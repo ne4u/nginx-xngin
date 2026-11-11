@@ -3,11 +3,12 @@
 [![CI](https://github.com/ne4u/nginx-xngin/actions/workflows/ci.yml/badge.svg)](https://github.com/ne4u/nginx-xngin/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20%2B%20Commons%20Clause-blue)](LICENSE)
 
-SPOE/SPOA-style traffic-decision offload for nginx. An http module
-(`ngx_http_xngin_module`) offloads request allow/deny/mutate decisions to
-N external agents — local (Unix sockets) or remote (TCP) — over **XNAP**,
-a custom low-latency multiplexed binary protocol. Use it for WAF, ACL,
-rate limiting, bot detection, auth, fraud scoring, anything.
+Engine and agent offload protocol for nginx traffic decisions. An http 
+module (`ngx_http_xngin_module`) offloads request allow/deny/mutate 
+decisions to N external agents — local (Unix sockets) or remote (TCP) — 
+over **XNAP**, a custom low-latency multiplexed binary protocol. Use it
+for WAF, ACL, rate limiting, bot detection, auth, fraud scoring, 
+anything.
 
 ```
 GET / ──► nginx ──NOTIFY──► agent ──VERDICT──► allow → upstream
