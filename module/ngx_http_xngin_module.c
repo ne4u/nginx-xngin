@@ -882,12 +882,25 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
          * ctx: decide the return code from it.
          */
         if (ctx->state == XNAP_ST_DONE) {
-            return ctx->status;       /* dispatch failed inline */
+            rc = ctx->status;         /* dispatch failed inline */
+        } else if (ctx->async) {
+            rc = NGX_DECLINED;        /* async dispatched inline */
+        } else {
+            rc = NGX_DONE;            /* suspended: body read or verdict */
         }
-        if (ctx->async) {
-            return NGX_DECLINED;      /* async dispatched inline */
-        }
-        return NGX_DONE;              /* suspended: body read or verdict */
+
+        /*
+         * ngx_http_read_client_request_body() takes a request reference
+         * that stock callers get released when the content-phase checker
+         * finalizes NGX_DONE.  The access-phase checker does not finalize
+         * NGX_DONE — our handler is re-entered on the verdict path
+         * instead — so release the reference here or the request ends
+         * with count 2, keepalive never re-arms, and the next request on
+         * this connection stalls in test_reading.
+         */
+        r->main->count--;
+
+        return rc;
     }
 
     ctx->body_read = 1;

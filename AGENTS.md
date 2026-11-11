@@ -86,3 +86,11 @@ python3 -m pytest test/cases -q
   route bodies through BODY frames/echo, not the verdict.
 - stub_agent stats flush every 0.5s — poll `stats()` or sleep 0.7s+ in
   tests; don't assert on stats immediately after a request.
+- `ngx_http_read_client_request_body` takes a `r->main->count` ref that
+  stock callers release when the *content*-phase checker finalizes
+  NGX_DONE. The *access*-phase checker does not finalize NGX_DONE —
+  release the ref yourself (`r->main->count--`) before returning from
+  the handler's first run, or the request ends with count 2, keepalive
+  never re-arms, and the NEXT request on that connection stalls in
+  test_reading. Symptom: first POST works, second POST on the same
+  keep-alive conn hangs before reaching the handler.

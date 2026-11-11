@@ -7,7 +7,7 @@ Single-threaded is fine — tests are sequential.
 
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class H(BaseHTTPRequestHandler):
@@ -33,4 +33,4 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
