@@ -1,0 +1,20 @@
+# Dev/test stack: nginx + edge-guard (Go) + mini-waf (Rust) agents.
+#
+#   docker compose up --build
+#   curl http://localhost:8080/
+#   curl http://localhost:8080/admin   (deny demo)
+#
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: test/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./test/docker/nginx.conf:/usr/local/nginx/conf/nginx.conf:ro
+      - agent-socks:/run
+    depends_on: []
+
+volumes:
+  agent-socks:

@@ -1,0 +1,466 @@
+{
+  "protocol": "XNAP",
+  "version": 1,
+  "vectors": [
+    {
+      "name": "uvarint-0",
+      "kind": "varint",
+      "value": 0,
+      "hex": "00"
+    },
+    {
+      "name": "uvarint-1",
+      "kind": "varint",
+      "value": 1,
+      "hex": "01"
+    },
+    {
+      "name": "uvarint-127",
+      "kind": "varint",
+      "value": 127,
+      "hex": "7f"
+    },
+    {
+      "name": "uvarint-128",
+      "kind": "varint",
+      "value": 128,
+      "hex": "8001"
+    },
+    {
+      "name": "uvarint-300",
+      "kind": "varint",
+      "value": 300,
+      "hex": "ac02"
+    },
+    {
+      "name": "uvarint-16384",
+      "kind": "varint",
+      "value": 16384,
+      "hex": "808001"
+    },
+    {
+      "name": "uvarint-1M",
+      "kind": "varint",
+      "value": 1048576,
+      "hex": "808040"
+    },
+    {
+      "name": "uvarint-2^32",
+      "kind": "varint",
+      "value": 4294967296,
+      "hex": "8080808010"
+    },
+    {
+      "name": "svarint-0",
+      "kind": "svarint",
+      "value": 0,
+      "hex": "00"
+    },
+    {
+      "name": "svarint--1",
+      "kind": "svarint",
+      "value": -1,
+      "hex": "01"
+    },
+    {
+      "name": "svarint-42",
+      "kind": "svarint",
+      "value": 42,
+      "hex": "54"
+    },
+    {
+      "name": "svarint--300",
+      "kind": "svarint",
+      "value": -300,
+      "hex": "d704"
+    },
+    {
+      "name": "svarint-big",
+      "kind": "svarint",
+      "value": 1099511627776,
+      "hex": "808080808040"
+    },
+    {
+      "name": "svarint-neg-big",
+      "kind": "svarint",
+      "value": -1099511627776,
+      "hex": "ffffffffff3f"
+    },
+    {
+      "name": "null",
+      "kind": "value",
+      "type": "null",
+      "expect": null,
+      "hex": "00"
+    },
+    {
+      "name": "true",
+      "kind": "value",
+      "type": "bool",
+      "expect": true,
+      "hex": "01"
+    },
+    {
+      "name": "false",
+      "kind": "value",
+      "type": "bool",
+      "expect": false,
+      "hex": "02"
+    },
+    {
+      "name": "int-neg",
+      "kind": "value",
+      "type": "int64",
+      "expect": -42,
+      "hex": "0453"
+    },
+    {
+      "name": "int-pos",
+      "kind": "value",
+      "type": "int64",
+      "expect": 1337,
+      "hex": "04f214"
+    },
+    {
+      "name": "str-empty",
+      "kind": "value",
+      "type": "str",
+      "expect": "",
+      "hex": "0900"
+    },
+    {
+      "name": "str-ascii",
+      "kind": "value",
+      "type": "str",
+      "expect": "hello xngin",
+      "hex": "090b68656c6c6f20786e67696e"
+    },
+    {
+      "name": "str-utf8",
+      "kind": "value",
+      "type": "str",
+      "expect": "h\u00e9llo\u2192w\u00f6rld",
+      "hex": "090f68c3a96c6c6fe2869277c3b6726c64"
+    },
+    {
+      "name": "bin",
+      "kind": "value",
+      "type": "bin",
+      "expect": {
+        "$bytes": "000102ff"
+      },
+      "hex": "0a04000102ff"
+    },
+    {
+      "name": "ipv4",
+      "kind": "value",
+      "type": "ipv4",
+      "expect": "10.20.30.40",
+      "hex": "070a141e28"
+    },
+    {
+      "name": "ipv6",
+      "kind": "value",
+      "type": "ipv6",
+      "expect": "::1",
+      "hex": "0800000000000000000000000000000001"
+    },
+    {
+      "name": "strlist",
+      "kind": "value",
+      "type": "strlist",
+      "expect": [
+        "a",
+        "bc",
+        "def"
+      ],
+      "hex": "0c03016102626303646566"
+    },
+    {
+      "name": "kvl-headers",
+      "kind": "value",
+      "type": "kvl",
+      "expect": {
+        "$pairs": [
+          [
+            "host",
+            "example.com"
+          ],
+          [
+            "user-agent",
+            "curl/8"
+          ],
+          [
+            "x-a",
+            "1"
+          ],
+          [
+            "x-a",
+            "2"
+          ]
+        ]
+      },
+      "hex": "0b3304686f7374090b6578616d706c652e636f6d0a757365722d6167656e7409066375726c2f3803782d6109013103782d61090132"
+    },
+    {
+      "name": "kv-action",
+      "kind": "kv",
+      "kname": "action",
+      "expect": "allow",
+      "hex": "06616374696f6e0905616c6c6f77"
+    },
+    {
+      "name": "kv-score",
+      "kind": "kv",
+      "kname": "score",
+      "expect": 90,
+      "hex": "0573636f726503b401"
+    },
+    {
+      "name": "kv-uri",
+      "kind": "kv",
+      "kname": "uri",
+      "expect": "/admin?x=1",
+      "hex": "03757269090a2f61646d696e3f783d31"
+    },
+    {
+      "name": "kv-ttl",
+      "kind": "kv",
+      "kname": "cache-ttl",
+      "expect": 30,
+      "hex": "0963616368652d74746c051e"
+    },
+    {
+      "name": "verdict-allow",
+      "kind": "frame",
+      "ftype": 5,
+      "flags": 1,
+      "sid": 41,
+      "fid": 0,
+      "expect_kv": [
+        [
+          "action",
+          "allow"
+        ],
+        [
+          "score",
+          0
+        ],
+        [
+          "reason",
+          "clean"
+        ]
+      ],
+      "hex": "2b0500000001290006616374696f6e0905616c6c6f770573636f7265030006726561736f6e0905636c65616e"
+    },
+    {
+      "name": "verdict-deny",
+      "kind": "frame",
+      "ftype": 5,
+      "flags": 1,
+      "sid": 7,
+      "fid": 0,
+      "expect_kv": [
+        [
+          "action",
+          "deny"
+        ],
+        [
+          "status",
+          403
+        ],
+        [
+          "reason",
+          "denylist hit"
+        ],
+        [
+          "body",
+          {
+            "$bytes": "666f7262696464656e"
+          }
+        ]
+      ],
+      "hex": "430500000001070006616374696f6e090464656e790673746174757303a60606726561736f6e090c64656e796c6973742068697404626f64790a09666f7262696464656e"
+    },
+    {
+      "name": "verdict-redirect",
+      "kind": "frame",
+      "ftype": 5,
+      "flags": 1,
+      "sid": 9,
+      "fid": 0,
+      "expect_kv": [
+        [
+          "action",
+          "redirect"
+        ],
+        [
+          "status",
+          302
+        ],
+        [
+          "location",
+          "https://example.com/"
+        ]
+      ],
+      "hex": "410500000001090006616374696f6e090872656469726563740673746174757303dc04086c6f636174696f6e091468747470733a2f2f6578616d706c652e636f6d2f"
+    },
+    {
+      "name": "ping",
+      "kind": "frame",
+      "ftype": 8,
+      "flags": 0,
+      "sid": 0,
+      "fid": 3,
+      "expect_kv": [],
+      "hex": "0708000000000003"
+    },
+    {
+      "name": "verdict-mutations",
+      "kind": "frame",
+      "ftype": 5,
+      "flags": 1,
+      "sid": 13,
+      "fid": 0,
+      "expect_kv": [
+        [
+          "action",
+          "allow"
+        ],
+        [
+          "hdr-set",
+          {
+            "$pairs": [
+              [
+                "x-added",
+                "1"
+              ],
+              [
+                "x-tag",
+                "yes"
+              ]
+            ]
+          }
+        ],
+        [
+          "hdr-unset",
+          [
+            "x-secret"
+          ]
+        ],
+        [
+          "vars",
+          {
+            "$pairs": [
+              [
+                "rule",
+                "acl-pass"
+              ],
+              [
+                "level",
+                "3"
+              ]
+            ]
+          }
+        ],
+        [
+          "cache-ttl",
+          60
+        ]
+      ],
+      "hex": "7505000000010d0006616374696f6e0905616c6c6f77076864722d7365740b1607782d616464656409013105782d7461670903796573096864722d756e7365740c0108782d73656372657404766172730b180472756c65090861636c2d70617373056c6576656c0901330963616368652d74746c053c"
+    },
+    {
+      "name": "verdict-res-mutations",
+      "kind": "frame",
+      "ftype": 5,
+      "flags": 1,
+      "sid": 15,
+      "fid": 0,
+      "expect_kv": [
+        [
+          "action",
+          "allow"
+        ],
+        [
+          "req-body",
+          {
+            "$bytes": "52455752495454454e"
+          }
+        ],
+        [
+          "res-hdr-set",
+          {
+            "$pairs": [
+              [
+                "x-agent",
+                "on"
+              ],
+              [
+                "x-ja4",
+                "t13d0000h0_0_0"
+              ]
+            ]
+          }
+        ],
+        [
+          "res-hdr-unset",
+          [
+            "x-powered-by",
+            "server"
+          ]
+        ],
+        [
+          "res-body",
+          {
+            "$bytes": "5245504c41434544"
+          }
+        ]
+      ],
+      "hex": "900105000000010f0006616374696f6e0905616c6c6f77087265712d626f64790a0952455752495454454e0b7265732d6864722d7365740b2207782d6167656e7409026f6e05782d6a6134090e743133643030303068305f305f300d7265732d6864722d756e7365740c020c782d706f77657265642d627906736572766572087265732d626f64790a085245504c41434544"
+    },
+    {
+      "name": "verdict-response",
+      "kind": "frame",
+      "ftype": 5,
+      "flags": 1,
+      "sid": 21,
+      "fid": 0,
+      "expect_kv": [
+        [
+          "action",
+          "allow"
+        ],
+        [
+          "res-hdr-set",
+          {
+            "$pairs": [
+              [
+                "x-filtered",
+                "yes"
+              ]
+            ]
+          }
+        ],
+        [
+          "res-body",
+          {
+            "$bytes": "6d61736b6564"
+          }
+        ],
+        [
+          "vars",
+          {
+            "$pairs": [
+              [
+                "res_rule",
+                "pii-redact"
+              ]
+            ]
+          }
+        ]
+      ],
+      "hex": "600500000001150006616374696f6e0905616c6c6f770b7265732d6864722d7365740b100a782d66696c74657265640903796573087265732d626f64790a066d61736b656404766172730b15087265735f72756c65090a7069692d726564616374"
+    }
+  ]
+}

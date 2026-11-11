@@ -1,0 +1,102 @@
+# ---------- hidden directories ----------
+# All dot-directories are local tooling state (.devin/, .pytest_cache/,
+# .idea/, .vscode/, .cargo/, etc.) — never commit.
+.*/
+
+# ---------- secrets / credentials ----------
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.cert
+*.cer
+*.p12
+*.pfx
+*.csr
+*.der
+*.keystore
+*.jks
+id_rsa*
+id_ed25519*
+*.asc
+*.gpg
+secrets/
+secrets.*
+credentials*
+*.token
+*_rsa
+*_ed25519
+
+# ---------- OS / editor noise ----------
+.DS_Store
+.AppleDouble
+._*
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+
+# ---------- C / nginx build artifacts ----------
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.d
+*.gcda
+*.gcno
+objs/
+nginx-*.tar.gz
+nginx-*/
+*.core
+core
+core.*
+
+# ---------- Go ----------
+*.exe
+*.test
+*.out
+*.prof
+/vendor/
+# compiled example-agent binaries (go build ./cmd/...)
+/agents/go/edge-guard
+/agents/go/ja4-fp
+
+# ---------- Rust ----------
+target/
+**/*.rs.bk
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+pip-wheel-metadata/
+
+# ---------- test / runtime artifacts ----------
+*.log
+*.sock
+*.socket
+*.pid
+logs/
+run/
+tmp/
+# conversation/summary dumps — must never be published
+history_*.md
+*.history
+
+# ---------- fuzzing ----------
+corpus/
+crash-*
+leak-*
+timeout-*
+oom-*
+artifacts/
