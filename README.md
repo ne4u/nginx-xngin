@@ -1,6 +1,6 @@
 # xngin
 
-[![CI](https://github.com/xngin/nginx-xngin/actions/workflows/ci.yml/badge.svg)](https://github.com/xngin/nginx-xngin/actions/workflows/ci.yml)
+[![CI](https://github.com/ne4u/nginx-xngin/actions/workflows/ci.yml/badge.svg)](https://github.com/ne4u/nginx-xngin/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20%2B%20Commons%20Clause-blue)](LICENSE)
 
 SPOE/SPOA-style traffic-decision offload for nginx. An http module
