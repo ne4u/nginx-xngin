@@ -1,0 +1,38 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pip install pytest && python3 -m pytest test/harness -q
+      - run: cd agents/go && go test ./... && go vet ./... && go build ./...
+      - run: cd agents/rust && cargo test
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev zlib1g-dev libssl-dev
+      - name: build nginx + module
+        run: |
+          curl -fsSL https://nginx.org/download/nginx-1.31.8.tar.gz | tar xz
+          cd nginx-1.31.8
+          ./configure --add-dynamic-module=$GITHUB_WORKSPACE/module \
+                      --with-http_ssl_module --prefix=$PWD/../install
+          make -j"$(nproc)" && make install
+      - run: pip install pytest
+      - env:
+          XNGIN_NGINX_BIN: ${{ github.workspace }}/install/sbin/nginx
+          XNGIN_MODULE_SO: ${{ github.workspace }}/nginx-1.31.8/objs/ngx_http_xngin_module.so
+        run: python3 -m pytest test/cases -q

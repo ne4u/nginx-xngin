@@ -1,5 +1,8 @@
 # xngin
 
+[![CI](https://github.com/xngin/nginx-xngin/actions/workflows/ci.yml/badge.svg)](https://github.com/xngin/nginx-xngin/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20%2B%20Commons%20Clause-blue)](LICENSE)
+
 SPOE/SPOA-style traffic-decision offload for nginx. An http module
 (`ngx_http_xngin_module`) offloads request allow/deny/mutate decisions to
 N external agents — local (Unix sockets) or remote (TCP) — over **XNAP**,
@@ -68,3 +71,10 @@ http {
 ```
 
 See `AGENTS.md` for build/test commands and `docs/` for details.
+
+## License
+
+Apache-2.0 with the [Commons Clause](https://commonsclause.com/)
+restriction — free to use, modify, and self-host; selling the software
+or a hosted/managed service built on it requires a commercial license.
+See `LICENSE`.

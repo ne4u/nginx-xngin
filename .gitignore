@@ -2,6 +2,8 @@
 # All dot-directories are local tooling state (.devin/, .pytest_cache/,
 # .idea/, .vscode/, .cargo/, etc.) — never commit.
 .*/
+# ...except GitHub metadata (CI, templates) which must be tracked.
+!/.github/
 
 # ---------- secrets / credentials ----------
 .env
