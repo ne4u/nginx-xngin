@@ -54,48 +54,16 @@ blocking mode. Design goal: < 1 ms added p99 for a co-located agent.
   would cut the syscall round-trip entirely — ~10-20 µs decisions.
 - UDP/fire-and-forget telemetry channel for high-rate async reporting.
 
-## Measured (localhost loopback, macOS arm64, nginx 1.31.8, 4 workers)
+## Measured
 
-`test/bench/bench.py` — one nginx port, one lane per feature; content
-handler is `empty_gif` so numbers isolate xngin's cost (no upstream
-noise). Serial keep-alive prober, 500 reqs/lane after warmup; `ab -k
--c 50 -n 10000` for throughput. Stub agent on UDS (allow-all) and
-loopback TCP.
+Headline numbers from `test/bench/bench.py` (full tables, methodology
+and run-to-run consistency in `docs/benchmarks.md`):
 
-| Lane | p50 | p99 | added vs baseline | ab -c50 rps |
-|---|---|---|---|---|
-| baseline (no offload) | 33 µs | 70 µs | — | 73 000 |
-| blocking, UDS agent | 89 µs | 164 µs | **+54 µs** | 39 800 |
-| async (fire-and-forget) | 26 µs | 81 µs | ~0 (noise) | 73 600 |
-| verdict cache hit | 27 µs | 78 µs | ~0 (noise) | 75 300 |
-| body inspect, 1 KiB POST | 98 µs | 195 µs | +62 µs | 29 500 |
-| response inspection | 91 µs | 192 µs | +59 µs | 36 800 |
-| deny 403 (no content) | 87 µs | 198 µs | +58 µs | 36 000 |
-| blocking, TCP agent | 102 µs | 171 µs | +68 µs | 33 300 |
-
-### Reading the numbers
-
-- **Blocking UDS costs ~54 µs at p50** — one XNAP round-trip plus frame
-  encode/decode. Well under the < 1 ms p99 design goal (p99 adds ~94 µs).
-- **Async and cache hits are free** — within measurement noise of the
-  no-offload baseline; they are the right mode for latency-sensitive
-  paths.
-- **Body inspection adds ~8 µs** over plain blocking for a 1 KiB body —
-  client-body read plus one extra BODY frame round-trip.
-- **Response inspection costs about a second round trip** — the staged
-  `http-response` exchange adds ~5 µs over blocking on a 43-byte
-  response; cost scales with buffered body size.
-- **Loopback TCP vs UDS is ~14 µs** — small enough that remote agents
-  are viable when UDS isn't.
-- **Throughput halves in blocking mode** (73 k → 40 k rps at c=50) —
-  every request serializes an agent round-trip over shared conns. Async
-  and cache-hit lanes keep full baseline throughput.
-
-### Caveats
-
-- Loopback only; real networks add the agent's actual distance.
-- `$xngin_agent_rtt_us` is derived from `ngx_current_msec` (ms
-  resolution) and quantizes to whole milliseconds — use the serial
-  prober deltas above for µs precision.
-- The stub agent answers in < 100 µs; real agents add their own
-  compute time on top of the transport deltas shown here.
+- **Blocking UDS offload: ~+55 µs p50 / ~+90 µs p99** — one XNAP
+  round-trip plus frame codec. Well under the < 1 ms p99 goal.
+- **Async mode and verdict-cache hits: free** — indistinguishable from
+  the no-offload baseline.
+- **Body inspection: ~+7 µs** over blocking for a 1 KiB body.
+- **Response inspection: ~+5 µs** over blocking on a small response.
+- **Throughput halves in blocking mode** at c=50; async/cache-hit keep
+  full baseline throughput.
