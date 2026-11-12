@@ -37,6 +37,34 @@ GET / ──► nginx ──NOTIFY──► agent ──VERDICT──► allow �
   recomputes JA4/JA4_r and returns them as headers and `$xngin_*` vars
 - **No C dependencies**: pure nginx APIs
 
+## Prior art
+
+Offloading traffic decisions to an external agent is a proven pattern —
+nginx was just missing an open implementation of it:
+
+- **HAProxy [SPOE/SPOP](https://github.com/haproxy/haproxy/blob/master/doc/SPOE.txt)**
+  — the model XNAP follows: multiplexed binary frames over persistent
+  conns, `set-var` actions back to the engine. Production-proven
+  (`coraza-spoa`, `spoa-server`), but HAProxy-only.
+- **Envoy [`ext_proc`](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter)**
+  — the same idea over gRPC bidi-streams, including streamed body
+  modes. Capable, but pulls in an h2 + HPACK + protobuf stack.
+- **Fastly (Signal Sciences) [Next-Gen WAF](https://www.fastly.com/documentation/guides/next-gen-waf/deployment-types/module-agent-deployment/nginx-module/about-the-nginx-module/)**
+  — a commercial nginx C module doing request→agent RPC over UDS/TCP
+  for allow/block/rate-limit verdicts. Validates the architecture at
+  scale, but closed-source and WAF-specific.
+- **ICAP (RFC 3507)** — request/response content adaptation; mostly AV
+  scanning, heavyweight, no multiplexing.
+- **In-process alternatives** — [`ngx_wasm_module`](https://github.com/Kong/ngx_wasm_module)
+  (proxy-wasm), njs, `auth_request` subrequests: either no agent at
+  all or headers-only decisions.
+
+**The gap**: no open, spec'd, mutation-capable offload protocol for
+nginx. XNAP combines what none of the above do together — streamed
+bodies with early verdicts, full request/response mutation, agent
+output as first-class `$xngin_*` variables for logs and headers, and
+TLS ClientHello/JA4 visibility — on a ~400-line zero-dependency codec.
+
 ## Repo
 
 | path | what |
