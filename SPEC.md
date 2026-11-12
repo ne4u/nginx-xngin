@@ -146,6 +146,13 @@ Payload is raw body bytes. Chunks are arbitrary; `LAST` flag marks the end.
 An agent MAY return a VERDICT before `LAST` (headers-only decision), in which
 case the engine stops sending BODY frames for that stream.
 
+With `xngin_body_inspect on` the engine dispatches the `http-request`
+NOTIFY as soon as the request headers are parsed — while the client
+upload is still in flight — and forwards body bytes to the agent as
+they arrive. Agents MUST NOT assume the upload is complete when the
+NOTIFY lands; `body-len` is the declared Content-Length and BODY frames
+simply trail the client upload until `LAST`.
+
 ### 4.3 VERDICT
 
 KV payload:
@@ -198,10 +205,12 @@ intersection. Version mismatch (agent cannot serve version 1) ⇒ DISCON.
 ### 4.5 NOTIFY — `http-response`
 
 Second defined message (requires capability bit 8, `RESP`). When enabled
-(`xngin_response on`), the engine buffers the upstream response and sends
-an `http-response` NOTIFY once the headers and full body (or the
-`xngin_res_body_max` cap) are available — before anything reaches the
-client. It is a separate stream and gets its own VERDICT.
+(`xngin_response on`), the engine holds the response headers and sends
+an `http-response` NOTIFY as soon as they are available — before
+anything reaches the client. Body bytes then stream to the agent as
+BODY frames while the upstream download continues (the engine keeps a
+buffered copy for release/deny). It is a separate stream and gets its
+own VERDICT.
 
 | name          | type    | notes                                        |
 |---------------|---------|----------------------------------------------|
@@ -209,15 +218,20 @@ client. It is a separate stream and gets its own VERDICT.
 | `method`      | STR     | original request method                      |
 | `status`      | INT32   | upstream response status                     |
 | `headers`     | KVL     | response headers, lower-cased names          |
-| `body-len`    | UINT32  | response body bytes sent in BODY frames      |
+| `body-len`    | UINT32  | declared Content-Length when known           |
 | `request-id`  | STR     | same id as the matching `http-request`       |
 
 Response BODY frames follow with `LAST` on the final chunk (or a lone
-`body-len`-less NOTIFY when the response was empty). If the buffered body
-would exceed `xngin_res_body_max`, the engine does **not** send an
-`http-response` stream at all — the response passes uninspected rather
-than being truncated (an agent could otherwise redact half a payload and
-leak the rest).
+`body-len`-less NOTIFY when the response was empty). As with
+`http-request`, an agent MAY verdict before `LAST`; the engine then
+stops sending BODY frames.
+
+A response whose declared Content-Length already exceeds
+`xngin_res_body_max` is never inspected — no `http-response` stream is
+sent at all. When the length is undeclared (e.g. chunked) and the body
+grows past the cap mid-download, the engine sends `ABORT` for the
+stream and releases the response uninspected rather than letting an
+agent redact half a payload and leak the rest.
 
 The response VERDICT uses the same fields as §4.3 with these differences:
 

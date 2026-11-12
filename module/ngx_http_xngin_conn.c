@@ -238,6 +238,10 @@ ngx_http_xngin_conn_connect(ngx_http_xngin_conn_t *c)
     }
 
     /* rc == NGX_OK or NGX_AGAIN */
+
+    /* no Nagle on agent RPC conns (no-op for AF_UNIX) */
+    ngx_tcp_nodelay(pc->connection);
+
     pc->connection->data = c;
     pc->connection->read->handler = ngx_http_xngin_conn_read;
     pc->connection->write->handler = ngx_http_xngin_conn_write;
@@ -250,8 +254,56 @@ ngx_http_xngin_conn_connect(ngx_http_xngin_conn_t *c)
 
 /* ---------- send ---------- */
 
+static ngx_xnap_pkt_t *
+ngx_http_xngin_pkt_get(ngx_http_xngin_conn_t *c, size_t cap)
+{
+    ngx_xnap_pkt_t  *pkt, **pp;
+
+    /* freelist: first entry that fits */
+    for (pp = &c->free_pkts; *pp; pp = &(*pp)->next) {
+        if ((*pp)->cap >= cap) {
+            pkt = *pp;
+            *pp = pkt->next;
+            c->nfree_pkts--;
+            return pkt;
+        }
+    }
+
+    pkt = ngx_alloc(sizeof(ngx_xnap_pkt_t) + cap, ngx_cycle->log);
+    if (pkt) {
+        pkt->cap = cap;
+    }
+    return pkt;
+}
+
+
+static void
+ngx_http_xngin_pkt_put(ngx_http_xngin_conn_t *c, ngx_xnap_pkt_t *pkt)
+{
+    if (c->nfree_pkts >= XNAP_PKT_FREE_MAX) {
+        ngx_free(pkt);
+        return;
+    }
+
+    pkt->next = c->free_pkts;
+    c->free_pkts = pkt;
+    c->nfree_pkts++;
+}
+
+
+static ngx_int_t
+ngx_http_xngin_conn_flush(ngx_http_xngin_conn_t *c);
+
+
+void
+ngx_http_xngin_pkt_discard(ngx_http_xngin_conn_t *c, ngx_xnap_pkt_t *pkt)
+{
+    ngx_http_xngin_pkt_put(c, pkt);
+}
+
+
 ngx_int_t
-ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
+ngx_http_xngin_conn_queue(ngx_http_xngin_conn_t *c, u_char type,
     uint32_t flags, uint64_t sid, uint64_t fid, u_char *payload, size_t len)
 {
     ngx_xnap_pkt_t *pkt;
@@ -265,7 +317,7 @@ ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
     flen = 1 + 4 + ngx_xnap_varint_len(sid) + ngx_xnap_varint_len(fid) + len;
     hlen = ngx_xnap_varint_len(flen);
 
-    pkt = ngx_alloc(sizeof(ngx_xnap_pkt_t) + hlen + flen, ngx_cycle->log);
+    pkt = ngx_http_xngin_pkt_get(c, hlen + flen);
     if (pkt == NULL) {
         return NGX_ERROR;
     }
@@ -291,9 +343,90 @@ ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
     *c->out_tail = pkt;
     c->out_tail = &pkt->next;
 
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
+    uint32_t flags, uint64_t sid, uint64_t fid, u_char *payload, size_t len)
+{
+    ngx_int_t rc;
+
+    rc = ngx_http_xngin_conn_queue(c, type, flags, sid, fid, payload, len);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
     ngx_http_xngin_conn_write(c->pc.connection->write);
 
     return NGX_OK;
+}
+
+
+u_char *
+ngx_http_xngin_conn_pkt_reserve(ngx_http_xngin_conn_t *c, size_t cap,
+    ngx_xnap_pkt_t **pkt_out)
+{
+    ngx_xnap_pkt_t *pkt;
+
+    if (c->down || c->pc.connection == NULL) {
+        return NULL;
+    }
+
+    pkt = ngx_http_xngin_pkt_get(c, XNAP_PKT_HEADROOM + cap);
+    if (pkt == NULL) {
+        return NULL;
+    }
+
+    *pkt_out = pkt;
+    return pkt->data + XNAP_PKT_HEADROOM;
+}
+
+
+ngx_int_t
+ngx_http_xngin_conn_pkt_commit(ngx_http_xngin_conn_t *c, ngx_xnap_pkt_t *pkt,
+    u_char type, uint32_t flags, uint64_t sid, uint64_t fid,
+    size_t payload_len)
+{
+    size_t   flen;
+    u_char  *payload, *p;
+
+    payload = pkt->data + XNAP_PKT_HEADROOM;
+    flen = 1 + 4 + ngx_xnap_varint_len(sid) + ngx_xnap_varint_len(fid)
+           + payload_len;
+
+    /* whole header is written back-to-front into the headroom gap:
+       flen varint lands first, so back up the total header size */
+    p = payload - ngx_xnap_varint_len(flen) - 1 - 4
+        - ngx_xnap_varint_len(sid) - ngx_xnap_varint_len(fid);
+    pkt->pos = p;
+
+    p = xnap_enc_varint(p, flen);
+    *p++ = type;
+    *p++ = (u_char) (flags >> 24);
+    *p++ = (u_char) (flags >> 16);
+    *p++ = (u_char) (flags >> 8);
+    *p++ = (u_char) flags;
+    p = xnap_enc_varint(p, sid);
+    p = xnap_enc_varint(p, fid);
+
+    pkt->last = payload + payload_len;
+    pkt->next = NULL;
+
+    *c->out_tail = pkt;
+    c->out_tail = &pkt->next;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_http_xngin_conn_flush_conn(ngx_http_xngin_conn_t *c)
+{
+    if (c->pc.connection) {
+        ngx_http_xngin_conn_write(c->pc.connection->write);
+    }
 }
 
 
@@ -303,11 +436,32 @@ ngx_http_xngin_conn_flush(ngx_http_xngin_conn_t *c)
     ssize_t           n;
     ngx_xnap_pkt_t   *pkt;
     ngx_connection_t *nc = c->pc.connection;
+    struct iovec      iov[32];
+    ngx_iovec_t       vec;
+    ngx_uint_t        i;
+
+    vec.iovs = iov;
+    vec.nalloc = 32;
 
     while (c->out) {
-        pkt = c->out;
+        /* gather the whole out queue into one writev */
+        vec.count = 0;
+        vec.size = 0;
+        for (pkt = c->out; pkt && vec.count < 32; pkt = pkt->next) {
+            iov[vec.count].iov_base = pkt->pos;
+            iov[vec.count].iov_len = pkt->last - pkt->pos;
+            vec.size += pkt->last - pkt->pos;
+            vec.count++;
+        }
 
-        n = nc->send(nc, pkt->pos, pkt->last - pkt->pos);
+        n = ngx_writev(nc, &vec);
+
+        /* ngx_writev (unlike ngx_unix_send) does not clear wev->ready on a
+           short write; do it ourselves or the write event never re-arms
+           and the queue stalls */
+        if (n < (ssize_t) vec.size) {
+            nc->write->ready = 0;
+        }
 
         if (n == NGX_ERROR) {
             return NGX_ERROR;
@@ -317,17 +471,27 @@ ngx_http_xngin_conn_flush(ngx_http_xngin_conn_t *c)
             return NGX_AGAIN;
         }
 
-        pkt->pos += n;
-
-        if (pkt->pos < pkt->last) {
-            return NGX_AGAIN;
+        /* consume n bytes across the pkt queue */
+        while (c->out && n > 0) {
+            pkt = c->out;
+            i = pkt->last - pkt->pos;
+            if (n < (ssize_t) i) {
+                pkt->pos += n;
+                return NGX_AGAIN;
+            }
+            n -= i;
+            c->out = pkt->next;
+            if (c->out == NULL) {
+                c->out_tail = &c->out;
+            }
+            ngx_http_xngin_pkt_put(c, pkt);
         }
 
-        c->out = pkt->next;
-        if (c->out == NULL) {
-            c->out_tail = &c->out;
+        if (n > 0) {
+            /* writev sent more than queued: keep looping only if
+               more pkts remain */
+            continue;
         }
-        ngx_free(pkt);
     }
 
     return NGX_OK;
@@ -667,6 +831,13 @@ ngx_http_xngin_conn_close(ngx_http_xngin_conn_t *c)
     }
     c->out = NULL;
     c->out_tail = &c->out;
+
+    for (pkt = c->free_pkts; pkt; pkt = next) {
+        next = pkt->next;
+        ngx_free(pkt);
+    }
+    c->free_pkts = NULL;
+    c->nfree_pkts = 0;
 
     c->rpos = c->rlast = c->rbuf;
 

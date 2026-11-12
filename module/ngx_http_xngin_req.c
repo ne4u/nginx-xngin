@@ -8,7 +8,7 @@ static ngx_int_t ngx_http_xngin_hdr_set(ngx_http_request_t *r,
                 ngx_str_t *name, ngx_str_t *value);
 static void  ngx_http_xngin_hdr_unset(ngx_http_request_t *r,
                 ngx_str_t *name);
-static void  ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
+void         ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx);
 
 
@@ -286,9 +286,9 @@ ngx_http_xngin_send_body(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
             remaining -= n;
             flags = remaining ? 0 : XNAP_FL_BODY_LAST;
 
-            if (ngx_http_xngin_conn_send(ctx->conn, XNAP_FRAME_BODY, flags,
-                                         ctx->stream_id, ctx->frame_id++,
-                                         pos, n)
+            if (ngx_http_xngin_conn_queue(ctx->conn, XNAP_FRAME_BODY, flags,
+                                          ctx->stream_id, ctx->frame_id++,
+                                          pos, n)
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -301,6 +301,161 @@ ngx_http_xngin_send_body(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
 }
 
 
+/* upper bound for the encoded NOTIFY payload — cheap over-estimate so
+   the frame can be encoded straight into a send pkt without a staging
+   copy; a miss just falls back to the pool wbuf + copy path */
+static size_t
+ngx_http_xngin_notify_bound(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+    size_t            bound = 1024;   /* fixed fields + TLS strings */
+
+    bound += r->unparsed_uri.len + r->method_name.len + r->schema.len;
+    if (r->headers_in.host) {
+        bound += r->headers_in.host->value.len;
+    }
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0) {
+            continue;
+        }
+        bound += h[i].key.len + h[i].value.len + 24;
+    }
+
+#if (NGX_SSL)
+    if (r->connection->ssl && r->connection->ssl->handshaked) {
+        ngx_http_xngin_hello_t *hello;
+
+        bound += 256;   /* tls-version / sni / alpn strings */
+
+        hello = ngx_http_xngin_tls_hello(r->connection);
+        if (hello) {
+            bound += hello->ja4.len + hello->ch_raw.len;
+        }
+    }
+#endif
+
+    return bound;
+}
+
+
+/* ---------- streaming request-body dispatch ---------- */
+
+/*
+ * Chained into ngx_http_top_request_body_filter (nginx >= 1.28).  Each
+ * call hands us the body bytes nginx just read; while ctx->body_stream
+ * is set we forward them as BODY frames on the already-open stream, so
+ * the agent sees the request body as it arrives instead of after the
+ * whole upload is buffered.  The data is memcpy'd into send pkts here,
+ * so it is safe for the caller to recycle the chain afterwards.
+ */
+
+static ngx_http_request_body_filter_pt ngx_http_xngin_next_body_filter;
+
+static ngx_int_t
+ngx_http_xngin_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    ngx_int_t               rc;
+    ngx_chain_t            *cl;
+    ngx_buf_t              *b;
+    ngx_http_xngin_ctx_t   *ctx;
+    ngx_http_xngin_conn_t  *conn;
+    size_t                  chunk_max, n;
+    u_char                 *pos;
+    uint32_t                flags;
+    unsigned                last;
+
+    rc = ngx_http_xngin_next_body_filter(r, in);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_xngin_module);
+    if (ctx == NULL || !ctx->body_stream) {
+        return rc;
+    }
+
+    conn = ctx->conn;
+    if (conn == NULL) {
+        return rc;   /* stream_failed: drain the upload, resolve later */
+    }
+
+    chunk_max = conn->max_frame;
+    chunk_max = (chunk_max > 64) ? chunk_max - 32 : chunk_max;
+
+    for (cl = in; cl; cl = cl->next) {
+        b = cl->buf;
+        if (b == NULL || b->in_file) {
+            continue;
+        }
+
+        last = b->last_buf && cl->next == NULL;
+        pos = b->pos;
+
+        if (pos == b->last) {
+            if (last) {
+                /* empty final buf: zero-length BODY carries LAST */
+                if (ngx_http_xngin_conn_queue(conn, XNAP_FRAME_BODY,
+                                              XNAP_FL_BODY_LAST,
+                                              ctx->stream_id,
+                                              ctx->frame_id++, NULL, 0)
+                    != NGX_OK)
+                {
+                    return rc;
+                }
+                ctx->body_stream = 0;
+            }
+            continue;
+        }
+
+        while (pos < b->last) {
+            n = b->last - pos;
+            if (n > chunk_max) {
+                n = chunk_max;
+            }
+            flags = (last && pos + n == b->last) ? XNAP_FL_BODY_LAST : 0;
+
+            if (ngx_http_xngin_conn_queue(conn, XNAP_FRAME_BODY, flags,
+                                          ctx->stream_id, ctx->frame_id++,
+                                          pos, n)
+                != NGX_OK)
+            {
+                return rc;   /* conn_failed will resolve the request */
+            }
+
+            if (flags & XNAP_FL_BODY_LAST) {
+                ctx->body_stream = 0;
+            }
+            pos += n;
+        }
+    }
+
+    ngx_http_xngin_conn_flush_conn(conn);
+
+    return rc;
+}
+
+
+void
+ngx_http_xngin_stream_filter_init(void)
+{
+    ngx_http_xngin_next_body_filter = ngx_http_top_request_body_filter;
+    ngx_http_top_request_body_filter = ngx_http_xngin_request_body_filter;
+}
+
+
 /* ---------- dispatch ---------- */
 
 ngx_int_t
@@ -309,9 +464,13 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
     ngx_http_xngin_loc_conf_t  *lcf;
     ngx_xnap_wbuf_t             wb;
     ngx_http_xngin_conn_t      *conn;
+    ngx_xnap_pkt_t             *pkt;
+    u_char                     *buf;
+    size_t                      bound;
     uint32_t                    flags = 0;
     ngx_int_t                   rc;
     unsigned                    has_body = 0;
+    unsigned                    sent_notify = 0;
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
@@ -321,17 +480,12 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
     }
 
     has_body = lcf->body_inspect
-               && ngx_http_xngin_body_in_mem(r);
+               && (ctx->body_stream || ngx_http_xngin_body_in_mem(r));
 
     ctx->conn = conn;
     ctx->stream_id = conn->next_sid;
     conn->next_sid += 2;
     ctx->frame_id = 0;
-
-    ngx_xnap_wbuf_init(&wb, r->pool, 2048);
-    if (ngx_http_xngin_build_notify(r, ctx, &wb) != NGX_OK) {
-        return NGX_ERROR;
-    }
 
     if (has_body) {
         flags |= XNAP_FL_NOTIFY_HAS_BODY;
@@ -340,18 +494,53 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
         flags |= XNAP_FL_NOTIFY_ASYNC;
     }
 
-    ngx_http_xngin_stream_add(conn, ctx->stream_id, ctx);
+    /* fast path: encode the NOTIFY straight into a send pkt — no
+       staging buffer, no payload memcpy */
+    bound = ngx_http_xngin_notify_bound(r);
+    buf = ngx_http_xngin_conn_pkt_reserve(conn, bound, &pkt);
+    if (buf) {
+        ngx_xnap_wbuf_init_fixed(&wb, buf, buf + bound);
+        if (ngx_http_xngin_build_notify(r, ctx, &wb) == NGX_OK) {
+            ngx_http_xngin_stream_add(conn, ctx->stream_id, ctx);
 
-    rc = ngx_http_xngin_conn_send(conn, XNAP_FRAME_NOTIFY, flags,
-                                  ctx->stream_id, ctx->frame_id++,
-                                  wb.start, wb.pos - wb.start);
-    if (rc != NGX_OK) {
-        ngx_http_xngin_stream_del(conn, ctx->stream_id);
-        ctx->conn = NULL;
-        return rc;
+            rc = ngx_http_xngin_conn_pkt_commit(conn, pkt,
+                        XNAP_FRAME_NOTIFY, flags,
+                        ctx->stream_id, ctx->frame_id++,
+                        wb.pos - buf);
+            if (rc == NGX_OK) {
+                sent_notify = 1;
+            } else {
+                ngx_http_xngin_stream_del(conn, ctx->stream_id);
+                ctx->conn = NULL;
+                return rc;
+            }
+        } else {
+            /* bound miss or encode error — retry via the pool path */
+            ngx_http_xngin_pkt_discard(conn, pkt);
+        }
     }
 
-    if (has_body) {
+    if (!sent_notify) {
+        ngx_xnap_wbuf_init(&wb, r->pool, 2048);
+        if (ngx_http_xngin_build_notify(r, ctx, &wb) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        ngx_http_xngin_stream_add(conn, ctx->stream_id, ctx);
+
+        rc = ngx_http_xngin_conn_queue(conn, XNAP_FRAME_NOTIFY, flags,
+                                       ctx->stream_id, ctx->frame_id++,
+                                       wb.start, wb.pos - wb.start);
+        if (rc != NGX_OK) {
+            ngx_http_xngin_stream_del(conn, ctx->stream_id);
+            ctx->conn = NULL;
+            return rc;
+        }
+    }
+
+    if (has_body && !ctx->body_stream) {
+        /* streaming dispatch sends BODY frames from the request body
+           filter instead; send_body is the buffered/replay path */
         rc = ngx_http_xngin_send_body(r, ctx);
         if (rc != NGX_OK) {
             ngx_http_xngin_stream_del(conn, ctx->stream_id);
@@ -360,8 +549,11 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
         }
     }
 
+    /* one writev for NOTIFY + all queued BODY frames */
+    ngx_http_xngin_conn_flush_conn(conn);
+
     ctx->state = XNAP_ST_SENT;
-    ctx->sent_at = ngx_current_msec;
+    ctx->sent_at = ngx_http_xngin_now_us();
 
     return NGX_OK;
 }
@@ -414,6 +606,14 @@ ngx_http_xngin_timeout(ngx_event_t *ev)
         ctx->conn = NULL;
     }
 
+    if (ctx->body_stream && !ctx->body_read) {
+        /* upload still in flight — can't replay the stream on a fresh
+           conn; drain the body, body_post resolves the request */
+        ctx->body_stream = 0;
+        ctx->stream_failed = 1;
+        return;
+    }
+
     if (!ctx->retried) {
         ctx->retried = 1;
         if (ngx_http_xngin_dispatch(r, ctx) == NGX_OK) {
@@ -450,6 +650,14 @@ ngx_http_xngin_ctx_conn_failed(ngx_http_xngin_ctx_t *ctx)
     if (ctx->async) {
         ctx->state = XNAP_ST_ABORTED;
         return;   /* nothing to resume; request already proceeded */
+    }
+
+    if (ctx->body_stream && !ctx->body_read) {
+        /* mid-upload: the body can't be replayed on another conn.
+           Defer to body_post — same place a slow upload already waits. */
+        ctx->body_stream = 0;
+        ctx->stream_failed = 1;
+        return;
     }
 
     if (!ctx->retried) {
@@ -784,7 +992,7 @@ ngx_http_xngin_parse_res_hdr_unset(ngx_http_request_t *r,
 }
 
 
-static void
+void
 ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
     ngx_http_xngin_ctx_t *ctx)
 {
@@ -792,7 +1000,6 @@ ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
     ngx_chain_t             *cl;
     ngx_buf_t               *b;
     ngx_str_t                cl_val, name;
-    u_char                   clbuf[NGX_OFF_T_LEN];
 
     if (rb == NULL) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
@@ -831,9 +1038,12 @@ ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
         return;
     }
 
-    cl_val.data = clbuf;
-    cl_val.len = ngx_snprintf(clbuf, sizeof(clbuf), "%O",
-                             (off_t) ctx->req_body.len) - clbuf;
+    cl_val.data = ngx_pnalloc(r->pool, NGX_OFF_T_LEN);
+    if (cl_val.data == NULL) {
+        return;
+    }
+    cl_val.len = ngx_snprintf(cl_val.data, NGX_OFF_T_LEN, "%O",
+                             (off_t) ctx->req_body.len) - cl_val.data;
 
     if (ngx_http_xngin_hdr_set(r, &name, &cl_val) == NGX_OK
         && r->headers_in.content_length)
@@ -863,7 +1073,7 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
         return NGX_OK;
     }
 
-    ctx->agent_rtt = ngx_current_msec - ctx->sent_at;
+    ctx->agent_rtt = ngx_http_xngin_now_us() - ctx->sent_at;
 
     ngx_http_xngin_stream_del(c, ctx->stream_id);
     ctx->conn = NULL;
@@ -983,7 +1193,9 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
 
     /* apply */
     if (action.len == 5 && ngx_memcmp(action.data, "allow", 5) == 0) {
-        if (ctx->req_body_set) {
+        if (ctx->req_body_set && ctx->body_read) {
+            /* mid-upload early verdict: body_post applies once the
+               read machinery has finished with rb->bufs */
             ngx_http_xngin_apply_req_body(r, ctx);
         }
         if (ctx->cache_key_val.len && cache_ttl && !mutable) {

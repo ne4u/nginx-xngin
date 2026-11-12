@@ -107,6 +107,8 @@ typedef struct {
 } ngx_xnap_val_t;
 
 void       ngx_xnap_wbuf_init(ngx_xnap_wbuf_t *wb, ngx_pool_t *pool, size_t cap);
+void       ngx_xnap_wbuf_init_fixed(ngx_xnap_wbuf_t *wb, u_char *start,
+                u_char *end);
 ngx_int_t  ngx_xnap_wbuf_u8(ngx_xnap_wbuf_t *wb, u_char b);
 ngx_int_t  ngx_xnap_wbuf_bytes(ngx_xnap_wbuf_t *wb, const void *p, size_t n);
 ngx_int_t  ngx_xnap_wbuf_varint(ngx_xnap_wbuf_t *wb, uint64_t v);
@@ -143,6 +145,7 @@ typedef struct ngx_xnap_pkt_s {
     struct ngx_xnap_pkt_s *next;
     u_char                *pos;
     u_char                *last;
+    size_t                 cap;      /* bytes allocated in data[] */
     u_char                 data[];
 } ngx_xnap_pkt_t;
 
@@ -168,6 +171,8 @@ struct ngx_http_xngin_conn_s {
 
     ngx_xnap_pkt_t         *out;
     ngx_xnap_pkt_t        **out_tail;
+    ngx_xnap_pkt_t         *free_pkts;
+    ngx_uint_t              nfree_pkts;
 
     u_char                 *rbuf;
     u_char                 *rpos;
@@ -217,12 +222,21 @@ struct ngx_http_xngin_ctx_s {
     unsigned                  async:1;
     unsigned                  body_wait:1;
     unsigned                  body_read:1;
+    unsigned                  body_stream:1;   /* NOTIFY sent, BODY frames
+                                                stream via the request
+                                                body filter (req) or
+                                                resp_collect (resp) */
+    unsigned                  stream_failed:1; /* agent conn died while
+                                                streaming; resolve in
+                                                body_post/resp_collect */
+    unsigned                  resp_body_done:1; /* upstream finished the
+                                                response body */
     unsigned                  in_handler:1;
     unsigned                  retried:1;
     unsigned                  dispatched:1;
 
-    ngx_msec_t                sent_at;
-    ngx_msec_t                agent_rtt;
+    int64_t                   sent_at;    /* µs, from ngx_timeofday */
+    int64_t                   agent_rtt;  /* µs */
     ngx_flag_t                cache_status;
 
     ngx_str_t                 action;     /* allow/deny/redirect string */
@@ -307,9 +321,33 @@ void        ngx_http_xngin_conn_free_worker(ngx_http_xngin_main_conf_t *mmcf,
 ngx_http_xngin_conn_t *ngx_http_xngin_conn_pick(ngx_http_xngin_group_t *g);
 ngx_http_xngin_conn_t *ngx_http_xngin_conn_pick_caps(
                 ngx_http_xngin_group_t *g, uint32_t caps);
+/* headroom reserved in every pkt for the frame-length varint + frame
+   header fields (flen varint ≤9, type 1, flags 4, sid varint ≤9,
+   fid varint ≤9) */
+#define XNAP_PKT_HEADROOM       32
+#define XNAP_PKT_FREE_MAX       64
+
 ngx_int_t   ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
                 uint32_t flags, uint64_t sid, uint64_t fid,
                 u_char *payload, size_t len);
+
+/* queue-only variant: caller must end the batch with conn_flush_conn() */
+ngx_int_t   ngx_http_xngin_conn_queue(ngx_http_xngin_conn_t *c, u_char type,
+                uint32_t flags, uint64_t sid, uint64_t fid,
+                u_char *payload, size_t len);
+
+/* encode-in-place: reserve `cap` payload bytes in a fresh pkt; the
+   returned pkt's data[] starts XNAP_PKT_HEADROOM before the write ptr.
+   Commit finishes the frame header in place and queues the pkt. */
+u_char     *ngx_http_xngin_conn_pkt_reserve(ngx_http_xngin_conn_t *c,
+                size_t cap, ngx_xnap_pkt_t **pkt_out);
+ngx_int_t   ngx_http_xngin_conn_pkt_commit(ngx_http_xngin_conn_t *c,
+                ngx_xnap_pkt_t *pkt, u_char type, uint32_t flags,
+                uint64_t sid, uint64_t fid, size_t payload_len);
+
+void        ngx_http_xngin_conn_flush_conn(ngx_http_xngin_conn_t *c);
+void        ngx_http_xngin_pkt_discard(ngx_http_xngin_conn_t *c,
+                ngx_xnap_pkt_t *pkt);
 void        ngx_http_xngin_stream_add(ngx_http_xngin_conn_t *c, uint64_t sid,
                 ngx_http_xngin_ctx_t *ctx);
 ngx_http_xngin_ctx_t *ngx_http_xngin_stream_find(ngx_http_xngin_conn_t *c,
@@ -328,6 +366,8 @@ ngx_int_t   ngx_http_xngin_build_notify(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_xnap_wbuf_t *wb);
 ngx_int_t   ngx_http_xngin_send_body(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx);
+void        ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
+                ngx_http_xngin_ctx_t *ctx);
 void        ngx_http_xngin_parse_vars(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, u_char *data, size_t len);
 void        ngx_http_xngin_parse_res_hdr_set(ngx_http_request_t *r,
@@ -339,6 +379,7 @@ void        ngx_http_xngin_parse_res_hdr_unset(ngx_http_request_t *r,
 /* ---------- response layer ---------- */
 
 void        ngx_http_xngin_filters_init(void);
+void        ngx_http_xngin_stream_filter_init(void);
 ngx_int_t   ngx_http_xngin_res_hdr_apply(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx);
 ngx_int_t   ngx_http_xngin_header_filter(ngx_http_request_t *r);
@@ -371,5 +412,14 @@ ngx_int_t   ngx_http_xngin_cache_zone_init(ngx_shm_zone_t *shm_zone,
 
 extern ngx_str_t ngx_http_xngin_uri_arg_sep;
 void ngx_http_xngin_resume(ngx_http_request_t *r, ngx_int_t status);
+
+/* wall-clock µs for agent-RTT measurement (cached time quantizes) */
+static ngx_inline int64_t
+ngx_http_xngin_now_us(void)
+{
+    struct timeval tv;
+    ngx_gettimeofday(&tv);
+    return (int64_t) tv.tv_sec * 1000000 + tv.tv_usec;
+}
 
 #endif /* _NGX_HTTP_XNGIN_MODULE_H_INCLUDED_ */

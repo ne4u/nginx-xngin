@@ -11,6 +11,18 @@ ngx_xnap_wbuf_init(ngx_xnap_wbuf_t *wb, ngx_pool_t *pool, size_t cap)
 }
 
 
+/* fixed-bounds wbuf: encodes into caller memory; writers fail instead
+   of growing (pool == NULL is the marker) */
+void
+ngx_xnap_wbuf_init_fixed(ngx_xnap_wbuf_t *wb, u_char *start, u_char *end)
+{
+    wb->start = start;
+    wb->pos = start;
+    wb->end = end;
+    wb->pool = NULL;
+}
+
+
 static ngx_int_t
 ngx_xnap_wbuf_ensure(ngx_xnap_wbuf_t *wb, size_t n)
 {
@@ -19,6 +31,10 @@ ngx_xnap_wbuf_ensure(ngx_xnap_wbuf_t *wb, size_t n)
 
     if ((size_t) (wb->end - wb->pos) >= n) {
         return NGX_OK;
+    }
+
+    if (wb->pool == NULL) {
+        return NGX_ERROR;   /* fixed buffer: no growth allowed */
     }
 
     used = wb->pos - wb->start;

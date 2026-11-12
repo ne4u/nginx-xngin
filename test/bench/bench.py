@@ -8,10 +8,11 @@ still runs):
   /          blocking verdict, UDS agent
   /async     fire-and-forget offload
   /cache     blocking + xngin_cache_key (repeat keys = cache hit)
-  /body      blocking + xngin_body_inspect (POST 1k)
+  /body      blocking + xngin_body_inspect (POST 1k / 64k)
   /resp      blocking + xngin_response (second round-trip)
   /deny      agent denies 403 (no content handler)
   /tcpblock  blocking verdict, loopback-TCP agent
+  /goblock   blocking verdict, Go edge-guard agent (rate=0, UDS)
 
 Measures:
   * serial keep-alive prober -> per-request p50/p95/p99 (us)
@@ -39,6 +40,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "harness"))
 import stacklib                                   # noqa: E402
 
 POST_BODY = b"x" * 1024
+POST_BODY_64K = b"x" * 65536
 
 CONF = """\
 load_module {module_so};
@@ -62,6 +64,11 @@ http {{
     }}
     xngin_agent_group net {{
         server 127.0.0.1:{tcp_port};
+        keepalive 2;
+        ping_interval 60s;
+    }}
+    xngin_agent_group go {{
+        server unix:{go_sock};
         keepalive 2;
         ping_interval 60s;
     }}
@@ -89,7 +96,7 @@ http {{
         }}
         location /body {{
             xngin_enable on; xngin_group uds;
-            xngin_body_inspect on; xngin_body_max 8k;
+            xngin_body_inspect on; xngin_body_max 128k;
             empty_gif;
         }}
         location /resp {{
@@ -103,6 +110,10 @@ http {{
         }}
         location /tcpblock {{
             xngin_enable on; xngin_group net;
+            empty_gif;
+        }}
+        location /goblock {{
+            xngin_enable on; xngin_group go;
             empty_gif;
         }}
     }}
@@ -120,15 +131,34 @@ RULES = {
 
 # name, path, method, body, expected status
 LANES = [
-    ("baseline",  "/baseline/x",  "GET",  None,      200),
-    ("blocking",  "/x",           "GET",  None,      200),
-    ("async",     "/async/x",     "GET",  None,      200),
-    ("cache-hit", "/cache/x",     "GET",  None,      200),
-    ("body-1k",   "/body/x",      "POST", POST_BODY, 405),
-    ("resp-insp", "/resp/x",      "GET",  None,      200),
-    ("deny-403",  "/deny/x",      "GET",  None,      403),
-    ("tcp-block", "/tcpblock/x",  "GET",  None,      200),
+    ("baseline",  "/baseline/x",  "GET",  None,          200),
+    ("blocking",  "/x",           "GET",  None,          200),
+    ("async",     "/async/x",     "GET",  None,          200),
+    ("cache-hit", "/cache/x",     "GET",  None,          200),
+    ("body-1k",   "/body/x",      "POST", POST_BODY,     405),
+    ("body-64k",  "/body/x",      "POST", POST_BODY_64K, 405),
+    ("resp-insp", "/resp/x",      "GET",  None,          200),
+    ("deny-403",  "/deny/x",      "GET",  None,          403),
+    ("tcp-block", "/tcpblock/x",  "GET",  None,          200),
+    ("go-block",  "/goblock/x",   "GET",  None,          200),
 ]
+
+REPO = os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))
+
+
+def build_go_agent(root):
+    """Build edge-guard for the go-block lane; None when go is missing."""
+    dst = os.path.join(root, "edge-guard")
+    r = subprocess.run(
+        ["go", "build", "-o", dst, "./cmd/edge-guard"],
+        cwd=os.path.join(REPO, "agents", "go"),
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"note: go build failed, skipping go-block lane\n{r.stderr}",
+              flush=True)
+        return None
+    return dst
 
 
 def pct(v, p):
@@ -253,9 +283,14 @@ def main():
     uds_agent = stacklib.Agent(root, 0, RULES)
     tcp_agent = stacklib.Agent(root, 1, RULES, tcp=True)
 
+    go_sock = os.path.join(root, "edge-guard.sock")
+    go_bin = build_go_agent(root)
+    lanes = LANES if go_bin else [l for l in LANES if l[0] != "go-block"]
+
     conf = CONF.format(
         module_so=stacklib.MODULE_SO, root=root,
         uds_sock=uds_agent.sock, tcp_port=tcp_agent.port,
+        go_sock=go_sock,
         listen_port=stacklib.free_port())
     conf_path = os.path.join(root, "nginx.conf")
     with open(conf_path, "w") as f:
@@ -263,9 +298,14 @@ def main():
 
     port = int(re.search(r"listen (\d+);", conf).group(1))
     procs = []
+    go_proc = None
     try:
         uds_agent.start(root)
         tcp_agent.start(root)
+        if go_bin:
+            go_proc = subprocess.Popen(
+                [go_bin, "-listen", f"unix:{go_sock}", "-rate", "0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(subprocess.Popen(
             [stacklib.NGINX_BIN, "-c", conf_path, "-p", root],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -279,20 +319,22 @@ def main():
 
         # wait for the agent group to be ready too: fail-close would 503
         # until conns complete the XNAP handshake
-        for _ in range(100):
-            try:
-                st = urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/x", timeout=1).status
-                if st == 200:
-                    break
-            except urllib.error.HTTPError:
-                time.sleep(0.05)
-            except Exception:
-                time.sleep(0.05)
+        for ready_path in ("/x", "/goblock/x" if go_bin else None):
+            if ready_path is None:
+                continue
+            for _ in range(100):
+                try:
+                    st = urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}{ready_path}",
+                        timeout=1).status
+                    if st == 200:
+                        break
+                except Exception:
+                    time.sleep(0.05)
 
         # global warmup: nginx workers, upstream conn pools and agent
         # keepalives all start cold — prime every lane before measuring
-        for name, path, method, body, want in LANES:
+        for name, path, method, body, want in lanes:
             ka = KeepAlive(port)
             try:
                 for _ in range(50):
@@ -301,7 +343,7 @@ def main():
                 ka.close()
 
         rows = []
-        for name, path, method, body, want in LANES:
+        for name, path, method, body, want in lanes:
             ts, bad = serial_bench(port, path, method, body, want,
                                    args.serial_n)
             rps, lat_us, fails = ab_bench(port, path, method, body,
@@ -335,6 +377,8 @@ def main():
     finally:
         for p in procs:
             p.terminate()
+        if go_proc:
+            go_proc.terminate()
         for a in (uds_agent, tcp_agent):
             if a.proc:
                 a.proc.terminate()

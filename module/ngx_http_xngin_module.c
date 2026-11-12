@@ -712,6 +712,7 @@ ngx_http_xngin_init(ngx_conf_t *cf)
     *h = ngx_http_xngin_handler;
 
     ngx_http_xngin_filters_init();
+    ngx_http_xngin_stream_filter_init();
 
     for (v = ngx_http_xngin_vars; v->name.len; v++) {
         nv = ngx_http_add_variable(cf, &v->name, v->flags);
@@ -865,7 +866,23 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
         r->request_body_in_persistent_file = 0;
         r->request_body_in_clean_file = 0;
 
+        /*
+         * Early dispatch: the NOTIFY goes out before the upload is
+         * buffered; BODY frames stream through the request body filter
+         * as chunks arrive, overlapping the upload with agent analysis.
+         * If dispatch fails inline (state DONE) the body is skipped
+         * entirely — same as any other early deny.
+         */
+        ctx->body_stream = 1;
         ctx->in_handler = 1;
+        ngx_http_xngin_launch(r, ctx, lcf);
+
+        if (ctx->state == XNAP_ST_DONE) {
+            ctx->body_stream = 0;
+            ctx->in_handler = 0;
+            return ctx->status;
+        }
+
         rc = ngx_http_read_client_request_body(r, ngx_http_xngin_body_post);
         ctx->in_handler = 0;
 
@@ -883,10 +900,12 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
          */
         if (ctx->state == XNAP_ST_DONE) {
             rc = ctx->status;         /* dispatch failed inline */
+        } else if (rc == NGX_AGAIN || rc == NGX_DONE) {
+            rc = NGX_DONE;            /* body read still in flight */
         } else if (ctx->async) {
-            rc = NGX_DECLINED;        /* async dispatched inline */
+            rc = NGX_DECLINED;        /* body consumed; fire-and-forget */
         } else {
-            rc = NGX_DONE;            /* suspended: body read or verdict */
+            rc = NGX_DONE;            /* suspended: awaiting verdict */
         }
 
         /*
@@ -945,7 +964,15 @@ ngx_http_xngin_launch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
     }
 
     if (!ctx->async) {
-        ngx_add_timer(ctx->timer, lcf->timeout);
+        /*
+         * Streaming dispatch: the verdict wait can't start until the
+         * whole upload has been forwarded, so the verdict timer is
+         * armed in body_post instead of here.  Body_post always runs
+         * (read complete, or conn_failed/timeout defers there too).
+         */
+        if (!ctx->body_stream) {
+            ngx_add_timer(ctx->timer, lcf->timeout);
+        }
         r->read_event_handler = ngx_http_test_reading;
     }
 }
@@ -963,9 +990,27 @@ ngx_http_xngin_body_post(ngx_http_request_t *r)
     }
 
     ctx->body_read = 1;
+    ctx->body_stream = 0;
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
-    ngx_http_xngin_launch(r, ctx, lcf);
+    if (ctx->req_body_set && ctx->state == XNAP_ST_DONE) {
+        /* early verdict replaced the body while the upload was in
+           flight; safe to swap rb->bufs now that the read is done */
+        ngx_http_xngin_apply_req_body(r, ctx);
+    }
+
+    if (!ctx->dispatched) {
+        ngx_http_xngin_launch(r, ctx, lcf);
+
+    } else if (ctx->stream_failed) {
+        /* the stream died mid-upload: apply the fail policy now that
+           the request body has been fully consumed */
+        ctx->state = XNAP_ST_DONE;
+        ctx->status = (ctx->async || lcf->fail == XNAP_FAIL_OPEN)
+                      ? NGX_DECLINED : NGX_HTTP_SERVICE_UNAVAILABLE;
+        ngx_str_set(&ctx->error, "down");
+        ctx->cache_status = XNAP_CACHE_BYPASS;
+    }
 
     if (ctx->in_handler) {
         /* invoked inline inside the phase handler; the handler picks up
@@ -977,8 +1022,18 @@ ngx_http_xngin_body_post(ngx_http_request_t *r)
     if (ctx->async || ctx->state == XNAP_ST_DONE) {
         r->write_event_handler = ngx_http_core_run_phases;
         ngx_http_core_run_phases(r);
+        return;
     }
+
     /* blocking && SENT: suspended until the verdict arrives */
+    if (ctx->dispatched) {
+        r->read_event_handler = ngx_http_test_reading;
+        if (!ctx->async && ctx->state == XNAP_ST_SENT
+            && !ctx->timer->timer_set)
+        {
+            ngx_add_timer(ctx->timer, lcf->timeout);
+        }
+    }
 }
 
 
@@ -998,6 +1053,14 @@ ngx_http_xngin_resume(ngx_http_request_t *r, ngx_int_t status)
     ctx->state = XNAP_ST_DONE;
 
     r->main->count--;
+
+    if (!ctx->body_read) {
+        /* early verdict while the upload is still streaming: stash the
+           outcome; ngx_http_xngin_body_post resumes when the body read
+           completes */
+        return;
+    }
+
     r->write_event_handler = ngx_http_core_run_phases;
     ngx_http_core_run_phases(r);
 }
@@ -1117,7 +1180,7 @@ ngx_http_xngin_var_rtt(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    v->len = ngx_sprintf(p, "%M", ctx->agent_rtt * 1000) - p;
+    v->len = ngx_sprintf(p, "%L", ctx->agent_rtt) - p;
     v->data = p;
     v->valid = 1;
     v->no_cacheable = 0;

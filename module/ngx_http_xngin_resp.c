@@ -250,6 +250,13 @@ ngx_http_xngin_resp_finish(ngx_http_xngin_ctx_t *ctx)
 {
     ngx_http_request_t *r = ctx->r;
 
+    if (!ctx->resp_body_done) {
+        /* early outcome while upstream is still delivering: releasing
+           the held prefix (or deny body) is enough — upstream keeps
+           running and its own finalize completes the request later */
+        return;
+    }
+
     ngx_http_finalize_request(r, NGX_OK);
 }
 
@@ -300,6 +307,11 @@ ngx_http_xngin_resp_eligible(ngx_http_request_t *r,
         return 0;
     }
 
+    /* declared length already over the cap: no inspection at all */
+    if (r->headers_out.content_length_n > (off_t) lcf->res_body_max) {
+        return 0;
+    }
+
     /* only responses that came from an upstream */
     if (r->upstream == NULL || lcf->group == NULL) {
         return 0;
@@ -310,10 +322,39 @@ ngx_http_xngin_resp_eligible(ngx_http_request_t *r,
 }
 
 
+/* spawn the response-inspection stream ctx + timer */
+static ngx_http_xngin_ctx_t *
+ngx_http_xngin_resp_ctx_new(ngx_http_request_t *r,
+    ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_http_xngin_ctx_t *rctx;
+
+    rctx = ngx_pcalloc(r->pool, sizeof(ngx_http_xngin_ctx_t));
+    if (rctx == NULL) {
+        return NULL;
+    }
+
+    rctx->is_resp = 1;
+    rctx->parent = ctx;
+    rctx->r = r;
+
+    rctx->timer = ngx_pcalloc(r->pool, sizeof(ngx_event_t));
+    if (rctx->timer == NULL) {
+        return NULL;
+    }
+    rctx->timer->handler = ngx_http_xngin_resp_timeout;
+    rctx->timer->data = rctx;
+    rctx->timer->log = r->connection->log;
+
+    ctx->resp_ctx = rctx;
+    return rctx;
+}
+
+
 ngx_int_t
 ngx_http_xngin_header_filter(ngx_http_request_t *r)
 {
-    ngx_http_xngin_ctx_t      *ctx;
+    ngx_http_xngin_ctx_t      *ctx, *rctx;
     ngx_http_xngin_loc_conf_t *lcf;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_xngin_module);
@@ -327,7 +368,29 @@ ngx_http_xngin_header_filter(ngx_http_request_t *r)
     if (lcf->response && !ctx->resp_sent
         && ngx_http_xngin_resp_eligible(r, ctx, lcf))
     {
-        /* hold: don't run the rest of the header filter chain yet */
+        /*
+         * Early dispatch: the http-response NOTIFY (headers + status)
+         * goes out now; body frames stream through resp_collect as
+         * chunks arrive — the agent analyzes while the response is
+         * still downloading.  The held copy is kept for release/deny.
+         */
+        rctx = ngx_http_xngin_resp_ctx_new(r, ctx);
+        if (rctx != NULL) {
+            /* stream body frames only when a body is coming:
+               CL > 0 or unknown (chunked); CL == 0 means none */
+            rctx->body_stream = (r->headers_out.content_length_n != 0);
+            if (ngx_http_xngin_resp_dispatch(rctx) != NGX_OK) {
+                ctx->resp_ctx = NULL;
+                rctx = NULL;
+            }
+        }
+
+        if (rctx == NULL) {
+            /* no agent stream: don't hold at all */
+            ngx_http_xngin_res_hdr_apply(r, ctx);
+            return ngx_http_xngin_next_header(r);
+        }
+
         ctx->resp_hold = 1;
         ctx->resp_held_tail = &ctx->resp_held;
         r->buffered |= NGX_HTTP_XNGIN_BUFFERED;
@@ -397,6 +460,46 @@ ngx_http_xngin_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
 /* ---------- http-response round-trip ---------- */
 
+/* queue one response-body chunk as BODY frames on the open resp stream */
+static void
+ngx_http_xngin_resp_stream_send(ngx_http_xngin_ctx_t *rctx,
+    u_char *pos, size_t len, unsigned last)
+{
+    ngx_http_xngin_conn_t *conn = rctx->conn;
+    size_t                 chunk_max, n;
+    uint32_t               flags;
+
+    chunk_max = conn->max_frame;
+    chunk_max = (chunk_max > 64) ? chunk_max - 32 : chunk_max;
+
+    if (len == 0) {
+        if (last) {
+            ngx_http_xngin_conn_queue(conn, XNAP_FRAME_BODY,
+                                      XNAP_FL_BODY_LAST,
+                                      rctx->stream_id, rctx->frame_id++,
+                                      NULL, 0);
+        }
+        return;
+    }
+
+    while (len) {
+        n = (len > chunk_max) ? chunk_max : len;
+        flags = (last && n == len) ? XNAP_FL_BODY_LAST : 0;
+
+        if (ngx_http_xngin_conn_queue(conn, XNAP_FRAME_BODY, flags,
+                                      rctx->stream_id, rctx->frame_id++,
+                                      pos, n)
+            != NGX_OK)
+        {
+            return;   /* conn_failed resolves the stream */
+        }
+
+        pos += n;
+        len -= n;
+    }
+}
+
+
 static ngx_int_t
 ngx_http_xngin_resp_collect(ngx_http_request_t *r,
     ngx_http_xngin_ctx_t *ctx, ngx_chain_t *in)
@@ -407,11 +510,13 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
     ngx_buf_t                 *nb;
     u_char                    *data;
     size_t                     n;
-    unsigned                   last = 0;
+    unsigned                   last = 0, send_last = 0;
 
     if (ctx->resp_pass) {
         return ngx_http_xngin_next_body(r, in);
     }
+
+    rctx = ctx->resp_ctx;
 
     for (cl = in; cl; cl = cl->next) {
         if (cl->buf == NULL) {
@@ -440,6 +545,7 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
                 *ctx->resp_held_tail = nl;
                 ctx->resp_held_tail = &nl->next;
                 last = 1;
+                send_last = 1;   /* body ends without trailing data */
             }
             continue;
         }
@@ -465,6 +571,12 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
         ctx->resp_held_tail = &nl->next;
         ctx->resp_held_len += n;
 
+        /* stream this chunk to the agent while the download continues */
+        if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+            ngx_http_xngin_resp_stream_send(rctx, data, n,
+                nb->last_buf || nb->last_in_chain);
+        }
+
         cl->buf->pos = cl->buf->last;   /* consumed */
 
         if (nb->last_buf || nb->last_in_chain) {
@@ -476,11 +588,12 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
 
     if (ctx->resp_held_len > lcf->res_body_max) {
         /*
-         * cap hit: release everything held, pass through the rest.
-         * Every buf in "in" was already consumed into resp_held, so we
-         * must NOT forward it (zero-size non-special bufs error the
-         * write filter); if this "in" ended the response, carry the
-         * terminal flag on a special empty buf appended to held.
+         * cap hit on an undeclared-length body: release everything held,
+         * pass through the rest.  Every buf in "in" was already consumed
+         * into resp_held, so we must NOT forward it (zero-size
+         * non-special bufs error the write filter); if this "in" ended
+         * the response, carry the terminal flag on a special empty buf
+         * appended to held.
          */
         if (last) {
             nb = ngx_calloc_buf(r->pool);
@@ -496,6 +609,18 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
             ctx->resp_held_tail = &nl->next;
         }
 
+        /* the agent saw a partial stream: close it out */
+        if (rctx != NULL && rctx->conn != NULL) {
+            ngx_http_xngin_conn_send(rctx->conn, XNAP_FRAME_ABORT, 0,
+                                   rctx->stream_id, rctx->frame_id++,
+                                   NULL, 0);
+            ngx_http_xngin_stream_del(rctx->conn, rctx->stream_id);
+            rctx->conn = NULL;
+        }
+        if (rctx != NULL) {
+            rctx->body_stream = 0;
+        }
+
         ctx->resp_pass = 1;
         r->buffered &= ~NGX_HTTP_XNGIN_BUFFERED;
         ngx_http_xngin_resp_release(ctx, ctx->resp_held);
@@ -503,45 +628,59 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
     }
 
     if (!last) {
+        if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+            ngx_http_xngin_conn_flush_conn(rctx->conn);
+        }
         return NGX_OK;
     }
 
-    /* body complete → spawn the resp stream ctx and dispatch */
-    rctx = ngx_pcalloc(r->pool, sizeof(ngx_http_xngin_ctx_t));
+    /* body complete: the stream is fully delivered */
+    ctx->resp_body_done = 1;
+
+    if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+        if (send_last) {
+            /* the final buf carried no data — the LAST flag still
+               has to reach the agent */
+            ngx_http_xngin_resp_stream_send(rctx, NULL, 0, 1);
+        }
+        ngx_http_xngin_conn_flush_conn(rctx->conn);
+    }
+    if (rctx != NULL) {
+        rctx->body_stream = 0;
+    }
+
     if (rctx == NULL) {
+        /* dispatch failed at header time: nothing held should exist,
+           but release defensively */
         ngx_http_xngin_resp_release(ctx, ctx->resp_held);
         return NGX_OK;
     }
 
-    rctx->is_resp = 1;
-    rctx->parent = ctx;
-    rctx->r = r;
-
-    rctx->timer = ngx_pcalloc(r->pool, sizeof(ngx_event_t));
-    if (rctx->timer == NULL) {
-        ngx_http_xngin_resp_release(ctx, ctx->resp_held);
+    if (rctx->stream_failed) {
+        /* conn died / timed out mid-download; the body is fully
+           buffered now, so the fail policy can run safely */
+        ngx_http_xngin_resp_fail(rctx, "down");
         return NGX_OK;
     }
-    rctx->timer->handler = ngx_http_xngin_resp_timeout;
-    rctx->timer->data = rctx;
-    rctx->timer->log = r->connection->log;
 
-    ctx->resp_ctx = rctx;
+    if (rctx->state == XNAP_ST_DONE) {
+        /* early verdict already handled release/deny */
+        return NGX_OK;
+    }
 
-    if (ngx_http_xngin_resp_dispatch(rctx) != NGX_OK) {
-        /* no agent available for inspection: ship what we buffered */
-        ctx->resp_ctx = NULL;
-        ngx_http_xngin_resp_release(ctx, ctx->resp_held);
+    if (rctx->conn != NULL && !rctx->timer->timer_set) {
+        ngx_add_timer(rctx->timer, lcf->timeout);
     }
 
     return NGX_OK;
 }
 
 
-/* build the http-response NOTIFY payload */
+/* build the http-response NOTIFY payload; body_len is the declared
+   Content-Length (>0), 0 when none/unknown */
 static ngx_int_t
 ngx_http_xngin_resp_notify(ngx_http_request_t *r,
-    ngx_http_xngin_ctx_t *ctx, ngx_xnap_wbuf_t *wb)
+    ngx_http_xngin_ctx_t *ctx, ngx_xnap_wbuf_t *wb, off_t body_len)
 {
     ngx_list_part_t  *part;
     ngx_table_elt_t  *h;
@@ -618,9 +757,11 @@ ngx_http_xngin_resp_notify(ngx_http_request_t *r,
     ngx_xnap_wbuf_varint(wb, hdrs.pos - hdrs.start);
     ngx_xnap_wbuf_bytes(wb, hdrs.start, hdrs.pos - hdrs.start);
 
-    ngx_xnap_wbuf_kv_name(wb, "body-len");
-    ngx_xnap_wbuf_u8(wb, XNAP_VT_UINT32);
-    ngx_xnap_wbuf_varint(wb, ctx->resp_held_len);
+    if (body_len > 0) {
+        ngx_xnap_wbuf_kv_name(wb, "body-len");
+        ngx_xnap_wbuf_u8(wb, XNAP_VT_UINT32);
+        ngx_xnap_wbuf_varint(wb, body_len);
+    }
 
     return NGX_OK;
 }
@@ -690,17 +831,22 @@ ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx)
     rctx->frame_id = 0;
 
     ngx_xnap_wbuf_init(&wb, r->pool, 2048);
-    if (ngx_http_xngin_resp_notify(r, ctx, &wb) != NGX_OK) {
+    if (ngx_http_xngin_resp_notify(r, ctx, &wb,
+                                   rctx->body_stream
+                                   ? r->headers_out.content_length_n
+                                   : (off_t) ctx->resp_held_len)
+        != NGX_OK)
+    {
         return NGX_ERROR;
     }
 
-    if (ctx->resp_held_len) {
+    if (rctx->body_stream || ctx->resp_held_len) {
         flags |= XNAP_FL_NOTIFY_HAS_BODY;
     }
 
     ngx_http_xngin_stream_add(conn, rctx->stream_id, rctx);
 
-    if (ngx_http_xngin_conn_send(conn, XNAP_FRAME_NOTIFY, flags,
+    if (ngx_http_xngin_conn_queue(conn, XNAP_FRAME_NOTIFY, flags,
                                  rctx->stream_id, rctx->frame_id++,
                                  wb.start, wb.pos - wb.start)
         != NGX_OK)
@@ -710,7 +856,7 @@ ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx)
         return NGX_ERROR;
     }
 
-    if (ctx->resp_held_len
+    if (!rctx->body_stream && ctx->resp_held_len
         && ngx_http_xngin_resp_send_body(rctx) != NGX_OK)
     {
         ngx_http_xngin_stream_del(conn, rctx->stream_id);
@@ -718,9 +864,16 @@ ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx)
         return NGX_ERROR;
     }
 
+    ngx_http_xngin_conn_flush_conn(conn);
+
     rctx->state = XNAP_ST_SENT;
-    rctx->sent_at = ngx_current_msec;
-    ngx_add_timer(rctx->timer, lcf->timeout);
+    rctx->sent_at = ngx_http_xngin_now_us();
+
+    /* for streamed bodies the verdict wait starts when the LAST frame
+       goes out (resp_collect arms the timer there) */
+    if (!rctx->body_stream) {
+        ngx_add_timer(rctx->timer, lcf->timeout);
+    }
 
     return NGX_OK;
 }
@@ -736,6 +889,21 @@ ngx_http_xngin_resp_timeout(ngx_event_t *ev)
     }
 
     rctx->state = XNAP_ST_TIMEDOUT;
+
+    if (rctx->body_stream) {
+        /* response still downloading — the verdict wait hasn't really
+           started; defer to last_buf in resp_collect */
+        if (rctx->conn) {
+            ngx_http_xngin_conn_send(rctx->conn, XNAP_FRAME_ABORT, 0,
+                                     rctx->stream_id, rctx->frame_id++,
+                                     NULL, 0);
+            ngx_http_xngin_stream_del(rctx->conn, rctx->stream_id);
+            rctx->conn = NULL;
+        }
+        rctx->body_stream = 0;
+        rctx->stream_failed = 1;
+        return;
+    }
 
     if (rctx->conn) {
         ngx_http_xngin_conn_send(rctx->conn, XNAP_FRAME_ABORT, 0,
@@ -761,6 +929,14 @@ ngx_http_xngin_resp_conn_failed(ngx_http_xngin_ctx_t *rctx)
     rctx->conn = NULL;
 
     if (rctx->state != XNAP_ST_SENT) {
+        return;
+    }
+
+    if (rctx->body_stream) {
+        /* mid-download: held bytes can't be replayed mid-flight on a
+           new stream; defer to resp_collect's completion path */
+        rctx->body_stream = 0;
+        rctx->stream_failed = 1;
         return;
     }
 
@@ -841,12 +1017,13 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
     ctx = rctx->parent;
     r = ctx->r;
 
-    rctx->agent_rtt = ngx_current_msec - rctx->sent_at;
+    rctx->agent_rtt = ngx_http_xngin_now_us() - rctx->sent_at;
     ctx->agent_rtt = rctx->agent_rtt;
 
     ngx_http_xngin_stream_del(c, rctx->stream_id);
     rctx->conn = NULL;
     rctx->state = XNAP_ST_DONE;
+    rctx->body_stream = 0;
 
     if (rctx->timer && rctx->timer->timer_set) {
         ngx_del_timer(rctx->timer);
