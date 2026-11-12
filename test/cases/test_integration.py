@@ -213,6 +213,13 @@ def test_tls_inspect(stack):
     # legacy_version major is 3
     assert raw[4] == 0x03
 
+    # independent oracle: recompute JA4 from ch-raw, must match engine
+    import ja4 as ja4_oracle
+    oracle_ja4, oracle_ja4r = ja4_oracle.compute_ja4(raw)
+    assert oracle_ja4 == hello["ja4"], \
+        f"engine ja4 {hello['ja4']} != oracle {oracle_ja4}"
+    assert oracle_ja4r[:10] == hello["ja4"][:10]
+
 
 def test_tls_deny(stack):
     """xngin_tls_deny aborts the handshake for a matching JA4."""
@@ -430,3 +437,18 @@ def test_ja4_agent(stack, ja4_bin):
     assert f"aja4={ja4}" in log
     assert "jm=1" in log          # agent JA4 == engine JA4
     assert "ja4=" + ja4 in log    # $xngin_ja4 is the same value
+
+    # oracle: capture ch-raw on a stub-backed stack (same python TLS
+    # client → same JA4), recompute, must match the agent headers exactly
+    s2 = stack(agents_rules=[ALLOW], ssl=True,
+               srv_extra="xngin_tls_inspect on;", sub="oracle").start()
+    st2, _, _ = s2.request("/")
+    assert st2 == 200
+    hello = _wait_hello(s2.agents[0])
+    assert hello and hello.get("ch_raw_hex")
+
+    import ja4 as ja4_oracle
+    o_ja4, o_ja4r = ja4_oracle.compute_ja4(
+        bytes.fromhex(hello["ch_raw_hex"]))
+    assert o_ja4 == ja4                      # engine == agent == oracle
+    assert o_ja4r == hdrs.get("x-ja4-raw")   # raw JA4 fully verified
