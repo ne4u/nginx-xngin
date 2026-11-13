@@ -4,6 +4,8 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const VERSION: u32 = 1;
+/// Default `max-frame-size` (SPEC.md §3).
+pub const DEFAULT_MAX_FRAME: u32 = 16384;
 
 // frame types
 pub const FT_ENGINE_HELLO: u8 = 0x01;
@@ -222,7 +224,9 @@ impl<'a> Reader<'a> {
             }
             0x0c => {
                 let n = self.varint()?;
-                let mut out = Vec::with_capacity(n as usize);
+                // every element needs at least one byte (its length varint)
+                let remaining = (self.buf.len() - self.pos) as u64;
+                let mut out = Vec::with_capacity(n.min(remaining) as usize);
                 for _ in 0..n {
                     let ln = self.varint()? as usize;
                     let s = self.take(ln)?;
@@ -317,17 +321,25 @@ fn peek_varint(buf: &[u8]) -> Result<Option<(u64, usize)>, ProtoError> {
 }
 
 /// Drain complete frames from `buf`, leaving the partial tail in place.
+/// Frames larger than [`DEFAULT_MAX_FRAME`] are rejected.
 pub fn feed(buf: &mut Vec<u8>) -> Result<Vec<Frame>, ProtoError> {
+    feed_max(buf, DEFAULT_MAX_FRAME)
+}
+
+/// Like [`feed`], but rejects frames whose `frame-len` exceeds `max_frame`.
+pub fn feed_max(buf: &mut Vec<u8>, max_frame: u32)
+    -> Result<Vec<Frame>, ProtoError>
+{
     let mut frames = Vec::new();
     let mut pos = 0usize;
-    loop {
-        let (flen, hdr_len) = match peek_varint(&buf[pos..])? {
-            Some(x) => (x.0 as usize, x.1),
-            None => break, // need more bytes
-        };
+    while let Some((flen, hdr_len)) = peek_varint(&buf[pos..])? {
         if flen < 6 {
             return Err(ProtoError("bad frame len"));
         }
+        if flen > max_frame as u64 {
+            return Err(ProtoError("frame too large"));
+        }
+        let flen = flen as usize;
         let fstart = pos + hdr_len;
         if buf.len() - fstart < flen {
             break; // incomplete frame
