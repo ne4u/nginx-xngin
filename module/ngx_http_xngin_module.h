@@ -50,6 +50,9 @@
 #define XNAP_CAP_RESP   0x08
 
 #define XNAP_DEFAULT_MAX_FRAME  16384
+/* absolute ceiling on a frame we will emit: keeps the frame-len arithmetic
+ * in ngx_http_xngin_conn_queue() far away from a size_t wrap */
+#define XNAP_MAX_FRAME_HARD     (16 * 1024 * 1024)
 #define XNAP_DEFAULT_MAX_STREAM 256
 #define XNAP_STREAM_TABLE_CAP   512
 #define XNAP_RBUF_SIZE          65536

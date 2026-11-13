@@ -176,6 +176,39 @@ def test_garbage_agent(stack):
     assert st == 503
 
 
+def _raw_frame_agent(stack, raw_hex):
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/"},
+         "behavior": {"raw_hex": raw_hex},
+         "verdict": {"action": "allow"}}]}
+    return stack(agents_rules=[rules], timeout="500ms", fail="close").start()
+
+
+def _assert_frame_rejected(s):
+    st, _, _ = s.request("/")
+    assert st == 503
+    # the worker survived: it still answers (fail close) on a new conn
+    st, _, _ = s.request("/")
+    assert st == 503
+    log = s.error_log()
+    assert "exited on signal" not in log
+    assert "exited with code" not in log
+
+
+def test_short_frame_missing_fid(stack):
+    """frame-len 6, PING, sid 1, no fid: rejected, no OOB read/overflow."""
+    s = _raw_frame_agent(stack, "06080000000001" + "00" * 16)
+    _assert_frame_rejected(s)
+    assert "bad frame header" in s.error_log()
+
+
+def test_overlong_sid_varint(stack):
+    """sid of 20 continuation bytes: rejected, no unbounded shift."""
+    s = _raw_frame_agent(stack, "1a0800000000" + "80" * 20)
+    _assert_frame_rejected(s)
+    assert "bad frame header" in s.error_log()
+
+
 def test_tcp_agent(stack):
     """agent over TCP works as well as UDS."""
     s = stack(agents_rules=[ALLOW], tcp_agents=True).start()

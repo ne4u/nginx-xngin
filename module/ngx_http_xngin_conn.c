@@ -314,7 +314,16 @@ ngx_http_xngin_conn_queue(ngx_http_xngin_conn_t *c, u_char type,
         return NGX_ERROR;
     }
 
-    flen = 1 + 4 + ngx_xnap_varint_len(sid) + ngx_xnap_varint_len(fid) + len;
+    flen = 1 + 4 + ngx_xnap_varint_len(sid) + ngx_xnap_varint_len(fid);
+
+    if (len > XNAP_MAX_FRAME_HARD - flen) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "xngin: refusing to send %uz byte %d frame to %V",
+                      len, type, &c->agent->url_text);
+        return NGX_ERROR;
+    }
+
+    flen += len;
     hlen = ngx_xnap_varint_len(flen);
 
     pkt = ngx_http_xngin_pkt_get(c, hlen + flen);
@@ -654,10 +663,40 @@ ngx_http_xngin_conn_frame(ngx_http_xngin_conn_t *c, u_char type,
 }
 
 
+/* Decode one varint from [*pp, end).  Returns NGX_ERROR on a truncated or
+ * overlong (> 10 byte / > 63 bit shift) encoding; *pp is advanced on OK. */
+static ngx_int_t
+ngx_http_xngin_frame_varint(u_char **pp, u_char *end, uint64_t *out)
+{
+    u_char   *p = *pp;
+    uint64_t  v = 0;
+    unsigned  shift = 0;
+
+    while (p < end) {
+        u_char b = *p++;
+
+        v |= (uint64_t) (b & 0x7f) << shift;
+
+        if (!(b & 0x80)) {
+            *pp = p;
+            *out = v;
+            return NGX_OK;
+        }
+
+        shift += 7;
+        if (shift > 63) {
+            return NGX_ERROR;       /* overlong varint */
+        }
+    }
+
+    return NGX_ERROR;               /* truncated inside the frame */
+}
+
+
 static ngx_int_t
 ngx_http_xngin_conn_parse(ngx_http_xngin_conn_t *c)
 {
-    u_char    *p, *frame;
+    u_char    *p, *frame, *fend;
     uint64_t   flen, sid, fid;
     u_char     type;
     uint32_t   flags;
@@ -706,38 +745,28 @@ ngx_http_xngin_conn_parse(ngx_http_xngin_conn_t *c)
 
         /* frame = type(1) + flags(4) + sid varint + fid varint + payload */
         p = frame;
+        fend = frame + flen;
 
         type = *p++;
         flags = ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16)
                 | ((uint32_t) p[2] << 8) | p[3];
         p += 4;
 
-        sid = 0;
-        shift = 0;
-        for (;;) {
-            u_char b = *p++;
-            sid |= (uint64_t) (b & 0x7f) << shift;
-            shift += 7;
-            if (!(b & 0x80)) {
-                break;
-            }
+        /* sid and fid are read strictly inside the declared frame */
+        if (ngx_http_xngin_frame_varint(&p, fend, &sid) != NGX_OK
+            || ngx_http_xngin_frame_varint(&p, fend, &fid) != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                          "xngin: bad frame header (stream-id/frame-id) "
+                          "in %uL byte frame from %V",
+                          flen, &c->agent->url_text);
+            return NGX_ERROR;
         }
 
-        fid = 0;
-        shift = 0;
-        for (;;) {
-            u_char b = *p++;
-            fid |= (uint64_t) (b & 0x7f) << shift;
-            shift += 7;
-            if (!(b & 0x80)) {
-                break;
-            }
-        }
-
-        c->rpos = frame + flen;
+        c->rpos = fend;
 
         rc = ngx_http_xngin_conn_frame(c, type, flags, sid, fid,
-                                       p, flen - (p - frame));
+                                       p, (size_t) (fend - p));
         if (rc == NGX_ERROR) {
             return NGX_ERROR;
         }

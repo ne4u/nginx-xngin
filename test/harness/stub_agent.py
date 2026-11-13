@@ -18,13 +18,14 @@ Rules JSON format:
                   "hdr_unset": ["h"], "vars": {"k": "v"},
                   "cache_ttl": 30, "score": 42},
       "behavior": {"delay_ms": 100, "drop": false, "abort": false,
-                   "garbage": false}
+                   "garbage": false, "raw_hex": "0608000000..."}
     }
   ]
 }
 
 Special behaviors: delay_ms, drop (never answer), abort (ABORT frame),
-garbage (send malformed bytes instead of a frame).
+garbage (send malformed bytes instead of a frame), raw_hex (send these
+exact bytes instead of a verdict).
 
 Stats file is refreshed every 0.5s: {"notifies": N, "verdicts": N, ...}
 """
@@ -263,6 +264,9 @@ class Conn:
         if behavior.get("garbage"):
             stats.verdicts += 1
             return b"\xff\xff\xff\xff garbage-not-a-frame"
+        if behavior.get("raw_hex"):
+            stats.verdicts += 1
+            return bytes.fromhex(behavior["raw_hex"])
         if behavior.get("delay_ms"):
             await asyncio.sleep(behavior["delay_ms"] / 1000)
 
