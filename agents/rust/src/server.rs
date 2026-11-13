@@ -170,7 +170,7 @@ impl<H: AgentHandler> Server<H> {
             handler,
             agent_id: "xngin-rs/1".into(),
             max_streams: 256,
-            max_frame: 16384,
+            max_frame: DEFAULT_MAX_FRAME,
         }
     }
 
@@ -252,7 +252,7 @@ where
             Err(_) => return,
         }
 
-        let frames = match feed(&mut buf) {
+        let frames = match feed_max(&mut buf, max_frame) {
             Ok(f) => f,
             Err(_) => return,
         };
