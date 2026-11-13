@@ -63,6 +63,12 @@ const (
 	CapResp   = 0x08
 )
 
+// DefaultMaxFrame is the SPEC default max-frame-size.
+const DefaultMaxFrame = 16384
+
+// maxVarintLen is the longest valid varint encoding of a uint64.
+const maxVarintLen = 10
+
 // ErrProtocol is returned for malformed frames.
 var ErrProtocol = errors.New("xngin: protocol error")
 
@@ -225,6 +231,31 @@ func (d *decoder) need(n int) error {
 	return nil
 }
 
+// remaining is the number of undecoded bytes.
+func (d *decoder) remaining() uint64 {
+	return uint64(len(d.buf) - d.pos)
+}
+
+// take consumes n bytes, comparing the wire length as uint64 so huge
+// values can never wrap to a negative int.
+func (d *decoder) take(n uint64) ([]byte, error) {
+	if n > d.remaining() {
+		return nil, ErrProtocol
+	}
+	b := d.buf[d.pos : d.pos+int(n)]
+	d.pos += int(n)
+	return b, nil
+}
+
+// lenBytes reads a varint length followed by that many bytes.
+func (d *decoder) lenBytes() ([]byte, error) {
+	n, err := d.varint()
+	if err != nil {
+		return nil, ErrProtocol
+	}
+	return d.take(n)
+}
+
 func (d *decoder) value() (Value, error) {
 	if err := d.need(1); err != nil {
 		return nil, err
@@ -257,12 +288,10 @@ func (d *decoder) value() (Value, error) {
 		d.pos += 16
 		return ip, nil
 	case VTStr, VTBin:
-		n, err := d.varint()
-		if err != nil || d.need(int(n)) != nil {
-			return nil, ErrProtocol
+		b, err := d.lenBytes()
+		if err != nil {
+			return nil, err
 		}
-		b := d.buf[d.pos : d.pos+int(n)]
-		d.pos += int(n)
 		if t == VTStr {
 			return string(b), nil
 		}
@@ -270,12 +299,11 @@ func (d *decoder) value() (Value, error) {
 		copy(out, b)
 		return out, nil
 	case VTKVL:
-		n, err := d.varint()
-		if err != nil || d.need(int(n)) != nil {
-			return nil, ErrProtocol
+		b, err := d.lenBytes()
+		if err != nil {
+			return nil, err
 		}
-		sub := &decoder{buf: d.buf[d.pos : d.pos+int(n)]}
-		d.pos += int(n)
+		sub := &decoder{buf: b}
 		var pairs []Pair
 		for {
 			name, v, err := sub.kv()
@@ -293,14 +321,20 @@ func (d *decoder) value() (Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		out := make([]string, 0, n)
+		// every entry needs at least its 1-byte length varint
+		if n > d.remaining() {
+			return nil, ErrProtocol
+		}
+		var out []string
 		for i := uint64(0); i < n; i++ {
-			ln, err := d.varint()
-			if err != nil || d.need(int(ln)) != nil {
-				return nil, ErrProtocol
+			b, err := d.lenBytes()
+			if err != nil {
+				return nil, err
 			}
-			out = append(out, string(d.buf[d.pos:d.pos+int(ln)]))
-			d.pos += int(ln)
+			out = append(out, string(b))
+		}
+		if out == nil {
+			out = []string{}
 		}
 		return out, nil
 	}
@@ -312,12 +346,11 @@ func (d *decoder) kv() (string, Value, error) {
 	if d.pos >= len(d.buf) {
 		return "", nil, nil
 	}
-	n, err := d.varint()
-	if err != nil || d.need(int(n)) != nil {
-		return "", nil, ErrProtocol
+	b, err := d.lenBytes()
+	if err != nil {
+		return "", nil, err
 	}
-	name := string(d.buf[d.pos : d.pos+int(n)])
-	d.pos += int(n)
+	name := string(b)
 	v, err := d.value()
 	return name, v, err
 }
@@ -374,43 +407,50 @@ func (f *Frame) Marshal() []byte {
 	return append(out, body...)
 }
 
-// ReadFrame reads one frame; returns nil,nil when more bytes are needed.
-// Call feed-style: append read bytes to buf, call ParseFrames.
+// ParseFrames decodes complete frames from buf using the SPEC default
+// max-frame-size; see ParseFramesMax.
 func ParseFrames(buf []byte) ([]Frame, []byte, error) {
+	return ParseFramesMax(buf, DefaultMaxFrame)
+}
+
+// ParseFramesMax decodes complete frames from buf and returns them with
+// the unconsumed tail (a partial frame). Call feed-style: append read
+// bytes to buf and call again. Frames whose frame-len exceeds maxFrame
+// are rejected with ErrProtocol before any payload is buffered.
+func ParseFramesMax(buf []byte, maxFrame uint32) ([]Frame, []byte, error) {
 	var frames []Frame
 	for {
 		d := &decoder{buf: buf}
-		start := 0
 		flen, err := d.varint()
 		if err != nil {
-			return frames, buf[start:], nil // need more
+			if len(buf) >= maxVarintLen {
+				return nil, nil, ErrProtocol // overlong varint
+			}
+			return frames, buf, nil // need more
 		}
-		if flen < 6 {
+		if flen < 6 || flen > uint64(maxFrame) {
 			return nil, nil, ErrProtocol
 		}
-		if len(buf)-d.pos < int(flen) {
-			return frames, buf[start:], nil
+		if flen > d.remaining() {
+			return frames, buf, nil
 		}
 		fend := d.pos + int(flen)
-		ftype := buf[d.pos]
-		d.pos++
-		if err := d.need(4); err != nil {
-			return nil, nil, ErrProtocol
-		}
-		flags := binary.BigEndian.Uint32(buf[d.pos:])
-		d.pos += 4
-		sid, err := d.varint()
+		// header fields must lie within the declared frame
+		h := &decoder{buf: buf[d.pos:fend]}
+		ftype := h.buf[0]
+		flags := binary.BigEndian.Uint32(h.buf[1:5])
+		h.pos = 5
+		sid, err := h.varint()
 		if err != nil {
 			return nil, nil, ErrProtocol
 		}
-		fid, err := d.varint()
+		fid, err := h.varint()
 		if err != nil {
 			return nil, nil, ErrProtocol
 		}
-		payload := buf[d.pos:fend]
 		frames = append(frames, Frame{
 			Type: ftype, Flags: flags, SID: sid, FID: fid,
-			Payload: append([]byte(nil), payload...),
+			Payload: append([]byte(nil), h.buf[h.pos:]...),
 		})
 		buf = buf[fend:]
 	}

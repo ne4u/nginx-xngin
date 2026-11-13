@@ -193,6 +193,12 @@ type streamState struct {
 
 func (s *Server) serveConn(c net.Conn) {
 	defer c.Close()
+	defer func() {
+		if r := recover(); r != nil && s.Logger != nil {
+			s.Logger.Printf("xngin: connection %v: panic: %v",
+				c.RemoteAddr(), r)
+		}
+	}()
 
 	maxStreams := s.MaxStreams
 	if maxStreams == 0 {
@@ -235,7 +241,7 @@ func (s *Server) serveConn(c net.Conn) {
 		buf = append(buf, tmp[:n]...)
 
 		var frames []Frame
-		frames, buf, err = ParseFrames(buf)
+		frames, buf, err = ParseFramesMax(buf, maxFrame)
 		if err != nil {
 			return
 		}
@@ -333,9 +339,8 @@ func parseNotify(payload []byte) (string, map[string]Value,
 	map[string][]string, bool) {
 	d := &decoder{buf: payload}
 	msg := ""
-	if n, err := d.varint(); err == nil && d.need(int(n)) == nil {
-		msg = string(d.buf[d.pos : d.pos+int(n)])
-		d.pos += int(n)
+	if b, err := d.lenBytes(); err == nil {
+		msg = string(b)
 	}
 	fields := map[string]Value{}
 	hdrs := map[string][]string{}
