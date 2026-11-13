@@ -1,17 +1,20 @@
 // edge-guard is a real-world xngin agent: IP allow/deny ACLs plus a
-// per-IP token-bucket rate limiter. It demonstrates the xngin-go SDK.
+// per-client token-bucket rate limiter (per IPv4 address, per IPv6 /64).
+// It demonstrates the xngin-go SDK.
 //
 // Flags:
 //
 //	-listen unix:/run/xngin/edge-guard.sock   (or tcp:127.0.0.1:7777)
 //	-allow 10.0.0.0/8,192.168.0.0/16          (optional allowlist CIDRs)
 //	-deny  203.0.113.0/24                     (denylist CIDRs)
-//	-rate  50                                 (requests/sec per IP, 0=off)
+//	-rate  50                                 (requests/sec per IPv4 or IPv6 /64, 0=off)
 //	-burst 20                                 (bucket size)
+//	-max-buckets 100000                       (rate-limit table cap)
 //	-ttl   5                                  (verdict cache-ttl seconds)
 package main
 
 import (
+	"container/list"
 	"context"
 	"flag"
 	"log"
@@ -23,7 +26,10 @@ import (
 	"github.com/xngin/xngin-go/xngin"
 )
 
+const defaultMaxBuckets = 100000
+
 type bucket struct {
+	key    string
 	tokens float64
 	last   time.Time
 }
@@ -35,8 +41,22 @@ type guard struct {
 	burst float64
 	ttl   uint32
 
+	// maxBuckets caps the rate-limit table; the least recently used
+	// bucket is evicted when a new key would exceed it.
+	maxBuckets int
+	now        func() time.Time
+
 	mu      sync.Mutex
-	buckets map[string]*bucket
+	buckets map[string]*list.Element // values are *bucket
+	lru     list.List                // front = most recently used
+}
+
+func newGuard() *guard {
+	return &guard{
+		buckets:    map[string]*list.Element{},
+		maxBuckets: defaultMaxBuckets,
+		now:        time.Now,
+	}
 }
 
 func parseCIDRs(s string) ([]*net.IPNet, error) {
@@ -64,16 +84,59 @@ func contains(nets []*net.IPNet, ip net.IP) bool {
 	return false
 }
 
-// takeToken returns true when a request from ip is within its rate budget.
+// rateKey returns the rate-limit bucket key for ip. IPv6 clients are
+// grouped by /64 since a single subscriber typically controls a whole
+// /64 and could otherwise mint a fresh bucket per address.
+func rateKey(ip net.IP) string {
+	if ip == nil {
+		return "unknown"
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	if v6 := ip.To16(); v6 != nil {
+		return v6.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	}
+	return "unknown"
+}
+
+// idleWindow is how long a bucket takes to refill from empty; an entry
+// idle at least that long is full again, so dropping it loses no state.
+func (g *guard) idleWindow() time.Duration {
+	if g.rate <= 0 {
+		return 0
+	}
+	return time.Duration(g.burst / g.rate * float64(time.Second))
+}
+
+// evictLocked drops idle buckets from the LRU tail, then the oldest
+// buckets until there is room for one more entry. Callers hold g.mu.
+func (g *guard) evictLocked(now time.Time) {
+	idle := g.idleWindow()
+	for e := g.lru.Back(); e != nil; e = g.lru.Back() {
+		b := e.Value.(*bucket)
+		if now.Sub(b.last) < idle && (g.maxBuckets <= 0 || g.lru.Len() < g.maxBuckets) {
+			return
+		}
+		g.lru.Remove(e)
+		delete(g.buckets, b.key)
+	}
+}
+
+// takeToken returns true when a request for key is within its rate budget.
 func (g *guard) takeToken(key string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	b := g.buckets[key]
-	now := time.Now()
-	if b == nil {
-		b = &bucket{tokens: g.burst, last: now}
-		g.buckets[key] = b
+	now := g.now()
+	var b *bucket
+	if e := g.buckets[key]; e != nil {
+		b = e.Value.(*bucket)
+		g.lru.MoveToFront(e)
+	} else {
+		g.evictLocked(now)
+		b = &bucket{key: key, tokens: g.burst, last: now}
+		g.buckets[key] = g.lru.PushFront(b)
 	}
 	b.tokens += now.Sub(b.last).Seconds() * g.rate
 	if b.tokens > g.burst {
@@ -89,10 +152,7 @@ func (g *guard) takeToken(key string) bool {
 
 func (g *guard) Handle(_ context.Context, r *xngin.Request) (*xngin.Verdict, error) {
 	src := r.GetIP("src-ip")
-	key := src.String()
-	if key == "<nil>" || key == "" {
-		key = "unknown"
-	}
+	key := rateKey(src)
 
 	v := xngin.Allow()
 	if g.ttl > 0 {
@@ -137,13 +197,19 @@ func main() {
 			"unix:/path or tcp:host:port")
 		allow = flag.String("allow", "", "comma-separated allowlist CIDRs")
 		deny  = flag.String("deny", "", "comma-separated denylist CIDRs")
-		rate  = flag.Float64("rate", 0, "requests/sec per client IP (0=off)")
+		rate  = flag.Float64("rate", 0, "requests/sec per client IPv4 address or IPv6 /64 (0=off)")
 		burst = flag.Float64("burst", 20, "token bucket size")
 		ttl   = flag.Uint("ttl", 0, "verdict cache-ttl seconds")
+		maxB  = flag.Int("max-buckets", defaultMaxBuckets,
+			"max tracked rate-limit buckets (LRU-evicted)")
 	)
 	flag.Parse()
 
-	g := &guard{buckets: map[string]*bucket{}, ttl: uint32(*ttl)}
+	if *maxB < 1 {
+		log.Fatalf("bad -max-buckets: must be >= 1")
+	}
+	g := newGuard()
+	g.ttl, g.maxBuckets = uint32(*ttl), *maxB
 	var err error
 	if *allow != "" {
 		if g.allow, err = parseCIDRs(*allow); err != nil {
