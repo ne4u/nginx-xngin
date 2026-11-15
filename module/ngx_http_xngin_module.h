@@ -193,6 +193,8 @@ struct ngx_http_xngin_conn_s {
     ngx_msec_t              last_rtt;
     ngx_uint_t              missed_pongs;
 
+    int64_t                 rx_us;      /* µs inside recv this read event */
+
     unsigned                ready:1;
     unsigned                hello_sent:1;
     unsigned                down:1;
@@ -258,6 +260,10 @@ struct ngx_http_xngin_ctx_s {
 
     int64_t                   sent_at;    /* µs, from ngx_timeofday */
     int64_t                   agent_rtt;  /* µs */
+    int64_t                   enc_us;     /* µs encode+queue (engine CPU) */
+    int64_t                   sys_us;     /* µs inside send/recv calls */
+    int64_t                   agent_us;   /* µs rtt not in engine recv */
+    int64_t                   rx_us;      /* µs recv attributed to verdict */
     ngx_flag_t                cache_status;
 
     ngx_str_t                 action;     /* allow/deny/redirect string */

@@ -71,6 +71,9 @@ Requires nginx built `--with-http_ssl_module` and OpenSSL >= 1.1.1.
 | `$xngin_reason` | agent reason string |
 | `$xngin_error` | timeout / down / proto (empty when clean) |
 | `$xngin_agent_rtt_us` | engine↔agent round-trip, microseconds |
+| `$xngin_encode_us` | engine CPU: NOTIFY/BODY encode + queue, microseconds |
+| `$xngin_syscall_us` | time inside agent-conn send/recv calls (incl. TLS record I/O), microseconds |
+| `$xngin_agent_us` | rtt minus attributed recv time ≈ agent-side wait (agent CPU + propagation + wakeup), microseconds |
 | `$xngin_cache` | hit / miss / bypass / disabled |
 | `$xngin_ja4` | JA4 fingerprint of the ClientHello, when `xngin_tls_inspect` is on |
 | `$xngin_<name>` | any key from verdict `vars` (e.g. vars `rule` → `$xngin_rule`); response-stream vars also land here |

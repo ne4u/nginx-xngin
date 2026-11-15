@@ -510,6 +510,7 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
     ngx_buf_t                 *nb;
     u_char                    *data;
     size_t                     n;
+    int64_t                    t0;
     unsigned                   last = 0, send_last = 0;
 
     if (ctx->resp_pass) {
@@ -573,8 +574,10 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
 
         /* stream this chunk to the agent while the download continues */
         if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+            t0 = ngx_http_xngin_now_us();
             ngx_http_xngin_resp_stream_send(rctx, data, n,
                 nb->last_buf || nb->last_in_chain);
+            rctx->enc_us += ngx_http_xngin_now_us() - t0;
         }
 
         cl->buf->pos = cl->buf->last;   /* consumed */
@@ -629,7 +632,9 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
 
     if (!last) {
         if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+            t0 = ngx_http_xngin_now_us();
             ngx_http_xngin_conn_flush_conn(rctx->conn);
+            rctx->sys_us += ngx_http_xngin_now_us() - t0;
         }
         return NGX_OK;
     }
@@ -643,7 +648,9 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
                has to reach the agent */
             ngx_http_xngin_resp_stream_send(rctx, NULL, 0, 1);
         }
+        t0 = ngx_http_xngin_now_us();
         ngx_http_xngin_conn_flush_conn(rctx->conn);
+        rctx->sys_us += ngx_http_xngin_now_us() - t0;
     }
     if (rctx != NULL) {
         rctx->body_stream = 0;
@@ -816,7 +823,10 @@ ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx)
     ngx_http_xngin_loc_conf_t *lcf;
     ngx_http_xngin_conn_t     *conn;
     ngx_xnap_wbuf_t            wb;
+    int64_t                    t0;
     uint32_t                   flags = 0;
+
+    t0 = ngx_http_xngin_now_us();
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
@@ -864,7 +874,11 @@ ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx)
         return NGX_ERROR;
     }
 
+    rctx->enc_us += ngx_http_xngin_now_us() - t0;
+
+    t0 = ngx_http_xngin_now_us();
     ngx_http_xngin_conn_flush_conn(conn);
+    rctx->sys_us += ngx_http_xngin_now_us() - t0;
 
     rctx->state = XNAP_ST_SENT;
     rctx->sent_at = ngx_http_xngin_now_us();
@@ -1018,7 +1032,13 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
     r = ctx->r;
 
     rctx->agent_rtt = ngx_http_xngin_now_us() - rctx->sent_at;
+    rctx->sys_us += rctx->rx_us;
+    rctx->agent_us = rctx->agent_rtt - rctx->rx_us;
+
     ctx->agent_rtt = rctx->agent_rtt;
+    ctx->enc_us += rctx->enc_us;
+    ctx->sys_us += rctx->sys_us;
+    ctx->agent_us += rctx->agent_us;
 
     ngx_http_xngin_stream_del(c, rctx->stream_id);
     rctx->conn = NULL;

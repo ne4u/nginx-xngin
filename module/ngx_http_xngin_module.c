@@ -48,6 +48,8 @@ static ngx_int_t ngx_http_xngin_var_error(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_xngin_var_rtt(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_xngin_var_us(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_xngin_var_cache(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_xngin_var_ja4(ngx_http_request_t *r,
@@ -211,6 +213,18 @@ static ngx_http_variable_t ngx_http_xngin_vars[] = {
 
     { ngx_string("xngin_agent_rtt_us"), NULL,
       ngx_http_xngin_var_rtt, 0,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+    { ngx_string("xngin_encode_us"), NULL,
+      ngx_http_xngin_var_us, offsetof(ngx_http_xngin_ctx_t, enc_us),
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+    { ngx_string("xngin_syscall_us"), NULL,
+      ngx_http_xngin_var_us, offsetof(ngx_http_xngin_ctx_t, sys_us),
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+    { ngx_string("xngin_agent_us"), NULL,
+      ngx_http_xngin_var_us, offsetof(ngx_http_xngin_ctx_t, agent_us),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("xngin_cache"), NULL,
@@ -1316,6 +1330,35 @@ ngx_http_xngin_var_rtt(ngx_http_request_t *r,
     }
 
     v->len = ngx_sprintf(p, "%L", ctx->agent_rtt) - p;
+    v->data = p;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_xngin_var_us(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_xngin_ctx_t *ctx = ngx_http_xngin_get_ctx(r, v);
+    int64_t             *field;
+    u_char              *p;
+
+    if (ctx == NULL || !ctx->dispatched) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    p = ngx_pnalloc(r->pool, NGX_INT64_LEN);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    field = (int64_t *) ((u_char *) ctx + data);
+
+    v->len = ngx_sprintf(p, "%L", *field) - p;
     v->data = p;
     v->valid = 1;
     v->no_cacheable = 0;

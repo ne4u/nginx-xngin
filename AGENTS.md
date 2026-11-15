@@ -10,7 +10,9 @@
 - `test/conformance/` — shared `vectors.json` consumed by all three codecs;
   regenerate with `python3 test/conformance/gen_vectors.py`
 - `test/cases/` — pytest integration suite
-- `test/bench/`, `test/fuzz/`, `docker-compose.yml`, `test/Dockerfile`
+- `test/bench/` — `bench.py` lane harness + `echo_agent.c` (minimal C
+  XNAP agent; bench.py cc-compiles it for the `c-echo` lane)
+- `test/fuzz/`, `docker-compose.yml`, `test/Dockerfile`
 
 ## Build the module (macOS/Linux)
 ```sh

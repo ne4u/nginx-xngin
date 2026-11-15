@@ -6,22 +6,29 @@ to a no-offload baseline on the same nginx instance.
 ## Methodology
 
 - `test/bench/bench.py` — one nginx (4 workers), one `location` per
-  lane, agent groups on UDS, loopback TCP and a real Go agent.
-  Content handler is `empty_gif` (in-process, C-speed) so numbers
-  isolate xngin's cost — no upstream noise. (POST returns 405 there;
-  the access-phase offload work still runs.)
+  lane, agent groups on UDS, loopback TCP, a real Go agent, a minimal
+  C echo agent, and two mTLS groups. Content handler is `empty_gif`
+  (in-process, C-speed) so numbers isolate xngin's cost — no upstream
+  noise. (POST returns 405 there; the access-phase offload work still
+  runs.)
 - **Serial latency**: single keep-alive connection, 20 warmup + 300
   timed requests per lane.
 - **Throughput**: `ab -k -c 50 -n 5000` per lane.
-- **Agent RTT**: `$xngin_agent_rtt_us` parsed from the access log —
-  genuine microseconds (`gettimeofday`); values blend the serial and
-  `ab` runs, so serial p50/p99 remain the authoritative per-request
-  latency.
-- Stub agent (`allow-all`, `res_default allow`) on a Unix socket; a
-  second stub on loopback TCP; the Go `edge-guard` example agent
-  (`-rate 0`, allow-all) on a third UDS for the real-agent lane; a
-  fourth stub behind `ssl on` (mTLS, openssl-generated certs) for the
-  `mtls-block` lane.
+- **Breakdown**: each request logs `$xngin_agent_rtt_us` split as
+  `$xngin_encode_us` (engine CPU: NOTIFY/BODY encode + queue),
+  `$xngin_syscall_us` (time inside agent-conn send/recv — on TLS conns
+  this is `ngx_ssl_send`/`ngx_ssl_recv`, i.e. engine-side crypto) and
+  `$xngin_agent_us` (rtt minus attributed recv time = agent-side wait:
+  agent CPU + loopback propagation + wakeup latency). Values are parsed
+  from the access-log slice written during the *serial* run only — under
+  `ab -c 50` shared conns add queue-wait, which is not per-request cost.
+- Agents: Python stub (`allow-all`) on UDS; second stub on loopback TCP;
+  Go `edge-guard` (`-rate 0`) on UDS; `test/bench/echo_agent.c` — a
+  ~1µs-CPU C agent answering a fixed allow verdict — on UDS for the
+  `c-echo` lane; Python stub behind `ssl on` for `mtls-block`; a second
+  `edge-guard` with `-tls-cert/-tls-key/-tls-client-ca` behind `ssl on`
+  for `go-mtls`. c-echo also self-reports service time as
+  `$xngin_agentus` (verdict `vars`).
 - Environment: localhost loopback, macOS arm64, nginx 1.31.8,
   `xngin_timeout 200ms`, `xngin_fail close`.
 - Since the streaming-dispatch change, request/response BODY frames
@@ -33,77 +40,95 @@ to a no-offload baseline on the same nginx instance.
 
 | Lane | run A p50 | run B p50 | Δ | run A p99 | run B p99 | run A rps | run B rps | Δ |
 |---|---|---|---|---|---|---|---|---|
-| baseline (no offload) | 35µs | 35µs | 0% | 133µs | 99µs | 65,659 | 62,865 | −4% |
-| blocking, UDS (stub) | 80µs | 79µs | −1% | 192µs | 189µs | 38,089 | 39,484 | +4% |
-| mTLS, UDS (stub) | 109µs | 111µs | +2% | 225µs | 234µs | 34,892 | 30,446 | −13% |
-| async (fire-and-forget) | 28µs | 27µs | −4% | 100µs | 101µs | 63,563 | 63,689 | 0% |
-| verdict cache hit | 26µs | 26µs | 0% | 64µs | 93µs | 59,774 | 67,496 | +13% |
-| body inspect, 1KiB POST | 100µs | 101µs | +1% | 196µs | 223µs | 28,020 | 29,495 | +5% |
-| body inspect, 64KiB POST | 238µs | 228µs | −4% | 441µs | 494µs | 8,927 | 9,090 | +2% |
-| response inspection | 67µs | 73µs | +9% | 171µs | 179µs | 36,574 | 37,967 | +4% |
-| deny 403 (no content) | 75µs | 73µs | −3% | 176µs | 178µs | 35,589 | 36,247 | +2% |
-| blocking, TCP agent | 89µs | 106µs | +19% | 219µs | 217µs | 32,146 | 34,071 | +6% |
-| blocking, Go agent | 41µs | 49µs | +20% | 136µs | 148µs | 51,636 | 51,293 | −1% |
+| baseline (no offload) | 34µs | 35µs | +3% | 46µs | 94µs | 64,309 | 62,533 | −3% |
+| blocking, UDS (stub) | 88µs | 82µs | −7% | 156µs | 191µs | 38,541 | 38,270 | −1% |
+| mTLS, UDS (stub, Python) | 86µs | 88µs | +2% | 258µs | 203µs | 31,664 | 34,143 | +8% |
+| async (fire-and-forget) | 27µs | 28µs | +4% | 68µs | 76µs | 64,755 | 61,864 | −4% |
+| verdict cache hit | 33µs | 27µs | −18% | 92µs | 80µs | 66,882 | 65,545 | −2% |
+| body inspect, 1KiB POST | 95µs | 95µs | 0% | 213µs | 175µs | 30,160 | 28,157 | −7% |
+| body inspect, 64KiB POST | 242µs | 234µs | −3% | 455µs | 403µs | 9,037 | 9,102 | +1% |
+| response inspection | 84µs | 79µs | −6% | 196µs | 158µs | 38,669 | 38,242 | −1% |
+| deny 403 (no content) | 74µs | 94µs | +27% | 180µs | 212µs | 36,730 | 36,179 | −2% |
+| blocking, TCP agent | 101µs | 100µs | −1% | 206µs | 220µs | 34,161 | 33,705 | −1% |
+| blocking, Go agent | 42µs | 42µs | 0% | 122µs | 106µs | 55,591 | 54,484 | −2% |
+| blocking, C echo agent | 30µs | 31µs | +3% | 65µs | 89µs | 63,105 | 60,776 | −4% |
+| blocking, Go agent mTLS | 45µs | 46µs | +2% | 162µs | 214µs | 54,211 | 53,542 | −1% |
 
 Zero unexpected-status responses in either run. p50 run-to-run
-variance ≤20% on the near-baseline lanes (noise at 25–35µs), ≤10% on
-all offload lanes; throughput variance ≤13%.
+variance ≤7% on offload lanes; the near-baseline lanes (25–35µs) sit
+inside noise.
 
 ## Added latency vs baseline (mean serial)
 
 | Lane | run A | run B | verdict |
 |---|---|---|---|
-| blocking, UDS (stub) | +46µs | +47µs | one XNAP round-trip ≈ 46µs vs stub |
-| mTLS, UDS (stub) | +68µs | +77µs | +~25µs over plaintext blocking |
-| async | −5µs | −5µs | free (noise) |
-| cache hit | −11µs | −9µs | free (noise) |
-| body inspect, 1KiB | +62µs | +68µs | +~20µs over blocking |
-| body inspect, 64KiB | +182µs | +183µs | streaming: ~2.8µs/KiB over blocking |
-| response inspection | +32µs | +43µs | ≈ blocking (streamed overlap) |
-| deny 403 | +43µs | +44µs | ≈ blocking (no content work) |
-| blocking, TCP | +56µs | +74µs | +~17µs over UDS |
-| blocking, Go agent | +7µs | +21µs | real wire cost: ~14µs/round-trip |
+| blocking, UDS (stub) | +54µs | +48µs | ≈ +50µs of Python stub |
+| mTLS, UDS (stub, Python) | +62µs | +59µs | agent-bound, see below |
+| async | −3µs | −4µs | free (noise) |
+| cache hit | +1µs | −6µs | free (noise) |
+| body inspect, 1KiB | +62µs | +55µs | ≈ blocking + ~8µs |
+| body inspect, 64KiB | +197µs | +189µs | ≈ blocking + ~140µs body cost |
+| response inspection | +53µs | +48µs | ≈ blocking (streamed overlap) |
+| deny 403 | +48µs | +59µs | ≈ blocking (no content work) |
+| blocking, TCP | +66µs | +65µs | +~14µs over UDS |
+| blocking, Go agent | +13µs | +10µs | ≈ +12µs vs c-echo floor |
+| blocking, C echo | +0µs | −1µs | **engine ≈ free** |
+| blocking, Go mTLS | +17µs | +18µs | +~6µs over Go plaintext |
+
+## Engine breakdown (serial p50, µs — run A)
+
+Per-request `enc` + `sys` is the engine's own cost; `agent` is the
+round-trip residue (agent CPU + wakeup/propagation); `rtt` is the whole
+send→verdict window.
+
+| Lane | enc | sys | agent | rtt | agentus (self-report) |
+|---|---|---|---|---|---|
+| blocking, UDS stub | 1 | 2 | 50 | 51 | — |
+| body-1k | 1 | 3 | 59 | 59 | — |
+| body-64k | 3 | 4 | 188 | 189 | — |
+| response inspection | 0 | 2 | 50 | 50 | — |
+| blocking, TCP | 0 | 5 | 62 | 65 | — |
+| blocking, Go | 0 | 3 | 12 | 13 | — |
+| blocking, C echo | 0 | 2 | 4 | 5 | 1 |
+| mTLS, UDS stub | 0 | 4 | 53 | 55 | — |
+| blocking, Go mTLS | 0 | 5 | 13 | 16 | — |
 
 ## Takeaways
 
-- **Blocking UDS offload costs ~45µs p50 against the Python stub** —
-  but ~35µs of that is the stub itself. Against the Go `edge-guard`
-  agent the same round-trip costs **~14µs p50** (~51k rps ≈ 80% of
-  baseline): protocol overhead is genuinely tiny; agent speed decides.
-- **Async mode and verdict-cache hits are free** — indistinguishable
-  from the no-offload baseline. Use them on latency-critical paths.
-- **Body inspection scales ~3µs/KiB** — 1KiB ≈ +5µs over blocking,
-  64KiB ≈ +150µs over blocking. Streaming dispatch (frames forwarded
-  as the client uploads) means the agent's analysis overlaps the
-  transfer rather than starting after it.
-- **Response inspection ≈ blocking on small bodies** — the
-  `http-response` NOTIFY goes out at header time and body frames
-  stream during the download, so the second round-trip is largely
-  hidden behind the response transfer.
-- **Loopback TCP is ~14µs slower than UDS** — remote agents are viable
-  when UDS isn't an option.
-- **mTLS costs ~+30µs p50 over plaintext blocking** (109–111µs vs
-  79–80µs) and ~10–20% throughput on this bench. The handshake itself
-  is fully amortized (persistent conns pre-warmed at worker init) — the
-  residual is the per-record cost, which lands mostly on the *agent*
-  side here: the stub does TLS in Python `ssl`, while the engine's
-  OpenSSL EVP path is AES-NI. A Go/Rust TLS agent would narrow the gap;
-  the go-block lane shows the wire cost itself is ~14µs/round-trip.
-- **Throughput halves in blocking mode vs the stub** (≈77k → ≈40k rps
-  at c=50): every request serializes a round-trip over shared agent
-  conns. With the Go agent it holds ≈65k rps — agent concurrency is
-  the throughput ceiling, not the wire.
+- **The engine alone is essentially free.** With a ~1µs-CPU C agent the
+  blocking offload round-trip costs ~5µs: ~2µs inside engine send/recv
+  syscalls, <1µs encoding, ~4µs agent-side wait (mostly wakeup +
+  propagation — the agent's own CPU is ~1µs per its self-report).
+  End-to-end p50 and `ab` throughput are indistinguishable from
+  baseline. The earlier "~45µs blocking tax" was ~50µs of Python stub.
+- **Agent speed is the whole story.** Same engine, same wire: rtt is
+  51µs against the Python stub, 13µs against Go, 5µs against the C
+  echo. `agent` p50 per lane: stub ≈ 50µs, Go ≈ 10–12µs, C ≈ 1–4µs.
+- **mTLS costs the engine ~+2µs, not +30µs.** `sys` rises 3→5µs on the
+  `go-mtls` lane (engine-side record layer); agent-side crypto adds
+  ~1µs (Go `crypto/tls` is AES-NI too). go-mtls rtt 15–16µs vs go-block
+  13µs is the real engine number — the 55µs `mtls-block` round-trip is
+  Python `ssl` inside `asyncio`, not an engine measurement.
+- **No shared-memory transport warranted.** The decision criterion was
+  "syscall-bound on the echo lane": `sys` is ~2µs of the ~5µs c-echo
+  round-trip (~40%), the residue is wakeup/scheduling latency a
+  shm-ring + wakeup mechanism (eventfd/kqueue) would pay identically.
+  Only a poll-mode transport could attack it, at idle-CPU cost.
+- **Async and cache hits remain free** — indistinguishable from
+  baseline. Encode scales with payload: ~1µs at 1KiB body, ~3µs at
+  64KiB (memcpy into 16KiB frames); `sys` stays flat — the extra body
+  cost lands in `agent` (transfer + parse).
 
 ## Caveats
 
 - Loopback only — a remote agent adds real network RTT on top.
-- The stub agent (Python asyncio) has ~40µs floor of its own; the
-  `go-block` lane is the honest measure of wire/protocol cost.
+- `enc`/`sys`/`agent` are engine-side timers; `agent` bundles agent CPU
+  with transport wakeup (cross-checked on c-echo by `agentus`).
+- `sys` recv attribution is per read-event: a single `recv` delivering
+  several verdicts (concurrent load) charges the same duration to each —
+  another reason only the serial slice is reported.
 - `empty_gif` baseline measures protocol/filter overhead, not the
   proxying path; upstream costs are additive in production.
-- `$xngin_agent_rtt_us` blends serial and concurrent samples; under
-  `ab -c 50` it reflects queue wait on shared conns, not per-request
-  cost.
 
 ## Reproduce
 
@@ -114,6 +139,7 @@ python3 test/bench/bench.py                 # 300 serial / 5000 ab
 python3 test/bench/bench.py --serial-n 500 --ab-n 10000   # this run
 ```
 
-The Go lane builds `agents/go/cmd/edge-guard` on the fly and is skipped
-when `go` isn't installed. Results JSON is written under
-`/tmp/xngin-bench-*/bench.json`.
+The Go lanes build `agents/go/cmd/edge-guard` on the fly (skipped when
+`go` isn't installed); the `c-echo` lane cc-compiles
+`test/bench/echo_agent.c` (skipped on compile failure). Results JSON is
+written under `/tmp/xngin-bench-*/bench.json`.

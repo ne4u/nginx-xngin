@@ -375,6 +375,7 @@ ngx_http_xngin_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     size_t                  chunk_max, n;
     u_char                 *pos;
     uint32_t                flags;
+    int64_t                 t0;
     unsigned                last;
 
     rc = ngx_http_xngin_next_body_filter(r, in);
@@ -394,6 +395,8 @@ ngx_http_xngin_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     chunk_max = conn->max_frame;
     chunk_max = (chunk_max > 64) ? chunk_max - 32 : chunk_max;
+
+    t0 = ngx_http_xngin_now_us();
 
     for (cl = in; cl; cl = cl->next) {
         b = cl->buf;
@@ -442,7 +445,11 @@ ngx_http_xngin_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
     }
 
+    ctx->enc_us += ngx_http_xngin_now_us() - t0;
+
+    t0 = ngx_http_xngin_now_us();
     ngx_http_xngin_conn_flush_conn(conn);
+    ctx->sys_us += ngx_http_xngin_now_us() - t0;
 
     return rc;
 }
@@ -469,8 +476,11 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
     size_t                      bound;
     uint32_t                    flags = 0;
     ngx_int_t                   rc;
+    int64_t                     t0, t1;
     unsigned                    has_body = 0;
     unsigned                    sent_notify = 0;
+
+    t0 = ngx_http_xngin_now_us();
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
@@ -549,8 +559,12 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
         }
     }
 
+    ctx->enc_us += ngx_http_xngin_now_us() - t0;
+
     /* one writev for NOTIFY + all queued BODY frames */
+    t1 = ngx_http_xngin_now_us();
     ngx_http_xngin_conn_flush_conn(conn);
+    ctx->sys_us += ngx_http_xngin_now_us() - t1;
 
     ctx->state = XNAP_ST_SENT;
     ctx->sent_at = ngx_http_xngin_now_us();
@@ -1074,6 +1088,8 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
     }
 
     ctx->agent_rtt = ngx_http_xngin_now_us() - ctx->sent_at;
+    ctx->sys_us += ctx->rx_us;
+    ctx->agent_us = ctx->agent_rtt - ctx->rx_us;
 
     ngx_http_xngin_stream_del(c, ctx->stream_id);
     ctx->conn = NULL;

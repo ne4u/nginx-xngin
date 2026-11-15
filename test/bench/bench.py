@@ -13,11 +13,17 @@ still runs):
   /deny      agent denies 403 (no content handler)
   /tcpblock  blocking verdict, loopback-TCP agent
   /goblock   blocking verdict, Go edge-guard agent (rate=0, UDS)
+  /cecho     blocking verdict, C echo agent (fixed allow, UDS)
+  /mtlsblock blocking verdict, Python stub agent over mTLS (agent-bound)
+  /gomtls    blocking verdict, Go edge-guard agent over mTLS
 
 Measures:
   * serial keep-alive prober -> per-request p50/p95/p99 (us)
   * ab -k -c 50 -n 5000    -> throughput + mean latency
   * $xngin_agent_rtt_us    -> engine-side agent RTT (access log)
+  * $xngin_encode_us / $xngin_syscall_us / $xngin_agent_us
+    -> engine CPU vs socket I/O vs agent-side time (access log)
+  * $xngin_agentus         -> c-echo agent's self-reported svc time
 
 Usage:
   python3 test/bench/bench.py [--serial-n 300] [--ab-n 5000] [--ab-c 50]
@@ -54,6 +60,8 @@ events {{ worker_connections 2048; }}
 
 http {{
     log_format xnginlog 'uri=$uri st=$status rtt=$xngin_agent_rtt_us '
+                        'enc=$xngin_encode_us sys=$xngin_syscall_us '
+                        'agt=$xngin_agent_us aus=$xngin_agentus '
                         'cache=$xngin_cache err=$xngin_error';
     access_log {root}/logs/access.log xnginlog;
 
@@ -72,8 +80,22 @@ http {{
         keepalive 2;
         ping_interval 60s;
     }}
+    xngin_agent_group cecho {{
+        server unix:{c_sock};
+        keepalive 2;
+        ping_interval 60s;
+    }}
     xngin_agent_group mtls {{
         server unix:{mtls_sock};
+        ssl on;
+        ssl_trusted_certificate {mtls_ca};
+        ssl_certificate {mtls_eng_crt};
+        ssl_certificate_key {mtls_eng_key};
+        keepalive 2;
+        ping_interval 60s;
+    }}
+    xngin_agent_group gomtls {{
+        server unix:{go_mtls_sock};
         ssl on;
         ssl_trusted_certificate {mtls_ca};
         ssl_certificate {mtls_eng_crt};
@@ -125,8 +147,16 @@ http {{
             xngin_enable on; xngin_group go;
             empty_gif;
         }}
+        location /cecho {{
+            xngin_enable on; xngin_group cecho;
+            empty_gif;
+        }}
         location /mtlsblock {{
             xngin_enable on; xngin_group mtls;
+            empty_gif;
+        }}
+        location /gomtls {{
+            xngin_enable on; xngin_group gomtls;
             empty_gif;
         }}
     }}
@@ -154,7 +184,9 @@ LANES = [
     ("deny-403",  "/deny/x",      "GET",  None,          403),
     ("tcp-block", "/tcpblock/x",  "GET",  None,          200),
     ("go-block",  "/goblock/x",   "GET",  None,          200),
+    ("c-echo",    "/cecho/x",     "GET",  None,          200),
     ("mtls-block", "/mtlsblock/x", "GET", None,          200),
+    ("go-mtls",   "/gomtls/x",    "GET",  None,          200),
 ]
 
 REPO = os.path.dirname(os.path.dirname(
@@ -162,14 +194,28 @@ REPO = os.path.dirname(os.path.dirname(
 
 
 def build_go_agent(root):
-    """Build edge-guard for the go-block lane; None when go is missing."""
+    """Build edge-guard for the go lanes; None when go is missing."""
     dst = os.path.join(root, "edge-guard")
     r = subprocess.run(
         ["go", "build", "-o", dst, "./cmd/edge-guard"],
         cwd=os.path.join(REPO, "agents", "go"),
         capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"note: go build failed, skipping go-block lane\n{r.stderr}",
+        print(f"note: go build failed, skipping go lanes\n{r.stderr}",
+              flush=True)
+        return None
+    return dst
+
+
+def build_c_agent(root):
+    """Compile the C echo agent for the c-echo lane; None on failure."""
+    dst = os.path.join(root, "xnap-echo")
+    r = subprocess.run(
+        ["cc", "-O2", "-pthread", "-o", dst,
+         os.path.join(REPO, "test", "bench", "echo_agent.c")],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"note: cc failed, skipping c-echo lane\n{r.stderr}",
               flush=True)
         return None
     return dst
@@ -268,16 +314,33 @@ def ab_bench(port, path, method, body, n, c, tmpdir):
             int(fails.group(1)) if fails else -1)
 
 
-def log_rtts(access_log, uri):
-    """$xngin_agent_rtt_us values for a lane from the access log."""
-    out = []
-    pat = re.compile(rf"uri={re.escape(uri)} .*rtt=(\d+)")
+METRIC_KEYS = ("rtt", "enc", "sys", "agt", "aus")
+
+
+def log_metrics(access_log, uri, start=None, end=None):
+    """per-request engine-side timings for a lane from the access log.
+    start/end are byte offsets delimiting the serial-bench window —
+    rtt/enc/sys/agt blend queue-wait under `ab -c 50`, so only the
+    serial slice gives honest per-request numbers."""
+    out = {k: [] for k in METRIC_KEYS}
+    pat = re.compile(
+        rf"uri={re.escape(uri)} .*"
+        r"rtt=(\d+|-).*enc=(\d+|-).*sys=(\d+|-).*agt=(\d+|-).*aus=(\d+|-)")
     try:
         with open(access_log) as f:
-            for line in f:
+            if start:
+                f.seek(start)
+            if end is None:
+                lines = f.read().splitlines()
+            else:
+                lines = f.read(end - f.tell()).splitlines()
+            for line in lines:
                 m = pat.search(line)
-                if m:
-                    out.append(int(m.group(1)))
+                if not m:
+                    continue
+                for k, g in zip(METRIC_KEYS, m.groups()):
+                    if g != "-":
+                        out[k].append(int(g))
     except OSError:
         pass
     return out
@@ -303,13 +366,21 @@ def main():
              "client_ca": certs["ca"]})
 
     go_sock = os.path.join(root, "edge-guard.sock")
+    go_mtls_sock = os.path.join(root, "edge-guard-mtls.sock")
+    c_sock = os.path.join(root, "xnap-echo.sock")
     go_bin = build_go_agent(root)
-    lanes = LANES if go_bin else [l for l in LANES if l[0] != "go-block"]
+    c_bin = build_c_agent(root)
+    lanes = LANES
+    if not go_bin:
+        lanes = [l for l in lanes if l[0] not in ("go-block", "go-mtls")]
+    if not c_bin:
+        lanes = [l for l in lanes if l[0] != "c-echo"]
 
     conf = CONF.format(
         module_so=stacklib.MODULE_SO, root=root,
         uds_sock=uds_agent.sock, tcp_port=tcp_agent.port,
-        go_sock=go_sock,
+        go_sock=go_sock, go_mtls_sock=go_mtls_sock,
+        c_sock=c_sock,
         mtls_sock=mtls_agent.sock, mtls_ca=certs["ca"],
         mtls_eng_crt=certs["engine_cert"],
         mtls_eng_key=certs["engine_key"],
@@ -321,6 +392,8 @@ def main():
     port = int(re.search(r"listen (\d+);", conf).group(1))
     procs = []
     go_proc = None
+    go_mtls_proc = None
+    c_proc = None
     try:
         uds_agent.start(root)
         tcp_agent.start(root)
@@ -328,6 +401,16 @@ def main():
         if go_bin:
             go_proc = subprocess.Popen(
                 [go_bin, "-listen", f"unix:{go_sock}", "-rate", "0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            go_mtls_proc = subprocess.Popen(
+                [go_bin, "-listen", f"unix:{go_mtls_sock}", "-rate", "0",
+                 "-tls-cert", certs["agent_cert"],
+                 "-tls-key", certs["agent_key"],
+                 "-tls-client-ca", certs["ca"]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if c_bin:
+            c_proc = subprocess.Popen(
+                [c_bin, "-listen", f"unix:{c_sock}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(subprocess.Popen(
             [stacklib.NGINX_BIN, "-c", conf_path, "-p", root],
@@ -343,7 +426,9 @@ def main():
         # wait for the agent group to be ready too: fail-close would 503
         # until conns complete the XNAP handshake
         for ready_path in ("/x", "/mtlsblock/x",
-                           "/goblock/x" if go_bin else None):
+                           "/goblock/x" if go_bin else None,
+                           "/gomtls/x" if go_bin else None,
+                           "/cecho/x" if c_bin else None):
             if ready_path is None:
                 continue
             for _ in range(100):
@@ -366,24 +451,34 @@ def main():
             finally:
                 ka.close()
 
+        log_path = os.path.join(root, "logs", "access.log")
         rows = []
         for name, path, method, body, want in lanes:
+            log_off = os.path.getsize(log_path)
             ts, bad = serial_bench(port, path, method, body, want,
                                    args.serial_n)
+            log_end = os.path.getsize(log_path)
             rps, lat_us, fails = ab_bench(port, path, method, body,
                                           args.ab_n, args.ab_c, root)
-            rtts = log_rtts(os.path.join(root, "logs", "access.log"), path)
+            met = log_metrics(log_path, path, log_off, log_end)
             rows.append({
                 "lane": name, "n": len(ts), "bad_status": bad,
                 "p50": pct(ts, 50), "p95": pct(ts, 95), "p99": pct(ts, 99),
                 "mean": statistics.fmean(ts),
                 "ab_rps": rps, "ab_lat_us": lat_us, "ab_fails": fails,
-                "rtt_p50": pct(rtts, 50) if rtts else None,
-                "rtt_p99": pct(rtts, 99) if rtts else None,
+                "rtt_p50": pct(met["rtt"], 50) if met["rtt"] else None,
+                "rtt_p99": pct(met["rtt"], 99) if met["rtt"] else None,
+                "enc_p50": pct(met["enc"], 50) if met["enc"] else None,
+                "sys_p50": pct(met["sys"], 50) if met["sys"] else None,
+                "agt_p50": pct(met["agt"], 50) if met["agt"] else None,
+                "aus_p50": pct(met["aus"], 50) if met["aus"] else None,
             })
-            print(f"{name:10s} p50={rows[-1]['p50']:7.0f}us "
-                  f"p99={rows[-1]['p99']:7.0f}us "
-                  f"ab={rps:8.0f}rps rtt_p50={rows[-1]['rtt_p50']}"
+            r = rows[-1]
+            print(f"{name:10s} p50={r['p50']:7.0f}us "
+                  f"p99={r['p99']:7.0f}us "
+                  f"ab={rps:8.0f}rps rtt_p50={r['rtt_p50']} "
+                  f"enc={r['enc_p50']} sys={r['sys_p50']} "
+                  f"agt={r['agt_p50']}"
                   + (f"  !! {bad} bad-status" if bad else ""),
                   flush=True)
 
@@ -398,11 +493,22 @@ def main():
             print(f"{r['lane']:10s} +{r['mean'] - base:7.0f}us  "
                   f"(mean {r['mean']:.0f}us, ab {r['ab_rps']:.0f} rps)")
 
+        print("\n=== offload breakdown (log p50, us) ===")
+        print(f"{'lane':10s} {'enc':>6s} {'sys':>6s} {'agent':>6s} "
+              f"{'rtt':>6s} {'agentus':>7s}")
+        for r in rows:
+            if r["enc_p50"] is None:
+                continue
+            aus = "-" if r["aus_p50"] is None else str(r["aus_p50"])
+            print(f"{r['lane']:10s} {r['enc_p50']:6d} {r['sys_p50']:6d} "
+                  f"{r['agt_p50'] or 0:6d} {r['rtt_p50'] or 0:6d} {aus:>7s}")
+
     finally:
         for p in procs:
             p.terminate()
-        if go_proc:
-            go_proc.terminate()
+        for p in (go_proc, go_mtls_proc, c_proc):
+            if p:
+                p.terminate()
         for a in (uds_agent, tcp_agent, mtls_agent):
             if a.proc:
                 a.proc.terminate()

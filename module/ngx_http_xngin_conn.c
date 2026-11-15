@@ -824,6 +824,7 @@ ngx_http_xngin_conn_frame(ngx_http_xngin_conn_t *c, u_char type,
         if (ctx == NULL) {
             return NGX_OK;  /* late verdict for aborted stream */
         }
+        ctx->rx_us = c->rx_us;  /* recv time of the delivering read event */
         if (ctx->is_resp) {
             return ngx_http_xngin_resp_verdict(c, ctx, payload, len);
         }
@@ -980,10 +981,13 @@ ngx_http_xngin_conn_read(ngx_event_t *ev)
     ssize_t                n;
     ngx_int_t              rc;
     size_t                 used, space;
+    int64_t                t0;
 
     if (c->down) {
         return;
     }
+
+    c->rx_us = 0;   /* recv-call time accumulates across this read event */
 
     for (;;) {
         /* compact read buffer */
@@ -1003,7 +1007,9 @@ ngx_http_xngin_conn_read(ngx_event_t *ev)
             return;
         }
 
+        t0 = ngx_http_xngin_now_us();
         n = nc->recv(nc, c->rlast, space);
+        c->rx_us += ngx_http_xngin_now_us() - t0;
 
         if (n > 0) {
             c->rlast += n;
