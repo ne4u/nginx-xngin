@@ -10,16 +10,18 @@ to a no-offload baseline on the same nginx instance.
   Content handler is `empty_gif` (in-process, C-speed) so numbers
   isolate xngin's cost — no upstream noise. (POST returns 405 there;
   the access-phase offload work still runs.)
-- **Serial latency**: single keep-alive connection, 50 warmup + 500
+- **Serial latency**: single keep-alive connection, 20 warmup + 300
   timed requests per lane.
-- **Throughput**: `ab -k -c 50 -n 10000` per lane.
+- **Throughput**: `ab -k -c 50 -n 5000` per lane.
 - **Agent RTT**: `$xngin_agent_rtt_us` parsed from the access log —
   genuine microseconds (`gettimeofday`); values blend the serial and
   `ab` runs, so serial p50/p99 remain the authoritative per-request
   latency.
 - Stub agent (`allow-all`, `res_default allow`) on a Unix socket; a
   second stub on loopback TCP; the Go `edge-guard` example agent
-  (`-rate 0`, allow-all) on a third UDS for the real-agent lane.
+  (`-rate 0`, allow-all) on a third UDS for the real-agent lane; a
+  fourth stub behind `ssl on` (mTLS, openssl-generated certs) for the
+  `mtls-block` lane.
 - Environment: localhost loopback, macOS arm64, nginx 1.31.8,
   `xngin_timeout 200ms`, `xngin_fail close`.
 - Since the streaming-dispatch change, request/response BODY frames
@@ -31,40 +33,42 @@ to a no-offload baseline on the same nginx instance.
 
 | Lane | run A p50 | run B p50 | Δ | run A p99 | run B p99 | run A rps | run B rps | Δ |
 |---|---|---|---|---|---|---|---|---|
-| baseline (no offload) | 33µs | 33µs | 0% | 60µs | 64µs | 78,465 | 77,698 | −1% |
-| blocking, UDS (stub) | 88µs | 89µs | +1% | 163µs | 167µs | 41,351 | 38,828 | −6% |
-| async (fire-and-forget) | 27µs | 34µs | +26% | 78µs | 75µs | 77,347 | 76,685 | −1% |
-| verdict cache hit | 26µs | 30µs | +15% | 53µs | 65µs | 78,703 | 77,804 | −1% |
-| body inspect, 1KiB POST | 95µs | 90µs | −5% | 167µs | 161µs | 29,216 | 28,570 | −2% |
-| body inspect, 64KiB POST | 239µs | 240µs | 0% | 435µs | 461µs | 9,306 | 9,126 | −2% |
-| response inspection | 93µs | 80µs | −14% | 173µs | 161µs | 37,627 | 38,321 | +2% |
-| deny 403 (no content) | 91µs | 88µs | −3% | 148µs | 159µs | 34,372 | 37,251 | +8% |
-| blocking, TCP agent | 101µs | 100µs | −1% | 199µs | 203µs | 33,385 | 34,094 | +2% |
-| blocking, Go agent | 42µs | 42µs | 0% | 100µs | 116µs | 66,146 | 64,823 | −2% |
+| baseline (no offload) | 35µs | 35µs | 0% | 133µs | 99µs | 65,659 | 62,865 | −4% |
+| blocking, UDS (stub) | 80µs | 79µs | −1% | 192µs | 189µs | 38,089 | 39,484 | +4% |
+| mTLS, UDS (stub) | 109µs | 111µs | +2% | 225µs | 234µs | 34,892 | 30,446 | −13% |
+| async (fire-and-forget) | 28µs | 27µs | −4% | 100µs | 101µs | 63,563 | 63,689 | 0% |
+| verdict cache hit | 26µs | 26µs | 0% | 64µs | 93µs | 59,774 | 67,496 | +13% |
+| body inspect, 1KiB POST | 100µs | 101µs | +1% | 196µs | 223µs | 28,020 | 29,495 | +5% |
+| body inspect, 64KiB POST | 238µs | 228µs | −4% | 441µs | 494µs | 8,927 | 9,090 | +2% |
+| response inspection | 67µs | 73µs | +9% | 171µs | 179µs | 36,574 | 37,967 | +4% |
+| deny 403 (no content) | 75µs | 73µs | −3% | 176µs | 178µs | 35,589 | 36,247 | +2% |
+| blocking, TCP agent | 89µs | 106µs | +19% | 219µs | 217µs | 32,146 | 34,071 | +6% |
+| blocking, Go agent | 41µs | 49µs | +20% | 136µs | 148µs | 51,636 | 51,293 | −1% |
 
 Zero unexpected-status responses in either run. p50 run-to-run
-variance ≤26% on the near-baseline lanes (noise at 25–35µs), ≤5% on
-all offload lanes; throughput variance ≤6%.
+variance ≤20% on the near-baseline lanes (noise at 25–35µs), ≤10% on
+all offload lanes; throughput variance ≤13%.
 
 ## Added latency vs baseline (mean serial)
 
 | Lane | run A | run B | verdict |
 |---|---|---|---|
-| blocking, UDS (stub) | +55µs | +54µs | one XNAP round-trip ≈ 55µs vs stub |
-| async | −2µs | 0µs | free (noise) |
-| cache hit | −5µs | −2µs | free (noise) |
-| body inspect, 1KiB | +61µs | +57µs | +~5µs over blocking |
-| body inspect, 64KiB | +204µs | +203µs | streaming: ~3.2µs/KiB over blocking |
-| response inspection | +60µs | +48µs | ≈ blocking (streamed overlap) |
-| deny 403 | +59µs | +53µs | ≈ blocking (no content work) |
-| blocking, TCP | +70µs | +68µs | +~14µs over UDS |
-| blocking, Go agent | +15µs | +13µs | real wire cost: ~14µs/round-trip |
+| blocking, UDS (stub) | +46µs | +47µs | one XNAP round-trip ≈ 46µs vs stub |
+| mTLS, UDS (stub) | +68µs | +77µs | +~25µs over plaintext blocking |
+| async | −5µs | −5µs | free (noise) |
+| cache hit | −11µs | −9µs | free (noise) |
+| body inspect, 1KiB | +62µs | +68µs | +~20µs over blocking |
+| body inspect, 64KiB | +182µs | +183µs | streaming: ~2.8µs/KiB over blocking |
+| response inspection | +32µs | +43µs | ≈ blocking (streamed overlap) |
+| deny 403 | +43µs | +44µs | ≈ blocking (no content work) |
+| blocking, TCP | +56µs | +74µs | +~17µs over UDS |
+| blocking, Go agent | +7µs | +21µs | real wire cost: ~14µs/round-trip |
 
 ## Takeaways
 
-- **Blocking UDS offload costs ~55µs p50 against the Python stub** —
-  but ~40µs of that is the stub itself. Against the Go `edge-guard`
-  agent the same round-trip costs **~14µs p50** (66k rps ≈ 85% of
+- **Blocking UDS offload costs ~45µs p50 against the Python stub** —
+  but ~35µs of that is the stub itself. Against the Go `edge-guard`
+  agent the same round-trip costs **~14µs p50** (~51k rps ≈ 80% of
   baseline): protocol overhead is genuinely tiny; agent speed decides.
 - **Async mode and verdict-cache hits are free** — indistinguishable
   from the no-offload baseline. Use them on latency-critical paths.
@@ -78,6 +82,13 @@ all offload lanes; throughput variance ≤6%.
   hidden behind the response transfer.
 - **Loopback TCP is ~14µs slower than UDS** — remote agents are viable
   when UDS isn't an option.
+- **mTLS costs ~+30µs p50 over plaintext blocking** (109–111µs vs
+  79–80µs) and ~10–20% throughput on this bench. The handshake itself
+  is fully amortized (persistent conns pre-warmed at worker init) — the
+  residual is the per-record cost, which lands mostly on the *agent*
+  side here: the stub does TLS in Python `ssl`, while the engine's
+  OpenSSL EVP path is AES-NI. A Go/Rust TLS agent would narrow the gap;
+  the go-block lane shows the wire cost itself is ~14µs/round-trip.
 - **Throughput halves in blocking mode vs the stub** (≈77k → ≈40k rps
   at c=50): every request serializes a round-trip over shared agent
   conns. With the Go agent it holds ≈65k rps — agent concurrency is

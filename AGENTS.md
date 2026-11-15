@@ -94,3 +94,33 @@ python3 -m pytest test/cases -q
   never re-arms, and the NEXT request on that connection stalls in
   test_reading. Symptom: first POST works, second POST on the same
   keep-alive conn hangs before reaching the handler.
+- Agent mTLS (`ssl on` in the group) needs `--with-http_ssl_module`;
+  the engine is the TLS CLIENT, the agent is the TLS server.
+- `ngx_ssl_create_connection` allocates from `c->pool` — agent conns
+  from `ngx_event_connect_peer` have NO pool → segfault in ngx_pcalloc.
+  Create a small `nc->pool` first and `ngx_destroy_pool` it in
+  conn_close (same as ngx_http_upstream does).
+- During `ngx_ssl_handshake`, openssl hijacks `rev/wev->handler` with
+  its own `ngx_ssl_handshake_handler` — restore `conn_read`/`conn_write`
+  in `c->ssl->handler` before resuming normal I/O.
+- TLS conns can't `writev` — drain the pkt queue via `nc->send`
+  (= `ngx_ssl_send`) one pkt at a time when `c->ssl`.
+- Config-time: `ssl on` requires `ssl_trusted_certificate` (engine
+  verifies agent cert; VERIFY_PEER + explicit X509_V_OK check +
+  optional `ngx_ssl_check_host` via `ssl_server_name` which doubles as
+  SNI — IPs send no SNI).
+- stacklib `gen_mtls_certs(root)` makes CA + agent + engine certs via
+  openssl; `Stack(mtls=True)` wires `ssl on` + engine client cert into
+  the group and `--tls-cert/--tls-key/--tls-client-ca` into the stub.
+  Knobs: `agent_tls=False` (plaintext agent), `wrong_ca=True`,
+  `client_cert=False` — all should yield fail-close 503.
+- Re-running `./configure` for `make modules` MUST repeat the original
+  args exactly (`--without-http_rewrite_module` etc.) or the .so
+  signature mismatches: "module is not binary compatible".
+- macOS: overwriting a dlopen'd .so in place invalidates its code
+  signature — the process dies with `Killed: 9` ("Code Signature
+  Invalid" in the .ips crash report). `rm` the old .so first, then cp.
+- FIPS crypto stack per side: engine → OpenSSL FIPS provider;
+  Go SDK → stdlib `crypto/tls` with `GOFIPS140=v1.0.0` (Go 1.24+) or
+  `GOEXPERIMENT=boringcrypto`; Rust SDK → rustls + aws-lc-rs
+  (FIPS 140-3 validated); Python harness → `ssl` on FIPS OpenSSL.

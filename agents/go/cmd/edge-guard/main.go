@@ -11,6 +11,9 @@
 //	-burst 20                                 (bucket size)
 //	-max-buckets 100000                       (rate-limit table cap)
 //	-ttl   5                                  (verdict cache-ttl seconds)
+//	-tls-cert /path/agent.pem                 (enable TLS; engine is client)
+//	-tls-key  /path/agent.key
+//	-tls-client-ca /path/ca.pem               (verify engine certs -> mTLS)
 package main
 
 import (
@@ -195,13 +198,17 @@ func main() {
 	var (
 		listen = flag.String("listen", "unix:/tmp/xngin-edge-guard.sock",
 			"unix:/path or tcp:host:port")
-		allow = flag.String("allow", "", "comma-separated allowlist CIDRs")
-		deny  = flag.String("deny", "", "comma-separated denylist CIDRs")
-		rate  = flag.Float64("rate", 0, "requests/sec per client IPv4 address or IPv6 /64 (0=off)")
-		burst = flag.Float64("burst", 20, "token bucket size")
-		ttl   = flag.Uint("ttl", 0, "verdict cache-ttl seconds")
-		maxB  = flag.Int("max-buckets", defaultMaxBuckets,
+		allow   = flag.String("allow", "", "comma-separated allowlist CIDRs")
+		deny    = flag.String("deny", "", "comma-separated denylist CIDRs")
+		rate    = flag.Float64("rate", 0, "requests/sec per client IPv4 address or IPv6 /64 (0=off)")
+		burst   = flag.Float64("burst", 20, "token bucket size")
+		ttl     = flag.Uint("ttl", 0, "verdict cache-ttl seconds")
+		maxB    = flag.Int("max-buckets", defaultMaxBuckets,
 			"max tracked rate-limit buckets (LRU-evicted)")
+		tlsCert = flag.String("tls-cert", "", "agent TLS certificate (PEM)")
+		tlsKey  = flag.String("tls-key", "", "agent TLS private key (PEM)")
+		tlsCA   = flag.String("tls-client-ca", "",
+			"CA verifying engine client certs (enables mTLS)")
 	)
 	flag.Parse()
 
@@ -228,6 +235,17 @@ func main() {
 		AgentID: "edge-guard/1.0",
 		Logger:  log.Default(),
 	}
+
+	if *tlsCert != "" {
+		cfg, err := xngin.TLSConfig(*tlsCert, *tlsKey, *tlsCA)
+		if err != nil {
+			log.Fatalf("bad tls config: %v", err)
+		}
+		srv.TLSConfig = cfg
+	} else if *tlsKey != "" || *tlsCA != "" {
+		log.Fatal("-tls-key/-tls-client-ca require -tls-cert")
+	}
+
 	log.Printf("edge-guard listening on %s (rate=%v/s burst=%v)", *listen, *rate, *burst)
 	log.Fatal(srv.ListenAndServe(*listen))
 }

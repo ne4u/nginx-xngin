@@ -73,3 +73,6 @@ def test_vector(vec):
         kvs = [(k, norm(v)) for k, v in f.kvs()]
         exp = [(k, e) for k, e in vec["expect_kv"]]
         assert kvs == exp
+
+
+

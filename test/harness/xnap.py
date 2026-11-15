@@ -5,6 +5,7 @@ the conformance test suite. Implements SPEC.md version 1.
 """
 
 import ipaddress
+import os
 import struct
 
 VERSION = 1

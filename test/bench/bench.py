@@ -72,6 +72,15 @@ http {{
         keepalive 2;
         ping_interval 60s;
     }}
+    xngin_agent_group mtls {{
+        server unix:{mtls_sock};
+        ssl on;
+        ssl_trusted_certificate {mtls_ca};
+        ssl_certificate {mtls_eng_crt};
+        ssl_certificate_key {mtls_eng_key};
+        keepalive 2;
+        ping_interval 60s;
+    }}
     xngin_cache_zone verdicts:8m;
 
     server {{
@@ -116,6 +125,10 @@ http {{
             xngin_enable on; xngin_group go;
             empty_gif;
         }}
+        location /mtlsblock {{
+            xngin_enable on; xngin_group mtls;
+            empty_gif;
+        }}
     }}
 }}
 """
@@ -141,6 +154,7 @@ LANES = [
     ("deny-403",  "/deny/x",      "GET",  None,          403),
     ("tcp-block", "/tcpblock/x",  "GET",  None,          200),
     ("go-block",  "/goblock/x",   "GET",  None,          200),
+    ("mtls-block", "/mtlsblock/x", "GET", None,          200),
 ]
 
 REPO = os.path.dirname(os.path.dirname(
@@ -282,6 +296,11 @@ def main():
 
     uds_agent = stacklib.Agent(root, 0, RULES)
     tcp_agent = stacklib.Agent(root, 1, RULES, tcp=True)
+    certs = stacklib.gen_mtls_certs(root)
+    mtls_agent = stacklib.Agent(
+        root, 2, RULES,
+        tls={"cert": certs["agent_cert"], "key": certs["agent_key"],
+             "client_ca": certs["ca"]})
 
     go_sock = os.path.join(root, "edge-guard.sock")
     go_bin = build_go_agent(root)
@@ -291,6 +310,9 @@ def main():
         module_so=stacklib.MODULE_SO, root=root,
         uds_sock=uds_agent.sock, tcp_port=tcp_agent.port,
         go_sock=go_sock,
+        mtls_sock=mtls_agent.sock, mtls_ca=certs["ca"],
+        mtls_eng_crt=certs["engine_cert"],
+        mtls_eng_key=certs["engine_key"],
         listen_port=stacklib.free_port())
     conf_path = os.path.join(root, "nginx.conf")
     with open(conf_path, "w") as f:
@@ -302,6 +324,7 @@ def main():
     try:
         uds_agent.start(root)
         tcp_agent.start(root)
+        mtls_agent.start(root)
         if go_bin:
             go_proc = subprocess.Popen(
                 [go_bin, "-listen", f"unix:{go_sock}", "-rate", "0"],
@@ -319,7 +342,8 @@ def main():
 
         # wait for the agent group to be ready too: fail-close would 503
         # until conns complete the XNAP handshake
-        for ready_path in ("/x", "/goblock/x" if go_bin else None):
+        for ready_path in ("/x", "/mtlsblock/x",
+                           "/goblock/x" if go_bin else None):
             if ready_path is None:
                 continue
             for _ in range(100):
@@ -379,7 +403,7 @@ def main():
             p.terminate()
         if go_proc:
             go_proc.terminate()
-        for a in (uds_agent, tcp_agent):
+        for a in (uds_agent, tcp_agent, mtls_agent):
             if a.proc:
                 a.proc.terminate()
         pidfile = os.path.join(root, "nginx.pid")

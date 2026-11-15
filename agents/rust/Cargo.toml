@@ -9,6 +9,9 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 regex = "1"
 async-trait = "0.1"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 serde_json = "1"
+rcgen = "0.13"

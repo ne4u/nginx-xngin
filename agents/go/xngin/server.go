@@ -2,6 +2,7 @@ package xngin
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"log"
 	"net"
@@ -56,11 +57,11 @@ type Verdict struct {
 	// ResUnsetHeaders removes client-bound response headers.
 	ResUnsetHeaders []string
 	// ResBody replaces the response body (non-nil to send).
-	ResBody       []byte
-	Vars          map[string]string // exposed as $xngin_<name>
-	CacheTTL      uint32            // >0 lets engine cache this verdict
-	Reason        string
-	Score         int64
+	ResBody  []byte
+	Vars     map[string]string // exposed as $xngin_<name>
+	CacheTTL uint32            // >0 lets engine cache this verdict
+	Reason   string
+	Score    int64
 }
 
 // Allow is a shorthand allow verdict.
@@ -152,7 +153,10 @@ type Server struct {
 	AgentID    string
 	MaxStreams uint32
 	MaxFrame   uint32
-	Logger     *log.Logger // nil -> silent
+	// TLSConfig enables TLS (optionally mutual) on the listener — the
+	// engine connects as the TLS client. Build it with TLSConfig().
+	TLSConfig *tls.Config
+	Logger    *log.Logger // nil -> silent
 }
 
 // Serve accepts XNAP connections on l until it is closed.
@@ -199,6 +203,10 @@ func (s *Server) serveConn(c net.Conn) {
 				c.RemoteAddr(), r)
 		}
 	}()
+
+	if s.TLSConfig != nil {
+		c = tls.Server(c, s.TLSConfig)
+	}
 
 	maxStreams := s.MaxStreams
 	if maxStreams == 0 {

@@ -5,6 +5,10 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#if (NGX_SSL)
+#include <ngx_event_openssl.h>
+#endif
+
 #define XNAP_VERSION 1
 
 /* frame types */
@@ -58,6 +62,9 @@
 #define XNAP_RBUF_SIZE          65536
 #define XNAP_MAX_PONG_MISSES    2
 #define XNAP_RECONNECT_DELAY    1000
+
+/* mTLS handshake bound for agent conns (SSL is client-side here) */
+#define XNAP_SSL_HANDSHAKE_TIMEOUT  10000
 
 /* our bit in r->buffered (0x01/0x02/0x04 are SSI/SUB/COPY, 0x10+ lowlevel) */
 #define NGX_HTTP_XNGIN_BUFFERED 0x08
@@ -157,6 +164,7 @@ typedef struct {
     ngx_http_xngin_ctx_t *ctx;
 } ngx_xnap_stream_t;
 
+
 struct ngx_http_xngin_conn_s {
     ngx_peer_connection_t   pc;
     ngx_http_xngin_agent_t *agent;
@@ -188,6 +196,8 @@ struct ngx_http_xngin_conn_s {
     unsigned                ready:1;
     unsigned                hello_sent:1;
     unsigned                down:1;
+    unsigned                ssl:1;        /* group requires TLS */
+    unsigned                ssl_ready:1;  /* TLS handshake complete */
 };
 
 struct ngx_http_xngin_agent_s {
@@ -205,6 +215,14 @@ struct ngx_http_xngin_group_s {
     ngx_uint_t               keepalive;
     ngx_msec_t               ping_interval;
     ngx_uint_t               max_streams;
+
+    /* mTLS transport (SPEC.md §1.1): engine is the TLS client */
+    unsigned                 ssl_on:1;
+    void                    *ssl;         /* ngx_ssl_t* client ctx (NULL=plain) */
+    ngx_str_t                ssl_cert;    /* engine client cert (mTLS) */
+    ngx_str_t                ssl_key;
+    ngx_str_t                ssl_trusted; /* CA verifying agent certs */
+    ngx_str_t                ssl_server_name; /* SNI + verify hostname */
 };
 
 typedef struct {

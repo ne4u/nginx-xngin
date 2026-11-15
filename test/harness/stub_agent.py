@@ -334,9 +334,23 @@ async def main():
                     help="unix:/path or tcp:port or tcp:host:port")
     ap.add_argument("--rules", default=None)
     ap.add_argument("--stats", default=None)
+    ap.add_argument("--tls-cert", default=None,
+                    help="agent TLS certificate (enables TLS listener)")
+    ap.add_argument("--tls-key", default=None)
+    ap.add_argument("--tls-client-ca", default=None,
+                    help="CA verifying engine client certs (enables mTLS)")
     args = ap.parse_args()
 
     rules = load_rules(args.rules)
+
+    ctx = None
+    if args.tls_cert:
+        import ssl as _ssl
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        if args.tls_client_ca:
+            ctx.load_verify_locations(args.tls_client_ca)
+            ctx.verify_mode = _ssl.CERT_REQUIRED
 
     async def cb(r, w):
         await Conn(rules).run(r, w)
@@ -347,13 +361,13 @@ async def main():
             os.unlink(path)
         except FileNotFoundError:
             pass
-        srv = await asyncio.start_unix_server(cb, path)
+        srv = await asyncio.start_unix_server(cb, path, ssl=ctx)
         os.chmod(path, 0o777)
     else:
         parts = args.listen[4:].split(":")
         host = parts[0] if len(parts) > 1 else "127.0.0.1"
         port = int(parts[-1])
-        srv = await asyncio.start_server(cb, host, port)
+        srv = await asyncio.start_server(cb, host, port, ssl=ctx)
         args.listen = f"tcp:{host}:{port}"
 
     if args.stats:

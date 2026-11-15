@@ -304,7 +304,7 @@ impl Frame {
 
 /// Peek a varint without consuming: Ok(Some((value, nbytes))) when complete,
 /// Ok(None) when the buffer ends mid-varint, Err on overlong encoding.
-fn peek_varint(buf: &[u8]) -> Result<Option<(u64, usize)>, ProtoError> {
+pub(crate) fn peek_varint(buf: &[u8]) -> Result<Option<(u64, usize)>, ProtoError> {
     let mut v: u64 = 0;
     let mut shift = 0u32;
     for (i, &b) in buf.iter().enumerate() {

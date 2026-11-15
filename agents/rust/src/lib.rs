@@ -3,6 +3,7 @@
 //! An agent accepts multiplexed XNAP connections from nginx workers and
 //! returns a [`Verdict`] for each request [`Request`].
 
+pub mod tls;
 pub mod proto;
 pub mod server;
 

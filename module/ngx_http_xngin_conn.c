@@ -180,6 +180,7 @@ ngx_http_xngin_conn_init_worker(ngx_http_xngin_main_conf_t *mmcf,
                                  ? a[j].max_streams
                                  : XNAP_DEFAULT_MAX_STREAM;
                 c->max_frame = XNAP_DEFAULT_MAX_FRAME;
+                c->ssl = g[i].ssl_on;
                 c->down = 1;
 
                 c->timer = ngx_pcalloc(cycle->pool, sizeof(ngx_event_t));
@@ -452,6 +453,38 @@ ngx_http_xngin_conn_flush(ngx_http_xngin_conn_t *c)
     vec.iovs = iov;
     vec.nalloc = 32;
 
+    if (c->ssl) {
+        /* TLS conns can't writev — drain the pkt queue through
+           ngx_ssl_send (nc->send) one record at a time */
+        while (c->out) {
+            pkt = c->out;
+            n = nc->send(nc, pkt->pos, pkt->last - pkt->pos);
+
+            if (n == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+
+            if (n == NGX_AGAIN) {
+                nc->write->ready = 0;
+                return NGX_AGAIN;
+            }
+
+            pkt->pos += n;
+            if (pkt->pos < pkt->last) {
+                nc->write->ready = 0;
+                return NGX_AGAIN;
+            }
+
+            c->out = pkt->next;
+            if (c->out == NULL) {
+                c->out_tail = &c->out;
+            }
+            ngx_http_xngin_pkt_put(c, pkt);
+        }
+
+        return NGX_OK;
+    }
+
     while (c->out) {
         /* gather the whole out queue into one writev */
         vec.count = 0;
@@ -507,6 +540,162 @@ ngx_http_xngin_conn_flush(ngx_http_xngin_conn_t *c)
 }
 
 
+#if (NGX_SSL)
+
+static void ngx_http_xngin_conn_ssl_done(ngx_http_xngin_conn_t *c);
+
+
+/* SNI: skip empty names, literals, and IPs (RFC 6066) */
+static ngx_int_t
+ngx_http_xngin_ssl_name(ngx_http_xngin_conn_t *c)
+{
+    ngx_connection_t *nc = c->pc.connection;
+    ngx_str_t        *name = &c->agent->group->ssl_server_name;
+    u_char           *p;
+
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+
+    if (name->len == 0 || *name->data == '['
+        || ngx_inet_addr(name->data, name->len) != INADDR_NONE)
+    {
+        return NGX_OK;
+    }
+
+    /* SSL_set_tlsext_host_name() needs a null-terminated string */
+    p = ngx_pnalloc(nc->pool, name->len + 1);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    (void) ngx_cpystrn(p, name->data, name->len + 1);
+
+    if (SSL_set_tlsext_host_name(nc->ssl->connection, (char *) p) == 0) {
+        ngx_ssl_error(NGX_LOG_ERR, nc->log, 0,
+                      "SSL_set_tlsext_host_name(\"%s\") failed", p);
+        return NGX_ERROR;
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_xngin_conn_ssl_handshake_handler(ngx_connection_t *nc)
+{
+    ngx_http_xngin_conn_t *c = nc->data;
+
+    /* openssl hijacked rev/wev handlers during the handshake — restore */
+    nc->read->handler = ngx_http_xngin_conn_read;
+    nc->write->handler = ngx_http_xngin_conn_write;
+
+    if (nc->write->timer_set) {
+        ngx_del_timer(nc->write);
+    }
+
+    if (!nc->ssl->handshaked) {
+        ngx_log_error(NGX_LOG_ERR, nc->log, 0,
+                      "xngin: ssl handshake to agent %V failed",
+                      &c->agent->url_text);
+        ngx_http_xngin_conn_close(c);
+        return;
+    }
+
+    ngx_http_xngin_conn_ssl_done(c);
+}
+
+
+/* engine is the TLS client: create the connection ctx and drive the
+   handshake; on completion verify the agent cert before HELLO */
+static void
+ngx_http_xngin_conn_ssl_handshake(ngx_http_xngin_conn_t *c)
+{
+    ngx_connection_t *nc = c->pc.connection;
+    ngx_int_t         rc;
+
+    if (nc->ssl == NULL) {
+        /* ngx_ssl_create_connection allocates from c->pool; agent conns
+           have none by default (upstream does the same) */
+        if (nc->pool == NULL) {
+            nc->pool = ngx_create_pool(256, nc->log);
+            if (nc->pool == NULL) {
+                ngx_http_xngin_conn_close(c);
+                return;
+            }
+            nc->pool->log = nc->log;
+        }
+
+        if (ngx_ssl_create_connection(c->agent->group->ssl, nc,
+                                      NGX_SSL_BUFFER|NGX_SSL_CLIENT)
+            != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, nc->log, 0,
+                          "xngin: ssl init for agent %V failed",
+                          &c->agent->url_text);
+            ngx_http_xngin_conn_close(c);
+            return;
+        }
+
+        if (ngx_http_xngin_ssl_name(c) != NGX_OK) {
+            ngx_http_xngin_conn_close(c);
+            return;
+        }
+    }
+
+    nc->ssl->handler = ngx_http_xngin_conn_ssl_handshake_handler;
+
+    rc = ngx_ssl_handshake(nc);
+
+    if (rc == NGX_AGAIN) {
+        if (!nc->write->timer_set) {
+            ngx_add_timer(nc->write, XNAP_SSL_HANDSHAKE_TIMEOUT);
+        }
+        return;
+    }
+
+    if (rc == NGX_ERROR) {
+        ngx_http_xngin_conn_close(c);
+        return;
+    }
+
+    /* NGX_OK/NGX_DONE — handshaked inline (unlikely but cheap) */
+    ngx_http_xngin_conn_ssl_done(c);
+}
+
+
+static void
+ngx_http_xngin_conn_ssl_done(ngx_http_xngin_conn_t *c)
+{
+    ngx_connection_t *nc = c->pc.connection;
+    long              rc;
+
+    rc = SSL_get_verify_result(nc->ssl->connection);
+    if (rc != X509_V_OK) {
+        ngx_log_error(NGX_LOG_ERR, nc->log, 0,
+                      "xngin: agent %V certificate verify failed (%l)",
+                      &c->agent->url_text, rc);
+        ngx_http_xngin_conn_close(c);
+        return;
+    }
+
+    if (c->agent->group->ssl_server_name.len
+        && ngx_ssl_check_host(nc, &c->agent->group->ssl_server_name)
+           != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, nc->log, 0,
+                      "xngin: agent %V certificate name mismatch",
+                      &c->agent->url_text);
+        ngx_http_xngin_conn_close(c);
+        return;
+    }
+
+    c->ssl_ready = 1;
+    ngx_http_xngin_conn_write(nc->write);
+}
+
+#endif  /* NGX_SSL */
+
+
 static void
 ngx_http_xngin_conn_write(ngx_event_t *ev)
 {
@@ -516,6 +705,15 @@ ngx_http_xngin_conn_write(ngx_event_t *ev)
     if (c->down) {
         return;
     }
+
+#if (NGX_SSL)
+
+    if (c->ssl && !c->ssl_ready) {
+        ngx_http_xngin_conn_ssl_handshake(c);
+        return;
+    }
+
+#endif
 
     if (!c->hello_sent) {
         u_char     payload[256], eid[64], *p;
@@ -849,7 +1047,13 @@ ngx_http_xngin_conn_close(ngx_http_xngin_conn_t *c)
     c->hello_sent = 0;
     c->missed_pongs = 0;
 
+    c->ssl_ready = 0;
+
     if (c->pc.connection) {
+        if (c->pc.connection->pool) {
+            ngx_destroy_pool(c->pc.connection->pool);
+            c->pc.connection->pool = NULL;
+        }
         ngx_close_connection(c->pc.connection);
         c->pc.connection = NULL;
     }

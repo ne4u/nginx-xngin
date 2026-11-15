@@ -6,6 +6,7 @@
 //! Rules ship with a score; exceeding --threshold denies with 403.
 
 use std::env;
+use std::path::Path;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -99,6 +100,9 @@ impl AgentHandler for MiniWaf {
 async fn main() -> std::io::Result<()> {
     let mut listen = "unix:/tmp/xngin-waf.sock".to_string();
     let mut threshold: i64 = 100;
+    let mut cert = None;
+    let mut key = None;
+    let mut client_ca = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -112,6 +116,18 @@ async fn main() -> std::io::Result<()> {
                 threshold = args[i + 1].parse().expect("threshold");
                 i += 1;
             }
+            "--tls-cert" => {
+                cert = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--tls-key" => {
+                key = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--tls-client-ca" => {
+                client_ca = Some(args[i + 1].clone());
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
@@ -121,5 +137,12 @@ async fn main() -> std::io::Result<()> {
     let waf = MiniWaf { rules: rules(), threshold };
     let mut srv = Server::new(waf);
     srv.agent_id = "mini-waf/1.0".into();
+    if let Some(c) = cert {
+        srv.tls = Some(xngin_rs::tls::server_config(
+            Path::new(&c),
+            Path::new(key.as_deref().expect("--tls-key")),
+            client_ca.as_deref().map(Path::new),
+        )?);
+    }
     srv.listen(&listen).await
 }

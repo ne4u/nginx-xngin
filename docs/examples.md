@@ -174,3 +174,47 @@ Result:
 
 Result: `GET /admin` → `451` with the custom body; never reaches
 upstream.
+
+## 8. mTLS agent transport
+
+Encrypt + mutually authenticate the engine↔agent link (TCP agents —
+pointless on same-host UDS). Engine is the TLS client, agent is the
+server.
+
+```nginx
+xngin_agent_group waf {
+    server 10.0.1.5:9000;
+    ssl on;
+    ssl_trusted_certificate /etc/xngin/ca.pem;      # verifies agent cert
+    ssl_certificate     /etc/xngin/engine.pem;      # engine client cert
+    ssl_certificate_key /etc/xngin/engine.key;
+    ssl_server_name waf.internal;                   # SNI + SAN check
+}
+```
+
+Agent side — same CA issues the agent's cert and verifies engine certs:
+
+```sh
+# Go
+(cd agents/go && go run ./cmd/edge-guard \
+    -listen tcp:0.0.0.0:9000 \
+    -tls-cert /etc/xngin/agent.pem -tls-key /etc/xngin/agent.key \
+    -tls-client-ca /etc/xngin/ca.pem)
+
+# Rust
+(cd agents/rust && cargo run --example mini_waf -- \
+    --listen tcp:0.0.0.0:9000 \
+    --tls-cert /etc/xngin/agent.pem --tls-key /etc/xngin/agent.key \
+    --tls-client-ca /etc/xngin/ca.pem)
+
+# test stub
+python3 test/harness/stub_agent.py --listen tcp:0.0.0.0:9000 \
+    --tls-cert /etc/xngin/agent.pem --tls-key /etc/xngin/agent.key \
+    --tls-client-ca /etc/xngin/ca.pem
+```
+
+Result: handshake only succeeds when both certs chain to the CA — a
+certless engine or a wrong-CA agent is rejected and the conn drops to
+`xngin_fail` handling (503 with `fail close`). Omit
+`ssl_certificate`/`ssl_certificate_key` for server-auth-only TLS and
+drop `--tls-client-ca` on the agent.

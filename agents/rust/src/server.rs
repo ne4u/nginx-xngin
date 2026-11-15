@@ -4,9 +4,12 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+                WriteHalf};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 
 use crate::proto::*;
 
@@ -162,6 +165,10 @@ pub struct Server<H> {
     pub agent_id: String,
     pub max_streams: u32,
     pub max_frame: u32,
+    /// TLS on the listener (engine connects as the TLS client).
+    /// Build via [`crate::tls::server_config`]; with a client CA it
+    /// becomes mutual TLS.
+    pub tls: Option<Arc<ServerConfig>>,
 }
 
 impl<H: AgentHandler> Server<H> {
@@ -171,6 +178,7 @@ impl<H: AgentHandler> Server<H> {
             agent_id: "xngin-rs/1".into(),
             max_streams: 256,
             max_frame: DEFAULT_MAX_FRAME,
+            tls: None,
         }
     }
 
@@ -178,15 +186,17 @@ impl<H: AgentHandler> Server<H> {
     pub async fn listen(self, addr: &str) -> std::io::Result<()> {
         let handler = Arc::new(self.handler);
         let agent_id = Arc::new(self.agent_id);
-        let (max_streams, max_frame) = (self.max_streams, self.max_frame);
+        let (max_streams, max_frame, tls) =
+            (self.max_streams, self.max_frame, self.tls);
 
         if let Some(path) = addr.strip_prefix("unix:") {
             let _ = std::fs::remove_file(path);
             let l = UnixListener::bind(path)?;
             loop {
                 let (sock, _) = l.accept().await?;
-                tokio::spawn(conn(sock, handler.clone(), agent_id.clone(),
-                                  max_streams, max_frame));
+                tokio::spawn(conn(Box::new(sock), handler.clone(),
+                                  agent_id.clone(), max_streams,
+                                  max_frame, tls.clone()));
             }
         } else {
             let a = addr.strip_prefix("tcp:").unwrap_or(addr);
@@ -196,8 +206,9 @@ impl<H: AgentHandler> Server<H> {
             loop {
                 let (sock, _) = l.accept().await?;
                 let _ = sock.set_nodelay(true);
-                tokio::spawn(conn(sock, handler.clone(), agent_id.clone(),
-                                  max_streams, max_frame));
+                tokio::spawn(conn(Box::new(sock), handler.clone(),
+                                  agent_id.clone(), max_streams,
+                                  max_frame, tls.clone()));
             }
         }
     }
@@ -211,18 +222,18 @@ type Streams = Arc<Mutex<HashMap<u64, StreamState>>>;
 
 async fn write_frame<W>(w: &Arc<Mutex<W>>, f: &Frame) -> bool
 where
-    W: AsyncWriteExt + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
 {
     let mut g = w.lock().await;
     g.write_all(&f.marshal()).await.is_ok()
         && g.flush().await.is_ok()
 }
 
-async fn decide<H, S>(handler: &Arc<H>, streams: &Streams,
-                      wr: &Arc<Mutex<WriteHalf<S>>>, sid: u64) -> bool
+async fn decide<H>(handler: &Arc<H>, streams: &Streams,
+                   wr: &Arc<Mutex<WriteHalf<Box<dyn Io>>>>, sid: u64)
+    -> bool
 where
     H: AgentHandler,
-    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
     let st = streams.lock().await.remove(&sid);
     if let Some(st) = st {
@@ -233,12 +244,26 @@ where
     true
 }
 
-async fn conn<H, S>(sock: S, handler: Arc<H>, agent_id: Arc<String>,
-                    _max_streams: u32, max_frame: u32)
+/// Object-safe stream type for plaintext or TLS connections.
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T> Io for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+async fn conn<H>(sock: Box<dyn Io>, handler: Arc<H>, agent_id: Arc<String>,
+                 _max_streams: u32, max_frame: u32,
+                 tls: Option<Arc<ServerConfig>>)
 where
     H: AgentHandler,
-    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
+    let sock: Box<dyn Io> = match tls {
+        Some(cfg) => {
+            match TlsAcceptor::from(cfg).accept(sock).await {
+                Ok(s) => Box::new(s),
+                Err(_) => return,    // TLS handshake failed: drop conn
+            }
+        }
+        None => sock,
+    };
+
     let (mut rd, wr_inner) = tokio::io::split(sock);
     let wr = Arc::new(Mutex::new(wr_inner));
 

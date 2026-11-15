@@ -70,9 +70,10 @@ def free_port():
 
 
 class Agent:
-    def __init__(self, root, idx, rules, tcp=False):
+    def __init__(self, root, idx, rules, tcp=False, tls=None):
         self.idx = idx
         self.tcp = tcp
+        self.tls = tls          # {cert, key, client_ca} or None
         if tcp:
             self.port = free_port()
             self.listen = f"tcp:{self.port}"
@@ -100,6 +101,11 @@ class Agent:
                     "--listen", self.listen,
                     "--rules", self.rules_file,
                     "--stats", self.stats_file]
+            if self.tls:
+                argv += ["--tls-cert", self.tls["cert"],
+                         "--tls-key", self.tls["key"]]
+                if self.tls.get("client_ca"):
+                    argv += ["--tls-client-ca", self.tls["client_ca"]]
         self.proc = subprocess.Popen(argv, stdout=log, stderr=log)
         if self.cmd:
             # no stats file for a foreign agent: probe the listen addr
@@ -138,11 +144,53 @@ class Agent:
             self.proc.wait()
 
 
+def gen_mtls_certs(root):
+    """CA + agent server cert + engine client cert for agent mTLS."""
+    def run(*a):
+        subprocess.run(["openssl"] + list(a), check=True, capture_output=True)
+
+    def sign(csr, ca, cakey, out, ext=None):
+        a = ["x509", "-req", "-in", csr, "-CA", ca, "-CAkey", cakey,
+             "-CAcreateserial", "-out", out, "-days", "1"]
+        if ext:
+            a += ["-extfile", ext]
+        run(*a)
+
+    ca_key, ca = (os.path.join(root, "ca.key"),
+                  os.path.join(root, "ca.pem"))
+    run("req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", ca_key, "-out", ca, "-days", "1",
+        "-subj", "/CN=xngin-test-ca")
+
+    # agent (TLS server) cert with SAN localhost + 127.0.0.1
+    a_key, a_csr, a_crt = (os.path.join(root, "agent.key"),
+                           os.path.join(root, "agent.csr"),
+                           os.path.join(root, "agent.pem"))
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", a_key,
+        "-out", a_csr, "-subj", "/CN=localhost")
+    ext = os.path.join(root, "san.ext")
+    with open(ext, "w") as f:
+        f.write("subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+    sign(a_csr, ca, ca_key, a_crt, ext)
+
+    # engine (TLS client) cert
+    e_key, e_csr, e_crt = (os.path.join(root, "engine.key"),
+                           os.path.join(root, "engine.csr"),
+                           os.path.join(root, "engine.pem"))
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", e_key,
+        "-out", e_csr, "-subj", "/CN=xngin-engine")
+    sign(e_csr, ca, ca_key, e_crt)
+
+    return {"ca": ca, "agent_cert": a_crt, "agent_key": a_key,
+            "engine_cert": e_crt, "engine_key": e_key}
+
+
 class Stack:
     def __init__(self, root, agents_rules, timeout="300ms", fail="close",
                  loc_extra="", main_extra="", tcp_agents=False,
                  loglevel="warn", ssl=False, srv_extra="",
-                 http_ready=True, sub="", go_agent=None):
+                 http_ready=True, sub="", go_agent=None, mtls=False,
+                 agent_tls=True, client_cert=True, wrong_ca=False):
         if sub:
             root = os.path.join(root, sub)
         self.root = root
@@ -165,16 +213,39 @@ class Stack:
             srv_extra = (f"ssl_certificate {self.cert};\n        "
                          f"ssl_certificate_key {self.key};\n        "
                          + srv_extra)
-        self.agents = [Agent(root, i, r, tcp=tcp_agents)
+
+        certs = gen_mtls_certs(root) if mtls else None
+        agent_tls_cfg = ({"cert": certs["agent_cert"],
+                          "key": certs["agent_key"],
+                          "client_ca": certs["ca"]}
+                         if certs and agent_tls else None)
+        self.agents = [Agent(root, i, r, tcp=tcp_agents, tls=agent_tls_cfg)
                        for i, r in enumerate(agents_rules)]
         if go_agent:
             self.agents[0].cmd = go_agent
         servers = "\n        ".join(
             f"server {a.addr};" for a in self.agents)
+
+        tls_conf = ""
+        if mtls:
+            trusted = certs["ca"]
+            if wrong_ca:
+                # engine trusts an unrelated CA -> agent cert rejected
+                ca2 = os.path.join(root, "ca2")
+                os.makedirs(ca2, exist_ok=True)
+                trusted = gen_mtls_certs(ca2)["ca"]
+            lines = ["ssl on;",
+                     f"ssl_trusted_certificate {trusted};"]
+            if client_cert:
+                lines += [f"ssl_certificate {certs['engine_cert']};",
+                          f"ssl_certificate_key {certs['engine_key']};"]
+            tls_conf = "\n        ".join(lines)
+
         self.conf = os.path.join(root, "nginx.conf")
         main = f"""
     xngin_agent_group waf {{
         {servers}
+        {tls_conf}
         keepalive 1;
         ping_interval 60s;
     }}

@@ -16,6 +16,14 @@
   `xngin.ComputeJA4`, surfaced as request/response headers and
   `$xngin_*` variables
 - `docs/examples.md`, verdict-field table in `docs/config-reference.md`
+- Optional TLS/mTLS on engine↔agent links: `ssl on` in the agent group
+  makes the engine a TLS client — verifies the agent cert against
+  `ssl_trusted_certificate`, optional `ssl_server_name` SNI/SAN pinning,
+  `ssl_certificate`/`ssl_certificate_key` presents an engine client
+  cert for mutual auth. Matching `--tls-cert`/`--tls-key`/
+  `--tls-client-ca` flags in `stub_agent.py`, edge-guard, and mini_waf.
+  FIPS-capable stacks: engine OpenSSL FIPS provider, Go `crypto/tls`
+  (boringcrypto/GOFIPS140), rustls + aws-lc-rs (Rust).
 - GitHub release prep: LICENSE (Apache-2.0 + Commons Clause),
   SECURITY.md, CONTRIBUTING.md, CI workflow, issue/PR templates
 

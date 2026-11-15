@@ -8,7 +8,7 @@ blocking mode. Design goal: < 1 ms added p99 for a co-located agent.
 | Component | Cost | Mitigation |
 |---|---|---|
 | connect(2)/accept | high (~ms) | none on hot path: persistent pre-warmed conns from worker init |
-| TLS handshake | would dominate | not used; UDS for local, plain TCP remote (TLS is an ops-layer concern — stunnel/mTLS sidecar if needed) |
+| TLS handshake | would dominate | amortized: persistent pre-warmed conns mean the handshake happens once per conn lifetime. Optional `ssl on` (SPEC §1.1) gives mTLS for compliance; steady state is just the record layer (~22B/frame) |
 | frame write + read | ~50-150 µs UDS | one frame out, one frame back; small binary frames, no headers/JSON |
 | serialization | low | zero-copy mostly: headers encoded straight into one wbuf |
 | queuing under load | bounded | max-streams per conn, keepalive N conns per agent |

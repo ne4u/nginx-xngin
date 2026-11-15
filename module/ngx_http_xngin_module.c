@@ -26,6 +26,11 @@ static char *ngx_http_xngin_cache_key_set(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_xngin_tls_deny_add(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_xngin_group_ssl(ngx_conf_t *cf,
+    ngx_http_xngin_group_t *g);
+static char *ngx_http_xngin_group_arg(ngx_conf_t *cf, ngx_str_t *field,
+    ngx_uint_t ispath);
+
 
 static ngx_int_t ngx_http_xngin_handler(ngx_http_request_t *r);
 static void ngx_http_xngin_body_post(ngx_http_request_t *r);
@@ -426,7 +431,7 @@ ngx_http_xngin_agent_group(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    return NGX_CONF_OK;
+    return ngx_http_xngin_group_ssl(cf, g);
 }
 
 
@@ -535,11 +540,141 @@ ngx_http_xngin_agent_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_OK;
     }
 
+    if (ngx_strcmp(value[0].data, "ssl") == 0) {
+        if (cf->args->nelts != 2
+            || ngx_strcmp(value[1].data, "on") != 0)
+        {
+            return "expected \"ssl on\"";
+        }
+        g->ssl_on = 1;
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_strcmp(value[0].data, "ssl_certificate") == 0) {
+        return ngx_http_xngin_group_arg(cf, &g->ssl_cert, 1);
+    }
+
+    if (ngx_strcmp(value[0].data, "ssl_certificate_key") == 0) {
+        return ngx_http_xngin_group_arg(cf, &g->ssl_key, 1);
+    }
+
+    if (ngx_strcmp(value[0].data, "ssl_trusted_certificate") == 0) {
+        return ngx_http_xngin_group_arg(cf, &g->ssl_trusted, 1);
+    }
+
+    if (ngx_strcmp(value[0].data, "ssl_server_name") == 0) {
+        return ngx_http_xngin_group_arg(cf, &g->ssl_server_name, 0);
+    }
+
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                        "xngin: invalid directive \"%V\" in agent group",
                        &value[0]);
     return NGX_CONF_ERROR;
 }
+
+
+/* single-argument group directive; ispath resolves relative to prefix */
+static char *
+ngx_http_xngin_group_arg(ngx_conf_t *cf, ngx_str_t *field, ngx_uint_t ispath)
+{
+    ngx_str_t *value = cf->args->elts;
+
+    if (cf->args->nelts != 2) {
+        return "invalid number of arguments";
+    }
+    if (field->len) {
+        return "is duplicate";
+    }
+
+    *field = value[1];
+    if (ispath
+        && ngx_conf_full_name(cf->cycle, field, 1) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+#if (NGX_SSL)
+
+/* finalize an agent group's mTLS ctx: engine is the TLS client and must
+   verify the agent cert (ssl_trusted_certificate is mandatory); a
+   configured ssl_certificate/key turns it into mutual TLS */
+static char *
+ngx_http_xngin_group_ssl(ngx_conf_t *cf, ngx_http_xngin_group_t *g)
+{
+    ngx_ssl_t *ssl;
+
+    if (!g->ssl_on) {
+        if (g->ssl_cert.len || g->ssl_key.len || g->ssl_trusted.len
+            || g->ssl_server_name.len)
+        {
+            return "ssl_* directives require \"ssl on\"";
+        }
+        return NGX_CONF_OK;
+    }
+
+    if (!g->ssl_trusted.len) {
+        return "\"ssl on\" requires ssl_trusted_certificate";
+    }
+
+    ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+    if (ssl == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_ssl_create(ssl, NGX_SSL_TLSv1_2|NGX_SSL_TLSv1_3, cf->log)
+        != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    if (g->ssl_cert.len) {
+        if (!g->ssl_key.len) {
+            return "ssl_certificate requires ssl_certificate_key";
+        }
+        if (ngx_ssl_certificate(cf, ssl, &g->ssl_cert, &g->ssl_key, NULL)
+            != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (g->ssl_key.len) {
+        return "ssl_certificate_key requires ssl_certificate";
+    }
+
+    if (ngx_ssl_trusted_certificate(cf, ssl, &g->ssl_trusted, 1)
+        != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    /* client mode: handshake must fail on an unverifiable agent cert */
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, NULL);
+
+    g->ssl = ssl;
+    return NGX_CONF_OK;
+}
+
+#else  /* !(NGX_SSL) */
+
+static char *
+ngx_http_xngin_group_ssl(ngx_conf_t *cf, ngx_http_xngin_group_t *g)
+{
+    if (g->ssl_on || g->ssl_cert.len || g->ssl_key.len
+        || g->ssl_trusted.len || g->ssl_server_name.len)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "xngin: ssl directives require nginx built "
+                           "--with-http_ssl_module");
+        return NGX_CONF_ERROR;
+    }
+    return NGX_CONF_OK;
+}
+
+#endif
 
 
 static char *

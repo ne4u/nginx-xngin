@@ -485,3 +485,55 @@ def test_ja4_agent(stack, ja4_bin):
         bytes.fromhex(hello["ch_raw_hex"]))
     assert o_ja4 == ja4                      # engine == agent == oracle
     assert o_ja4r == hdrs.get("x-ja4-raw")   # raw JA4 fully verified
+
+
+
+def test_mtls(stack):
+    """engine<->agent over mutual TLS: normal verdict flow."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/admin"},
+         "verdict": {"action": "deny", "status": 403,
+                     "reason": "admin blocked", "score": 90}}]}
+    s = stack(agents_rules=[rules], mtls=True, timeout="1s").start()
+    st, _, _ = s.request("/")
+    assert st == 200
+    st, _, _ = s.request("/admin/x")
+    assert st == 403
+    # second request proves the TLS conn carries multiple requests
+    st, _, _ = s.request("/admin/y")
+    assert st == 403
+
+
+def test_mtls_tcp(stack):
+    """mTLS over a TCP listener too."""
+    s = stack(agents_rules=[ALLOW], mtls=True, timeout="1s",
+              tcp_agents=True).start()
+    st, _, _ = s.request("/")
+    assert st == 200
+
+
+def test_mtls_wrong_ca(stack):
+    """engine trusts an unrelated CA: agent cert rejected, conn drops,
+    fail-close -> 503."""
+    s = stack(agents_rules=[ALLOW], mtls=True, wrong_ca=True,
+              timeout="500ms", fail="close").start()
+    st, _, _ = s.request("/")
+    assert st == 503
+
+
+def test_mtls_no_client_cert(stack):
+    """engine presents no client cert but agent requires one:
+    handshake fails -> fail-close 503."""
+    s = stack(agents_rules=[ALLOW], mtls=True, client_cert=False,
+              timeout="500ms", fail="close").start()
+    st, _, _ = s.request("/")
+    assert st == 503
+
+
+def test_mtls_plaintext_agent(stack):
+    """engine TLS on, agent TLS off: ClientHello is garbage to the
+    agent -> conn drops -> fail-close 503."""
+    s = stack(agents_rules=[ALLOW], mtls=True, agent_tls=False,
+              timeout="500ms", fail="close").start()
+    st, _, _ = s.request("/")
+    assert st == 503

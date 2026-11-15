@@ -35,6 +35,9 @@ GET / ──► nginx ──NOTIFY──► agent ──VERDICT──► allow �
 - **TLS fingerprinting**: `xngin_tls_inspect` captures the ClientHello —
   raw `ch-raw` plus engine JA4 in the NOTIFY; the `ja4-fp` example agent
   recomputes JA4/JA4_r and returns them as headers and `$xngin_*` vars
+- **Optional mTLS to agents**: `ssl on` in the agent group — engine
+  verifies agent certs and can present its own for mutual auth; FIPS-
+  capable stacks on every SDK (OpenSSL FIPS / boringcrypto / aws-lc-rs)
 - **No C dependencies**: pure nginx APIs
 
 ## Prior art

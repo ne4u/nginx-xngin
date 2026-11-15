@@ -14,6 +14,37 @@ steady-state cost of a decision is one frame out and one frame back.
 - Either side may close the connection at any time. The engine treats an
   unexpected close as a connection failure (§7).
 
+### 1.1 TLS transport (optional)
+
+When `ssl on` is configured on the engine's agent group, the connection
+runs standard TLS (1.2 or 1.3) underneath the XNAP framing. The engine
+is the TLS **client** (it initiates the connection); the agent is the
+TLS **server** and presents its certificate.
+
+- The engine MUST verify the agent certificate against the configured
+  `ssl_trusted_certificate` CA and MUST close on verify failure.
+- `ssl_server_name` optionally pins the expected agent hostname: it is
+  sent as SNI and checked against the certificate SAN/CN. IP literals
+  send no SNI.
+- `ssl_certificate` + `ssl_certificate_key` present an engine client
+  certificate; agents that require one get mutual TLS. Without them the
+  connection is server-authenticated TLS only.
+- All XNAP frames are carried unchanged inside TLS records. The HELLO
+  exchange happens after the handshake completes.
+- A TLS failure (handshake error, bad or missing peer certificate)
+  behaves like a dead agent: the connection drops and `xngin_fail`
+  policy applies.
+
+TLS on agent links is intended for deployments that need peer
+authentication, key rotation, or compliance (PCI DSS, FedRAMP) on the
+engine↔agent path. For FIPS module requirements, build against a
+validated crypto library (OpenSSL FIPS provider on the engine,
+aws-lc-rs on the Rust SDK, boringcrypto/GOFIPS140 on the Go SDK).
+
+The handshake cost is amortized: connections are persistent and
+pre-warmed at worker init, so steady-state cost is just the record
+layer (~22 bytes/frame, AES-GCM/ChaCha20 hardware-accelerated).
+
 ## 2. Primitive encodings
 
 ### 2.1 varint
