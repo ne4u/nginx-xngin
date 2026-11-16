@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-                WriteHalf};
+use bytes::BytesMut;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -157,6 +157,17 @@ impl Verdict {
 #[async_trait::async_trait]
 pub trait AgentHandler: Send + Sync + 'static {
     async fn handle(&self, req: &Request) -> Verdict;
+
+    /// Opt-in early verdict (SPEC §4.2): called once per NOTIFY that
+    /// carries HAS_BODY, before the request body finishes uploading —
+    /// on the stream's own task, so it cannot stall the read loop.
+    /// Return `Some` to answer immediately and close the stream (the
+    /// engine stops sending BODY); `None` keeps accumulating BODY
+    /// frames and calls [`handle`](Self::handle) at LAST. `req.body`
+    /// is always empty at this point.
+    async fn early_verdict(&self, _req: &Request) -> Option<Verdict> {
+        None
+    }
 }
 
 /// XNAP server.
@@ -214,43 +225,114 @@ impl<H: AgentHandler> Server<H> {
     }
 }
 
-struct StreamState {
-    req: Request,
+/// Body accumulator for a stream awaiting LAST. The Request itself is
+/// owned by the stream task, so nothing here is held across an await
+/// and no per-stream lock can stall the read loop.
+struct Slot {
+    body: Vec<u8>,
+    done: oneshot::Sender<(Vec<u8>, bool)>,
 }
 
-type Streams = Arc<Mutex<HashMap<u64, StreamState>>>;
-
-async fn write_frame<W>(w: &Arc<Mutex<W>>, f: &Frame) -> bool
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    let mut g = w.lock().await;
-    g.write_all(&f.marshal()).await.is_ok()
-        && g.flush().await.is_ok()
-}
-
-async fn decide<H>(handler: &Arc<H>, streams: &Streams,
-                   wr: &Arc<Mutex<WriteHalf<Box<dyn Io>>>>, sid: u64)
-    -> bool
-where
-    H: AgentHandler,
-{
-    let st = streams.lock().await.remove(&sid);
-    if let Some(st) = st {
-        let v = handler.handle(&st.req).await;
-        return write_frame(wr, &Frame::new(FT_VERDICT, FL_FIN, sid, 0,
-                                         v.marshal())).await;
-    }
-    true
-}
+type Streams = Arc<Mutex<HashMap<u64, Slot>>>;
 
 /// Object-safe stream type for plaintext or TLS connections.
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T> Io for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
-async fn conn<H>(sock: Box<dyn Io>, handler: Arc<H>, agent_id: Arc<String>,
-                 _max_streams: u32, max_frame: u32,
-                 tls: Option<Arc<ServerConfig>>)
+/// Conn write side: drains the marshal queue in batches so a burst of
+/// verdicts costs one write and one flush, not one syscall per frame.
+/// On write failure it signals `stop` so the read loop gives up too —
+/// a dead write side must not queue frames forever.
+async fn writer<W>(mut wr: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+                   stop: oneshot::Sender<()>)
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut out = Vec::with_capacity(64 * 1024);
+    while let Some(first) = rx.recv().await {
+        out.extend_from_slice(&first);
+        while let Ok(next) = rx.try_recv() {
+            out.extend_from_slice(&next);
+        }
+        if wr.write_all(&out).await.is_err()
+            || wr.flush().await.is_err()
+        {
+            let _ = stop.send(());
+            return;
+        }
+        out.clear();
+    }
+}
+
+fn send_frame(wtx: &mpsc::UnboundedSender<Vec<u8>>, f: &Frame) {
+    let _ = wtx.send(f.marshal());
+}
+
+fn send_verdict(wtx: &mpsc::UnboundedSender<Vec<u8>>, sid: u64,
+                v: Verdict) {
+    send_frame(wtx, &Frame::new(FT_VERDICT, FL_FIN, sid, 0, v.marshal()));
+}
+
+/// Headers-only stream: run `handle` on its own task, bounded by the
+/// max-streams semaphore so one slow handler stalls only itself.
+async fn decide_task<H>(handler: Arc<H>,
+                        wtx: mpsc::UnboundedSender<Vec<u8>>,
+                        sem: Arc<Semaphore>, req: Request, sid: u64)
+where
+    H: AgentHandler,
+{
+    let _permit = match sem.acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let v = handler.handle(&req).await;
+    send_verdict(&wtx, sid, v);
+}
+
+/// Body-carrying stream: the task owns the Request; the body arrives
+/// through the oneshot at LAST. `early_verdict` may answer first.
+async fn stream_task<H>(handler: Arc<H>, streams: Streams,
+                        wtx: mpsc::UnboundedSender<Vec<u8>>,
+                        sem: Arc<Semaphore>, mut req: Request,
+                        rx: oneshot::Receiver<(Vec<u8>, bool)>, sid: u64)
+where
+    H: AgentHandler,
+{
+    {
+        let _permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if let Some(v) = handler.early_verdict(&req).await {
+            streams.lock().unwrap().remove(&sid);
+            send_verdict(&wtx, sid, v);
+            return;
+        }
+    }
+    match rx.await {
+        Ok((body, truncated)) => {
+            req.body = body;
+            req.body_truncated |= truncated;
+        }
+        Err(_) => {
+            // aborted or conn died before LAST
+            streams.lock().unwrap().remove(&sid);
+            return;
+        }
+    }
+    let v = {
+        let _permit = match sem.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        handler.handle(&req).await
+    };
+    send_verdict(&wtx, sid, v);
+}
+
+pub(crate) async fn conn<H>(sock: Box<dyn Io>, handler: Arc<H>,
+                            agent_id: Arc<String>, max_streams: u32,
+                            max_frame: u32, tls: Option<Arc<ServerConfig>>)
 where
     H: AgentHandler,
 {
@@ -264,82 +346,109 @@ where
         None => sock,
     };
 
-    let (mut rd, wr_inner) = tokio::io::split(sock);
-    let wr = Arc::new(Mutex::new(wr_inner));
+    let (mut rd, wr) = tokio::io::split(sock);
 
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let (wtx, wrx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (stx, mut srx) = oneshot::channel::<()>();
+    tokio::spawn(writer(wr, wrx, stx));
+
+    let sem = Arc::new(Semaphore::new(max_streams.max(1) as usize));
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
+    let mut buf = BytesMut::with_capacity(64 * 1024);
 
     loop {
-        match rd.read_buf(&mut buf).await {
+        // writer death (srx resolves) or read failure ends the conn
+        let read = tokio::select! {
+            r = rd.read_buf(&mut buf) => r,
+            _ = &mut srx => return,
+        };
+        match read {
             Ok(0) => return,
             Ok(_) => {}
             Err(_) => return,
         }
 
-        let frames = match feed_max(&mut buf, max_frame) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
+        // walk complete frames over the buffer front without copying;
+        // split_to + freeze moves the consumed prefix into a refcounted
+        // chunk the dispatcher can slice at zero cost.
+        let mut spans = Vec::new();
+        let mut off = 0usize;
+        loop {
+            match next_frame(&buf[off..], max_frame) {
+                Ok(Some(h)) => {
+                    let base = off;
+                    off += h.total;
+                    spans.push((base, h));
+                }
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
+        if off == 0 {
+            continue;
+        }
+        let chunk = buf.split_to(off).freeze();
 
-        for fr in frames {
-            match fr.typ {
+        for (base, h) in spans {
+            let payload =
+                chunk.slice(base + h.payload.start..base + h.payload.end);
+            match h.typ {
                 FT_ENGINE_HELLO => {
                     let mut p = Vec::new();
                     enc_kv(&mut p, "version", &Value::Uint(VERSION as u64));
                     enc_kv(&mut p, "max-frame-size",
                            &Value::Uint(max_frame as u64));
-                    enc_kv(&mut p, "max-streams", &Value::Uint(256));
+                    enc_kv(&mut p, "max-streams",
+                           &Value::Uint(max_streams as u64));
                     enc_kv(&mut p, "capabilities",
                            &Value::Uint((CAP_BODY | CAP_ASYNC | CAP_VCACHE
                                          | CAP_RESP) as u64));
                     enc_kv(&mut p, "agent-id",
                            &Value::Str(agent_id.as_str().to_string()));
-                    if !write_frame(&wr,
-                                    &Frame::new(FT_AGENT_HELLO, 0, 0, 0, p))
-                        .await
-                    {
-                        return;
-                    }
+                    send_frame(&wtx,
+                               &Frame::new(FT_AGENT_HELLO, 0, 0, 0, p));
                 }
                 FT_PING => {
-                    if !write_frame(&wr,
-                                    &Frame::new(FT_PONG, 0, fr.sid, fr.fid,
-                                                fr.payload)).await {
-                        return;
-                    }
+                    send_frame(&wtx, &Frame::new(FT_PONG, 0, h.sid, h.fid,
+                                                 payload.to_vec()));
                 }
                 FT_ABORT => {
-                    streams.lock().await.remove(&fr.sid);
+                    streams.lock().unwrap().remove(&h.sid);
                 }
                 FT_BODY => {
-                    let mut done = false;
-                    {
-                        let mut map = streams.lock().await;
-                        if let Some(st) = map.get_mut(&fr.sid) {
-                            st.req.body.extend_from_slice(&fr.payload);
-                            if fr.flags & FL_BODY_LAST != 0 {
-                                st.req.body_truncated |=
-                                    fr.flags & FL_BODY_TRUNCATED != 0;
-                                done = true;
+                    let mut map = streams.lock().unwrap();
+                    if let Some(slot) = map.get_mut(&h.sid) {
+                        slot.body.extend_from_slice(&payload);
+                        if h.flags & FL_BODY_LAST != 0 {
+                            let truncated =
+                                h.flags & FL_BODY_TRUNCATED != 0;
+                            if let Some(slot) = map.remove(&h.sid) {
+                                let _ =
+                                    slot.done.send((slot.body, truncated));
                             }
                         }
                     }
-                    if done && !decide(&handler, &streams, &wr, fr.sid).await {
-                        return;
-                    }
                 }
                 FT_NOTIFY => {
-                    let req = match fr.notify() {
-                        Ok((msg, kvs)) => build_request(msg, kvs, fr.flags),
+                    let req = match parse_notify(&payload) {
+                        Ok((msg, kvs)) => build_request(msg, kvs, h.flags),
                         Err(_) => continue,
                     };
-                    let has_body = fr.flags & FL_NOTIFY_HAS_BODY != 0;
-                    streams.lock().await.insert(fr.sid, StreamState { req });
-                    if !has_body
-                        && !decide(&handler, &streams, &wr, fr.sid).await
-                    {
-                        return;
+                    if h.flags & FL_NOTIFY_HAS_BODY != 0 {
+                        let (tx, rx) = oneshot::channel();
+                        streams.lock().unwrap().insert(
+                            h.sid,
+                            Slot { body: Vec::new(), done: tx },
+                        );
+                        tokio::spawn(stream_task(
+                            handler.clone(), streams.clone(),
+                            wtx.clone(), sem.clone(), req, rx, h.sid,
+                        ));
+                    } else {
+                        tokio::spawn(decide_task(
+                            handler.clone(), wtx.clone(), sem.clone(),
+                            req, h.sid,
+                        ));
                     }
                 }
                 FT_DISCON => return,

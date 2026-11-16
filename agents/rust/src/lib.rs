@@ -17,3 +17,7 @@ mod proto_tests;
 #[cfg(test)]
 #[path = "conformance_tests.rs"]
 mod conformance_tests;
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod server_tests;

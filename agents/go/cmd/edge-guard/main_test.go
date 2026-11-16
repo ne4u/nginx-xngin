@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -24,29 +25,35 @@ func testGuard(rate, burst float64, maxBuckets int) (*guard, *time.Time) {
 
 func (g *guard) size(t *testing.T) int {
 	t.Helper()
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if len(g.buckets) != g.lru.Len() {
-		t.Fatalf("map/lru out of sync: %d vs %d", len(g.buckets), g.lru.Len())
+	total := 0
+	for i := range g.shards {
+		s := &g.shards[i]
+		s.mu.Lock()
+		if len(s.buckets) != s.lru.Len() {
+			t.Fatalf("shard %d map/lru out of sync: %d vs %d",
+				i, len(s.buckets), s.lru.Len())
+		}
+		total += len(s.buckets)
+		s.mu.Unlock()
 	}
-	return len(g.buckets)
+	return total
 }
 
 func TestRateKey(t *testing.T) {
-	cases := map[string]string{
-		"192.0.2.7":            "192.0.2.7",
-		"::ffff:192.0.2.7":     "192.0.2.7",
-		"2001:db8:1:2:3:4:5:6": "2001:db8:1:2::/64",
-		"2001:db8:1:2:ffff::1": "2001:db8:1:2::/64",
-		"2001:db8:1:3::1":      "2001:db8:1:3::/64",
+	cases := map[string]netip.Addr{
+		"192.0.2.7":            netip.MustParseAddr("192.0.2.7"),
+		"::ffff:192.0.2.7":     netip.MustParseAddr("192.0.2.7"),
+		"2001:db8:1:2:3:4:5:6": netip.MustParseAddr("2001:db8:1:2::"),
+		"2001:db8:1:2:ffff::1": netip.MustParseAddr("2001:db8:1:2::"),
+		"2001:db8:1:3::1":      netip.MustParseAddr("2001:db8:1:3::"),
 	}
 	for in, want := range cases {
 		if got := rateKey(net.ParseIP(in)); got != want {
-			t.Errorf("rateKey(%s) = %q, want %q", in, got, want)
+			t.Errorf("rateKey(%s) = %v, want %v", in, got, want)
 		}
 	}
-	if got := rateKey(nil); got != "unknown" {
-		t.Errorf("rateKey(nil) = %q", got)
+	if got := rateKey(nil); got.IsValid() {
+		t.Errorf("rateKey(nil) = %v, want invalid", got)
 	}
 }
 
@@ -94,28 +101,107 @@ func TestDistinctPrefixesStayUnderCap(t *testing.T) {
 func TestIdleBucketsEvicted(t *testing.T) {
 	g, clock := testGuard(10, 20, 1000) // idle window = 2s
 	for i := 0; i < 500; i++ {
-		g.takeToken(net.IPv4(10, 0, byte(i>>8), byte(i)).String())
+		ip := net.IPv4(10, 0, byte(i>>8), byte(i))
+		g.takeToken(rateKey(ip))
 	}
 	if n := g.size(t); n != 500 {
 		t.Fatalf("buckets = %d, want 500", n)
 	}
 	*clock = clock.Add(g.idleWindow())
-	g.takeToken("192.0.2.1")
-	if n := g.size(t); n != 1 {
-		t.Fatalf("buckets after idle sweep = %d, want 1", n)
+	g.sweep(*clock)
+	if n := g.size(t); n != 0 {
+		t.Fatalf("buckets after idle sweep = %d, want 0", n)
 	}
 }
 
 func TestEvictionKeepsActiveLimit(t *testing.T) {
 	g, clock := testGuard(1, 3, 1000)
+	a := netip.MustParseAddr("10.0.0.1")
+	b := netip.MustParseAddr("10.0.0.2")
 	for i := 0; i < 3; i++ {
-		if !g.takeToken("a") {
+		if !g.takeToken(a) {
 			t.Fatalf("request %d denied within burst", i)
 		}
 	}
 	*clock = clock.Add(500 * time.Millisecond)
-	g.takeToken("b") // triggers a sweep; "a" is not idle yet
-	if g.takeToken("a") {
+	g.takeToken(b) // triggers a sweep in b's shard; "a" is not idle yet
+	if g.takeToken(a) {
 		t.Fatal("drained bucket was reset by eviction")
+	}
+}
+
+func TestDenyTTLClampedToWindow(t *testing.T) {
+	// rate=50 burst=20 -> window = ceil(0.4) = 1s
+	g, _ := testGuard(50, 20, 1000)
+	g.ttl = 60
+	if got := g.denyTTL(); got != 1 {
+		t.Fatalf("denyTTL = %d, want clamp to 1", got)
+	}
+	g.ttl = 0
+	if got := g.denyTTL(); got != 0 {
+		t.Fatalf("denyTTL = %d, want 0 for ttl=0", got)
+	}
+	// no limiter -> ttl passes through for ACL denies
+	g, _ = testGuard(0, 20, 1000)
+	g.ttl = 30
+	if got := g.denyTTL(); got != 30 {
+		t.Fatalf("denyTTL = %d, want 30", got)
+	}
+}
+
+func TestAllowNeverCached(t *testing.T) {
+	g, _ := testGuard(50, 20, 1000)
+	g.ttl = 60
+	v, err := g.Handle(context.Background(), reqFrom(net.ParseIP("192.0.2.9")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Action != "allow" {
+		t.Fatalf("action = %q, want allow", v.Action)
+	}
+	if v.CacheTTL != 0 {
+		t.Fatalf("allow CacheTTL = %d, want 0 (every request takes a token)", v.CacheTTL)
+	}
+}
+
+func TestCacheableDenyDropsExtras(t *testing.T) {
+	g, _ := testGuard(1, 1, 1000) // burst=1, window=1s
+	g.ttl = 60                    // clamps to 1 -> cacheable
+	ctx := context.Background()
+	// burn the single token
+	if _, err := g.Handle(ctx, reqFrom(net.ParseIP("192.0.2.1"))); err != nil {
+		t.Fatal(err)
+	}
+	v, err := g.Handle(ctx, reqFrom(net.ParseIP("192.0.2.1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Status != 429 {
+		t.Fatalf("status = %d, want 429", v.Status)
+	}
+	if v.CacheTTL == 0 {
+		t.Fatal("429 verdict should carry the clamped cache-ttl")
+	}
+	if len(v.SetHeaders) != 0 || len(v.Vars) != 0 {
+		t.Fatalf("cacheable deny keeps hdr-set/vars: %+v", v)
+	}
+}
+
+func TestUncachedDenyKeepsExtras(t *testing.T) {
+	g, _ := testGuard(1, 1, 1000)
+	// ttl unset -> deny is not cacheable, extras stay for observability
+	ctx := context.Background()
+	if _, err := g.Handle(ctx, reqFrom(net.ParseIP("192.0.2.1"))); err != nil {
+		t.Fatal(err)
+	}
+	v, err := g.Handle(ctx, reqFrom(net.ParseIP("192.0.2.1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Status != 429 || v.CacheTTL != 0 {
+		t.Fatalf("verdict = %+v, want 429 uncached", v)
+	}
+	if v.Vars["guard"] != "ratelimit" || v.SetHeaders["retry-after"] != "1" {
+		t.Fatalf("uncached deny lost vars/hdr-set: %+v", v)
 	}
 }

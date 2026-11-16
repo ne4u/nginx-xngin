@@ -290,11 +290,7 @@ impl Frame {
 
     /// Parse the NOTIFY payload: (msg-name, kv pairs)
     pub fn notify(&self) -> Result<(String, Vec<(String, Value)>), ProtoError> {
-        let mut r = Reader::new(&self.payload);
-        let n = r.varint()? as usize;
-        let msg = String::from_utf8(r.take(n)?.to_vec())
-            .map_err(|_| ProtoError("utf8"))?;
-        Ok((msg, r.kv_list()?))
+        parse_notify(&self.payload)
     }
 
     pub fn kvs(&self) -> Result<Vec<(String, Value)>, ProtoError> {
@@ -320,6 +316,68 @@ pub(crate) fn peek_varint(buf: &[u8]) -> Result<Option<(u64, usize)>, ProtoError
     Ok(None)
 }
 
+/// Parsed frame header plus the payload's byte range inside the
+/// scanned buffer (zero-copy view; nothing is materialized).
+pub(crate) struct FrameHdr {
+    pub typ: u8,
+    pub flags: u32,
+    pub sid: u64,
+    pub fid: u64,
+    /// payload range relative to the start of the scanned buffer
+    pub payload: std::ops::Range<usize>,
+    /// bytes consumed by the whole frame (len varint + frame)
+    pub total: usize,
+}
+
+/// Parse the frame at the start of `buf` without copying.
+/// Ok(Some) — a complete frame; Ok(None) — incomplete (need more
+/// bytes); Err — malformed. Bounds checks are identical to
+/// [`feed_max`], which is implemented on top of this scanner.
+pub(crate) fn next_frame(buf: &[u8], max_frame: u32)
+    -> Result<Option<FrameHdr>, ProtoError>
+{
+    let Some((flen, hdr_len)) = peek_varint(buf)? else {
+        return Ok(None);
+    };
+    if flen < 6 {
+        return Err(ProtoError("bad frame len"));
+    }
+    if flen > max_frame as u64 {
+        return Err(ProtoError("frame too large"));
+    }
+    let flen = flen as usize;
+    let fstart = hdr_len;
+    if buf.len() - fstart < flen {
+        return Ok(None); // incomplete frame
+    }
+    let fend = fstart + flen;
+
+    let mut fr = Reader::new(&buf[fstart..fend]);
+    let typ = fr.take(1)?[0];
+    let flags = u32::from_be_bytes(fr.take(4)?.try_into().unwrap());
+    let sid = fr.varint()?;
+    let fid = fr.varint()?;
+    Ok(Some(FrameHdr {
+        typ,
+        flags,
+        sid,
+        fid,
+        payload: fstart + fr.pos..fend,
+        total: fend,
+    }))
+}
+
+/// Parse a NOTIFY payload into (msg-name, kv pairs).
+pub(crate) fn parse_notify(payload: &[u8])
+    -> Result<(String, Vec<(String, Value)>), ProtoError>
+{
+    let mut r = Reader::new(payload);
+    let n = r.varint()? as usize;
+    let msg = String::from_utf8(r.take(n)?.to_vec())
+        .map_err(|_| ProtoError("utf8"))?;
+    Ok((msg, r.kv_list()?))
+}
+
 /// Drain complete frames from `buf`, leaving the partial tail in place.
 /// Frames larger than [`DEFAULT_MAX_FRAME`] are rejected.
 pub fn feed(buf: &mut Vec<u8>) -> Result<Vec<Frame>, ProtoError> {
@@ -331,31 +389,18 @@ pub fn feed_max(buf: &mut Vec<u8>, max_frame: u32)
     -> Result<Vec<Frame>, ProtoError>
 {
     let mut frames = Vec::new();
-    let mut pos = 0usize;
-    while let Some((flen, hdr_len)) = peek_varint(&buf[pos..])? {
-        if flen < 6 {
-            return Err(ProtoError("bad frame len"));
-        }
-        if flen > max_frame as u64 {
-            return Err(ProtoError("frame too large"));
-        }
-        let flen = flen as usize;
-        let fstart = pos + hdr_len;
-        if buf.len() - fstart < flen {
-            break; // incomplete frame
-        }
-        let fend = fstart + flen;
-
-        let mut fr = Reader::new(&buf[fstart..fend]);
-        let typ = fr.take(1)?[0];
-        let flags = u32::from_be_bytes(fr.take(4)?.try_into().unwrap());
-        let sid = fr.varint()?;
-        let fid = fr.varint()?;
-        let payload = fr.buf[fr.pos..].to_vec();
-
-        frames.push(Frame { typ, flags, sid, fid, payload });
-        pos = fend;
+    let mut off = 0usize;
+    while let Some(h) = next_frame(&buf[off..], max_frame)? {
+        frames.push(Frame {
+            typ: h.typ,
+            flags: h.flags,
+            sid: h.sid,
+            fid: h.fid,
+            payload: buf[off + h.payload.start..off + h.payload.end]
+                .to_vec(),
+        });
+        off += h.total;
     }
-    buf.drain(..pos);
+    buf.drain(..off);
     Ok(frames)
 }

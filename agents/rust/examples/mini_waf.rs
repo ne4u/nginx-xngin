@@ -9,7 +9,7 @@ use std::env;
 use std::path::Path;
 
 use async_trait::async_trait;
-use regex::Regex;
+use regex::bytes::Regex;
 use xngin_rs::{AgentHandler, Request, Server, Verdict};
 
 struct Rule {
@@ -56,26 +56,65 @@ fn rules() -> Vec<Rule> {
     ]
 }
 
+impl MiniWaf {
+    /// Rule matches borrowed from the request — no per-rule copies.
+    fn subject<'a>(rule: &Rule, req: &'a Request) -> Option<&'a [u8]> {
+        match rule.scope {
+            Scope::Uri => req.get("uri").map(str::as_bytes),
+            Scope::Header(h) => req.header(h).map(str::as_bytes),
+            Scope::Body => {
+                if req.body.is_empty() {
+                    None
+                } else {
+                    Some(&req.body)
+                }
+            }
+        }
+    }
+
+    /// Score the header/URI rules only (usable before the body lands).
+    fn score_headers(&self, req: &Request) -> (i64, Vec<&'static str>) {
+        let mut score: i64 = 0;
+        let mut hits: Vec<&'static str> = Vec::new();
+        for rule in &self.rules {
+            if matches!(rule.scope, Scope::Body) {
+                continue;
+            }
+            if Self::subject(rule, req)
+                .is_some_and(|s| rule.re.is_match(s))
+            {
+                score += rule.score;
+                hits.push(rule.name);
+            }
+        }
+        (score, hits)
+    }
+}
+
 #[async_trait]
 impl AgentHandler for MiniWaf {
+    /// Early deny: when URI/header rules alone cross the threshold the
+    /// verdict can go out at NOTIFY time — body rules never run on that
+    /// stream (the engine stops sending BODY after the verdict).
+    async fn early_verdict(&self, req: &Request) -> Option<Verdict> {
+        let (score, hits) = self.score_headers(req);
+        if score < self.threshold {
+            return None;
+        }
+        let mut v =
+            Verdict::deny(403, &format!("waf-early: {}", hits.join(",")));
+        v.score = Some(score);
+        v.vars.push(("waf_rules".into(), hits.join(",")));
+        Some(v)
+    }
+
     async fn handle(&self, req: &Request) -> Verdict {
         let mut score: i64 = 0;
         let mut hits: Vec<&'static str> = Vec::new();
 
         for rule in &self.rules {
-            let subject = match rule.scope {
-                Scope::Uri => req.get("uri").map(str::to_string),
-                Scope::Header(h) => req.header(h).map(str::to_string),
-                Scope::Body => {
-                    if req.body.is_empty() {
-                        None
-                    } else {
-                        Some(String::from_utf8_lossy(&req.body).into_owned())
-                    }
-                }
-            };
-            if let Some(s) = subject {
-                if rule.re.is_match(&s) {
+            if let Some(s) = Self::subject(rule, req) {
+                if rule.re.is_match(s) {
                     score += rule.score;
                     hits.push(rule.name);
                 }

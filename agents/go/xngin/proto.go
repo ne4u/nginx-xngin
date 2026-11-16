@@ -95,6 +95,15 @@ func appendVarint(dst []byte, v uint64) []byte {
 	return append(dst, byte(v))
 }
 
+func varintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
+}
+
 func appendSvarint(dst []byte, v int64) []byte {
 	return appendVarint(dst, uint64(v<<1)^uint64(v>>63))
 }
@@ -277,14 +286,17 @@ func (d *decoder) value() (Value, error) {
 		if err := d.need(4); err != nil {
 			return nil, err
 		}
-		ip := net.IP(d.buf[d.pos : d.pos+4])
+		// copy: the decoded value may outlive a borrowed payload
+		ip := make(net.IP, net.IPv4len)
+		copy(ip, d.buf[d.pos:d.pos+4])
 		d.pos += 4
 		return ip, nil
 	case VTIPv6:
 		if err := d.need(16); err != nil {
 			return nil, err
 		}
-		ip := net.IP(d.buf[d.pos : d.pos+16])
+		ip := make(net.IP, net.IPv6len)
+		copy(ip, d.buf[d.pos:d.pos+16])
 		d.pos += 16
 		return ip, nil
 	case VTStr, VTBin:
@@ -394,17 +406,27 @@ type Frame struct {
 
 // Marshal encodes the frame to wire bytes.
 func (f *Frame) Marshal() []byte {
-	out := make([]byte, 0, len(f.Payload)+16)
-	body := make([]byte, 0, len(f.Payload)+16)
-	body = append(body, f.Type)
+	return appendFrame(nil, f)
+}
+
+// appendFrame encodes the frame onto dst with a single growth: the
+// frame-len varint prefix length and body length are both computable
+// up front, so no scratch body buffer is needed.
+func appendFrame(dst []byte, f *Frame) []byte {
+	blen := 1 + 4 + varintLen(f.SID) + varintLen(f.FID) + len(f.Payload)
+	if cap(dst)-len(dst) < varintLen(uint64(blen))+blen {
+		grown := make([]byte, len(dst), len(dst)+varintLen(uint64(blen))+blen)
+		copy(grown, dst)
+		dst = grown
+	}
+	dst = appendVarint(dst, uint64(blen))
+	dst = append(dst, f.Type)
 	var fb [4]byte
 	binary.BigEndian.PutUint32(fb[:], f.Flags)
-	body = append(body, fb[:]...)
-	body = appendVarint(body, f.SID)
-	body = appendVarint(body, f.FID)
-	body = append(body, f.Payload...)
-	out = appendVarint(out, uint64(len(body)))
-	return append(out, body...)
+	dst = append(dst, fb[:]...)
+	dst = appendVarint(dst, f.SID)
+	dst = appendVarint(dst, f.FID)
+	return append(dst, f.Payload...)
 }
 
 // ParseFrames decodes complete frames from buf using the SPEC default
@@ -417,41 +439,78 @@ func ParseFrames(buf []byte) ([]Frame, []byte, error) {
 // the unconsumed tail (a partial frame). Call feed-style: append read
 // bytes to buf and call again. Frames whose frame-len exceeds maxFrame
 // are rejected with ErrProtocol before any payload is buffered.
+// Returned payloads are owned copies; see scanFrames for the zero-copy
+// variant used by the server read loop.
 func ParseFramesMax(buf []byte, maxFrame uint32) ([]Frame, []byte, error) {
-	var frames []Frame
+	spans, consumed, err := scanFrames(buf, maxFrame)
+	if err != nil {
+		return nil, nil, err
+	}
+	frames := make([]Frame, 0, len(spans))
+	for _, s := range spans {
+		frames = append(frames, Frame{
+			Type:    s.typ,
+			Flags:   s.flags,
+			SID:     s.sid,
+			FID:     s.fid,
+			Payload: append([]byte(nil), s.payload...),
+		})
+	}
+	return frames, buf[consumed:], nil
+}
+
+// frameSpan is one parsed frame; payload borrows the scanned buffer and
+// is only valid until that buffer is appended to or compacted.
+type frameSpan struct {
+	typ     byte
+	flags   uint32
+	sid     uint64
+	fid     uint64
+	payload []byte
+}
+
+// scanFrames walks complete frames in buf without copying. It returns
+// the frame spans (payloads alias buf) and the number of bytes consumed;
+// the caller must dispatch all spans before mutating buf's contents.
+// The wire bounds checks are identical to ParseFramesMax, which is
+// implemented on top of this scanner.
+func scanFrames(buf []byte, maxFrame uint32) ([]frameSpan, int, error) {
+	var spans []frameSpan
+	off := 0
 	for {
-		d := &decoder{buf: buf}
+		d := &decoder{buf: buf[off:]}
 		flen, err := d.varint()
 		if err != nil {
-			if len(buf) >= maxVarintLen {
-				return nil, nil, ErrProtocol // overlong varint
+			if len(buf)-off >= maxVarintLen {
+				return nil, 0, ErrProtocol // overlong varint
 			}
-			return frames, buf, nil // need more
+			return spans, off, nil // need more
 		}
 		if flen < 6 || flen > uint64(maxFrame) {
-			return nil, nil, ErrProtocol
+			return nil, 0, ErrProtocol
 		}
 		if flen > d.remaining() {
-			return frames, buf, nil
+			return spans, off, nil
 		}
-		fend := d.pos + int(flen)
+		fstart := off + d.pos
+		fend := fstart + int(flen)
 		// header fields must lie within the declared frame
-		h := &decoder{buf: buf[d.pos:fend]}
+		h := &decoder{buf: buf[fstart:fend]}
 		ftype := h.buf[0]
 		flags := binary.BigEndian.Uint32(h.buf[1:5])
 		h.pos = 5
 		sid, err := h.varint()
 		if err != nil {
-			return nil, nil, ErrProtocol
+			return nil, 0, ErrProtocol
 		}
 		fid, err := h.varint()
 		if err != nil {
-			return nil, nil, ErrProtocol
+			return nil, 0, ErrProtocol
 		}
-		frames = append(frames, Frame{
-			Type: ftype, Flags: flags, SID: sid, FID: fid,
-			Payload: append([]byte(nil), h.buf[h.pos:]...),
+		spans = append(spans, frameSpan{
+			typ: ftype, flags: flags, sid: sid, fid: fid,
+			payload: h.buf[h.pos:],
 		})
-		buf = buf[fend:]
+		off = fend
 	}
 }

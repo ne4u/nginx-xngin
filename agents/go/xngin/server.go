@@ -3,7 +3,6 @@ package xngin
 import (
 	"context"
 	"crypto/tls"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -73,7 +72,12 @@ func Deny(status int, reason string) *Verdict {
 }
 
 func (v *Verdict) marshal() ([]byte, error) {
-	var out []byte
+	return v.marshalInto(nil)
+}
+
+// marshalInto encodes the verdict KV payload onto dst, for callers
+// supplying a pooled buffer.
+func (v *Verdict) marshalInto(out []byte) ([]byte, error) {
 	var err error
 	put := func(name string, val Value) {
 		if err == nil {
@@ -140,6 +144,18 @@ type Handler interface {
 	Handle(ctx context.Context, req *Request) (*Verdict, error)
 }
 
+// EarlyHandler is an optional interface a Handler may implement to
+// answer a stream before its request body finishes uploading
+// (SPEC §4.2). It is called once per NOTIFY that carries HAS_BODY, on
+// the stream's own goroutine — a slow EarlyVerdict cannot stall the
+// connection's read loop. A non-nil verdict is sent immediately and the
+// stream is closed (the engine stops sending BODY); nil keeps
+// accumulating BODY frames and calls Handle at LAST, as today.
+// req.Body is always empty at this point.
+type EarlyHandler interface {
+	EarlyVerdict(ctx context.Context, req *Request) (*Verdict, error)
+}
+
 // HandlerFunc adapts a function to Handler.
 type HandlerFunc func(ctx context.Context, req *Request) (*Verdict, error)
 
@@ -192,7 +208,150 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 type streamState struct {
-	req *Request
+	req      *Request
+	ctx      context.Context
+	cancel   context.CancelFunc
+	body     []byte // raw accumulation; lands in req.Body at LAST
+	trunc    bool
+	bodyDone bool          // LAST seen: body is now read-only
+	done     chan struct{} // closed at LAST; wakes the stream task
+	decided  bool          // early verdict sent; BODY is ignored
+}
+
+// marshalPool recycles VERDICT/PONG/HELLO wire buffers: the writer
+// goroutine returns each buffer after it hits the socket.
+var marshalPool = sync.Pool{New: func() any {
+	return make([]byte, 0, 512)
+}}
+
+// marshalBuf encodes f into a pooled buffer; callers hand the buffer to
+// wq.enqueue (or return it to the pool themselves).
+func marshalBuf(f *Frame) []byte {
+	return appendFrame(marshalPool.Get().([]byte)[:0], f)
+}
+
+// writeQueue owns the conn's write side. The `writing` flag is a
+// single-writer claim taken atomically under mu: an uncontended
+// producer writes its frame inline (no scheduler hop), while a
+// producer that finds a write in flight or queued work appends to the
+// queue for the writer goroutine to batch into one net.Buffers writev.
+type writeQueue struct {
+	c        net.Conn
+	mu       sync.Mutex
+	queue    [][]byte
+	wake     chan struct{}
+	stop     chan struct{}
+	finished chan struct{}
+	closed   bool
+	writing  bool
+}
+
+func newWriteQueue(c net.Conn) *writeQueue {
+	q := &writeQueue{
+		c:        c,
+		wake:     make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	go q.run()
+	return q
+}
+
+func (q *writeQueue) enqueue(b []byte) {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		marshalPool.Put(b[:0])
+		return
+	}
+	if len(q.queue) == 0 && !q.writing {
+		// fast path: take the claim and write inline — the frame is
+		// ordered first because the queue is empty.
+		q.writing = true
+		q.mu.Unlock()
+
+		_, err := q.c.Write(b)
+		marshalPool.Put(b[:0])
+
+		q.mu.Lock()
+		q.writing = false
+		if len(q.queue) > 0 {
+			// run() may have skipped a wake while we held the claim
+			select {
+			case q.wake <- struct{}{}:
+			default:
+			}
+		}
+		q.mu.Unlock()
+		if err != nil {
+			q.c.Close() // unblock the reader so serveConn returns
+		}
+		return
+	}
+	q.queue = append(q.queue, b)
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (q *writeQueue) run() {
+	defer close(q.finished)
+	for {
+		select {
+		case <-q.stop:
+			return
+		case <-q.wake:
+		}
+		q.mu.Lock()
+		if q.writing || len(q.queue) == 0 {
+			// someone holds the claim; when it is released it
+			// re-signals wake if work is pending
+			q.mu.Unlock()
+			continue
+		}
+		q.writing = true
+		batch := q.queue
+		q.queue = nil
+		q.mu.Unlock()
+
+		var err error
+		if len(batch) == 1 {
+			_, err = q.c.Write(batch[0])
+		} else {
+			// WriteTo consumes the slice it is given; pass a copy so
+			// the originals stay whole for the pool return below.
+			v := make(net.Buffers, len(batch))
+			copy(v, batch)
+			_, err = v.WriteTo(q.c)
+		}
+		for _, b := range batch {
+			marshalPool.Put(b[:0])
+		}
+
+		q.mu.Lock()
+		q.writing = false
+		q.mu.Unlock()
+		if err != nil {
+			q.c.Close() // unblock the reader so serveConn returns
+			return
+		}
+	}
+}
+
+func (q *writeQueue) close() {
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		for _, b := range q.queue {
+			marshalPool.Put(b[:0])
+		}
+		q.queue = nil
+		close(q.stop)
+	}
+	q.mu.Unlock()
+	<-q.finished
 }
 
 func (s *Server) serveConn(c net.Conn) {
@@ -221,41 +380,43 @@ func (s *Server) serveConn(c net.Conn) {
 		agentID = "xngin-go/1"
 	}
 
+	early, _ := s.Handler.(EarlyHandler)
+
+	connCtx, connCancel := context.WithCancel(context.Background())
+
 	var (
-		buf     []byte
 		streams = map[uint64]*streamState{}
 		mu      sync.Mutex
 		wg      sync.WaitGroup
-		writeMu sync.Mutex
 	)
+	wq := newWriteQueue(c)
 
-	writeFrame := func(f *Frame) {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		c.Write(f.Marshal())
-	}
-
+	// teardown order (LIFO): cancel handlers -> stop writer -> wait for
+	// stream goroutines -> close the socket.
+	defer connCancel()
+	defer wq.close()
 	defer wg.Wait()
 
-	tmp := make([]byte, 64*1024)
+	buf := make([]byte, 0, 64*1024)
 	for {
-		n, err := c.Read(tmp)
-		if err != nil {
-			if err != io.EOF {
-				return
-			}
-			return
+		if len(buf) == cap(buf) {
+			nb := make([]byte, len(buf), cap(buf)*2)
+			copy(nb, buf)
+			buf = nb
 		}
-		buf = append(buf, tmp[:n]...)
-
-		var frames []Frame
-		frames, buf, err = ParseFramesMax(buf, maxFrame)
+		n, err := c.Read(buf[len(buf):cap(buf)])
 		if err != nil {
 			return
 		}
+		buf = buf[:len(buf)+n]
 
-		for _, fr := range frames {
-			switch fr.Type {
+		spans, consumed, err := scanFrames(buf, maxFrame)
+		if err != nil {
+			return
+		}
+
+		for _, fr := range spans {
+			switch fr.typ {
 
 			case FrameEngineHello:
 				hello := KVPairs(
@@ -266,66 +427,118 @@ func (s *Server) serveConn(c net.Conn) {
 						uint32(CapBody | CapAsync | CapVCache | CapResp)},
 					Pair{"agent-id", agentID},
 				)
-				writeFrame(&Frame{Type: FrameAgentHello, Payload: hello})
+				wq.enqueue(marshalBuf(&Frame{Type: FrameAgentHello,
+					Payload: hello}))
 
 			case FramePing:
-				writeFrame(&Frame{Type: FramePong, SID: fr.SID,
-					FID: fr.FID, Payload: fr.Payload})
+				wq.enqueue(marshalBuf(&Frame{Type: FramePong,
+					SID: fr.sid, FID: fr.fid, Payload: fr.payload}))
 
 			case FrameAbort:
 				mu.Lock()
-				delete(streams, fr.SID)
+				if st := streams[fr.sid]; st != nil {
+					delete(streams, fr.sid)
+					st.cancel()
+				}
 				mu.Unlock()
 
 			case FrameBody:
 				mu.Lock()
-				st := streams[fr.SID]
-				mu.Unlock()
-				if st == nil {
-					break
-				}
-				st.req.Body = append(st.req.Body, fr.Payload...)
-				if fr.Flags&FlagBodyLast != 0 {
-					if fr.Flags&FlagBodyTruncated != 0 {
-						st.req.BodyTruncated = true
+				st := streams[fr.sid]
+				if st != nil && !st.decided && !st.bodyDone {
+					st.body = append(st.body, fr.payload...)
+					if fr.flags&FlagBodyLast != 0 {
+						st.bodyDone = true
+						st.trunc = st.trunc ||
+							fr.flags&FlagBodyTruncated != 0
+						close(st.done)
 					}
-					wg.Add(1)
-					go s.handleStream(c, st, fr.SID, writeFrame, &wg, &mu, streams)
 				}
+				mu.Unlock()
 
 			case FrameNotify:
-				msg, fields, hdrs, trunc := parseNotify(fr.Payload)
-				st := &streamState{req: &Request{
-					Msg: msg, Fields: fields, Header: hdrs,
-					Async:         fr.Flags&FlagNotifyAsync != 0,
-					BodyTruncated: trunc,
-				}}
-				mu.Lock()
-				streams[fr.SID] = st
-				mu.Unlock()
-				if fr.Flags&FlagNotifyHasBody == 0 {
-					wg.Add(1)
-					go s.handleStream(c, st, fr.SID, writeFrame, &wg, &mu, streams)
+				msg, fields, hdrs, trunc := parseNotify(fr.payload)
+				ctx, cancel := context.WithCancel(connCtx)
+				st := &streamState{
+					req: &Request{
+						Msg: msg, Fields: fields, Header: hdrs,
+						Async:         fr.flags&FlagNotifyAsync != 0,
+						BodyTruncated: trunc,
+					},
+					ctx:    ctx,
+					cancel: cancel,
+					done:   make(chan struct{}),
 				}
+				mu.Lock()
+				streams[fr.sid] = st
+				mu.Unlock()
+				wg.Add(1)
+				go s.streamTask(st, fr.sid,
+					fr.flags&FlagNotifyHasBody != 0, early,
+					wq, &wg, &mu, streams)
 
 			case FrameDiscon:
 				return
 			}
 		}
+
+		if consumed > 0 {
+			copy(buf, buf[consumed:])
+			buf = buf[:len(buf)-consumed]
+		}
 	}
 }
 
-func (s *Server) handleStream(c net.Conn, st *streamState, sid uint64,
-	writeFrame func(*Frame), wg *sync.WaitGroup,
+// streamTask runs one stream to a verdict: the optional early callback
+// first, then (when the request has a body) the wait for LAST, then
+// Handle — all off the read loop so a slow handler stalls only its own
+// stream.
+func (s *Server) streamTask(st *streamState, sid uint64, hasBody bool,
+	early EarlyHandler, wq *writeQueue, wg *sync.WaitGroup,
 	mu *sync.Mutex, streams map[uint64]*streamState) {
 	defer wg.Done()
-	defer func() {
-		mu.Lock()
-		delete(streams, sid)
-		mu.Unlock()
-	}()
 
-	v, err := s.Handler.Handle(context.Background(), st.req)
+	if hasBody {
+		if early != nil {
+			v, err := early.EarlyVerdict(st.ctx, st.req)
+			if err != nil {
+				if s.Logger != nil {
+					s.Logger.Printf("xngin: early handler error: %v", err)
+				}
+				v = Deny(500, "agent error")
+			}
+			if v != nil {
+				mu.Lock()
+				st.decided = true
+				delete(streams, sid)
+				mu.Unlock()
+				s.sendVerdict(wq, sid, v)
+				return
+			}
+		}
+		select {
+		case <-st.done:
+		case <-st.ctx.Done():
+			mu.Lock()
+			delete(streams, sid)
+			mu.Unlock()
+			return
+		}
+		mu.Lock()
+		st.req.Body = st.body
+		st.req.BodyTruncated = st.req.BodyTruncated || st.trunc
+		mu.Unlock()
+	}
+	s.handleStream(st, sid, wq, mu, streams)
+}
+
+func (s *Server) handleStream(st *streamState, sid uint64,
+	wq *writeQueue, mu *sync.Mutex, streams map[uint64]*streamState) {
+	mu.Lock()
+	delete(streams, sid)
+	mu.Unlock()
+
+	v, err := s.Handler.Handle(st.ctx, st.req)
 	if err != nil {
 		if s.Logger != nil {
 			s.Logger.Printf("xngin: handler error: %v", err)
@@ -335,12 +548,20 @@ func (s *Server) handleStream(c net.Conn, st *streamState, sid uint64,
 	if v == nil {
 		v = Allow()
 	}
-	payload, err := v.marshal()
+	s.sendVerdict(wq, sid, v)
+}
+
+func (s *Server) sendVerdict(wq *writeQueue, sid uint64, v *Verdict) {
+	payload, err := v.marshalInto(marshalPool.Get().([]byte)[:0])
 	if err != nil {
-		payload = KVPairs(Pair{"action", "deny"}, Pair{"status", int32(500)})
+		payload = append(payload[:0],
+			KVPairs(Pair{"action", "deny"},
+				Pair{"status", int32(500)})...)
 	}
-	writeFrame(&Frame{Type: FrameVerdict, Flags: FlagFin,
+	buf := marshalBuf(&Frame{Type: FrameVerdict, Flags: FlagFin,
 		SID: sid, Payload: payload})
+	marshalPool.Put(payload[:0])
+	wq.enqueue(buf)
 }
 
 func parseNotify(payload []byte) (string, map[string]Value,
@@ -350,8 +571,8 @@ func parseNotify(payload []byte) (string, map[string]Value,
 	if b, err := d.lenBytes(); err == nil {
 		msg = string(b)
 	}
-	fields := map[string]Value{}
-	hdrs := map[string][]string{}
+	fields := make(map[string]Value, 16)
+	hdrs := make(map[string][]string, 8)
 	trunc := false
 	for {
 		name, v, err := d.kv()
