@@ -1,8 +1,10 @@
 """End-to-end scenario tests: nginx + xngin module + stub agent + backend."""
 
+import http.client
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 
@@ -638,3 +640,214 @@ def test_mtls_plaintext_agent(stack):
               timeout="500ms", fail="close").start()
     st, _, _ = s.request("/")
     assert st == 503
+
+
+# ------------------------------------------------------------------ #
+# borrowed BODY payloads (zero-copy) + request cleanup                 #
+# ------------------------------------------------------------------ #
+
+def _poll_stats(fn, pred, timeout=5.0):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = fn()
+        if last is not None and pred(last):
+            return last
+        time.sleep(0.1)
+    return last
+
+
+def test_body_borrow_conn_close(stack):
+    """A stalled agent leaves borrowed BODY pkts queued on the conn;
+    the client then closes mid-flight.  Request cleanup must
+    materialize them into owned copies so every streamed byte still
+    reaches the agent."""
+    body = b"A" * (512 * 1024)
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/up"},
+         "behavior": {"early": True, "delay_ms": 900},
+         "verdict": {"action": "allow"}}]}
+    s = stack(agents_rules=[rules], tcp_agents=True, timeout="3s",
+              loc_extra="xngin_body_inspect on; xngin_body_max 1m;").start()
+
+    sock = socket.create_connection(("127.0.0.1", s.listen_port), 5)
+    sock.sendall(b"POST /up HTTP/1.1\r\nHost: x\r\n"
+                 b"Content-Type: application/octet-stream\r\n"
+                 b"Content-Length: " + str(len(body)).encode()
+                 + b"\r\n\r\n" + body)
+    sock.close()   # close while the agent conn queue is backlogged
+
+    st = _poll_stats(s.agents[0].stats,
+                     lambda d: d.get("body_bytes", 0) >= len(body))
+    assert st is not None and st["body_bytes"] == len(body)
+    assert "exited on signal" not in s.error_log()
+
+
+def test_resp_borrow_conn_close(stack):
+    """Held response bytes are pool memory borrowed into BODY frames;
+    closing the client while the agent is stalled must not corrupt or
+    lose the still-queued response payload."""
+    rules = {"res_default": {"action": "allow"}, "res_rules": [
+        {"match": {"uri_contains": "/big"},
+         "behavior": {"early": True, "delay_ms": 1500},
+         "verdict": {"action": "allow"}}]}
+    s = stack(agents_rules=[rules], tcp_agents=True, timeout="4s",
+              loc_extra="xngin_response on; xngin_res_body_max 1m;").start()
+
+    sock = socket.create_connection(("127.0.0.1", s.listen_port), 5)
+    sock.sendall(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+    time.sleep(0.5)   # let the backend deliver + frames queue up
+    sock.close()
+
+    st = _poll_stats(s.agents[0].stats,
+                     lambda d: d.get("body_bytes", 0) >= 512 * 1024,
+                     timeout=8)
+    # other requests (e.g. fixture warmup) may contribute bytes too
+    assert st is not None and st["body_bytes"] >= 512 * 1024
+    assert "exited on signal" not in s.error_log()
+
+
+# ------------------------------------------------------------------ #
+# xngin_body_replace off (opt-in: no single-buf capture)               #
+# ------------------------------------------------------------------ #
+
+def test_body_replace_off(stack):
+    """Without request_body_in_single_buf the filter still streams the
+    whole body to the agent (as copies) — body matching keeps working
+    and the upstream receives the original body."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"body_contains": "evil"},
+         "verdict": {"action": "deny", "status": 403,
+                     "body": "denied-body"}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_body_inspect on; xngin_body_max 1m; "
+                        "xngin_body_replace off;").start()
+
+    body = b"Z" * 70000   # > client_body_buffer_size: multi-buf chain
+    conn = http.client.HTTPConnection("127.0.0.1", s.listen_port, timeout=5)
+    conn.request("POST", "/", body)
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 200
+    assert data["body"] == body.decode()
+
+    conn = http.client.HTTPConnection("127.0.0.1", s.listen_port, timeout=5)
+    conn.request("POST", "/", b"prefix-evil-suffix")
+    resp = conn.getresponse()
+    text = resp.read()
+    conn.close()
+    assert resp.status == 403
+    assert b"denied-body" in text
+
+
+def test_body_replace_off_contract_violation(stack):
+    """xngin_body_replace off is a contract; an agent that breaks it
+    still gets its req-body applied (with a logged warning)."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/repl"},
+         "verdict": {"action": "allow", "req_body": "FORGED"}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_body_inspect on; xngin_body_max 1m; "
+                        "xngin_body_replace off;").start()
+
+    conn = http.client.HTTPConnection("127.0.0.1", s.listen_port, timeout=5)
+    conn.request("POST", "/repl", b"original")
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 200
+    assert data["body"] == "FORGED"
+    assert "xngin_body_replace off" in s.error_log()
+
+
+# ------------------------------------------------------------------ #
+# xngin_upload_drain off (opt-in: answer-and-close on early verdicts)  #
+# ------------------------------------------------------------------ #
+
+def test_early_deny_close(stack):
+    """upload_drain off: a deny verdict while the upload is still in
+    flight is sent immediately and the connection is closed instead of
+    draining the rest of the body."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/deny"},
+         "behavior": {"early": True},
+         "verdict": {"action": "deny", "status": 403,
+                     "body": "denied-early"}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_body_inspect on; xngin_body_max 1m; "
+                        "xngin_upload_drain off;").start()
+
+    sock = socket.create_connection(("127.0.0.1", s.listen_port), 5)
+    sock.settimeout(5)
+    # CL under client_max_body_size but far from sent: upload in flight
+    sock.sendall(b"POST /deny HTTP/1.1\r\nHost: x\r\n"
+                 b"Content-Length: 999999\r\n\r\n" + b"x" * 1000)
+
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        resp += chunk
+    assert b" 403 " in resp.split(b"\r\n", 1)[0]
+
+    # server must close: recv drains the deny body then hits EOF
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            pytest.fail("connection not closed after early deny")
+        if not chunk:
+            break
+    sock.close()
+    assert "exited on signal" not in s.error_log()
+
+
+def test_upload_drain_default(stack):
+    """Default upload_drain on: an early deny verdict is stashed until
+    the upload completes, and the keep-alive connection survives."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/deny"},
+         "behavior": {"early": True},
+         "verdict": {"action": "deny", "status": 403,
+                     "body": "denied-drain"}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_body_inspect on; xngin_body_max 1m;").start()
+
+    body = b"d" * 4096
+    sock = socket.create_connection(("127.0.0.1", s.listen_port), 5)
+    sock.sendall(b"POST /deny HTTP/1.1\r\nHost: x\r\n"
+                 b"Content-Length: " + str(len(body)).encode()
+                 + b"\r\n\r\n" + body[:1024])
+
+    # verdict already reached nginx, but the drain must finish first —
+    # nothing on the wire yet
+    sock.settimeout(0.5)
+    try:
+        got = sock.recv(65536)
+        assert got == b"", "early response despite pending upload"
+    except socket.timeout:
+        pass
+
+    sock.sendall(body[1024:])
+    sock.settimeout(5)
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = sock.recv(65536)
+        assert chunk != b"", "connection closed before drain verdict"
+        resp += chunk
+    assert b" 403 " in resp.split(b"\r\n", 1)[0]
+
+    # keep-alive still usable on the same connection
+    hdr_end = resp.index(b"\r\n\r\n") + 4
+    body_len = int(re.search(
+        br"content-length: *(\d+)", resp[:hdr_end], re.I).group(1))
+    have = len(resp) - hdr_end
+    while have < body_len:
+        have += len(sock.recv(65536))
+
+    sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    resp2 = sock.recv(65536)
+    assert b" 200 " in resp2.split(b"\r\n", 1)[0]
+    sock.close()

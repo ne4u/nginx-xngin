@@ -3,6 +3,18 @@
 ## [Unreleased]
 
 ### Added
+- Zero-copy BODY frames: payloads that reference provably stable memory
+  (the single-buffer request body, the pool-held response chain) are
+  queued as borrowed packets instead of memcpy'd; request cleanup
+  materializes any still-queued borrowed packets into owned copies
+  before the request pool dies
+- `xngin_body_replace off` (default on): opt out of
+  `request_body_in_single_buf` when the agent never replaces the
+  request body — streamed BODY frames fall back to copies. A `req-body`
+  verdict that violates the contract is still applied, with a warning
+- `xngin_upload_drain off` (default on): deny/redirect verdicts that
+  land while the upload is in flight answer immediately and close the
+  connection instead of draining the body to keep it alive
 - Request mutation: `req-body` replacement (Content-Length fixup),
   `hdr-set`/`hdr-unset` upstream header ops
 - Response mutation: `res-hdr-set`/`res-hdr-unset`/`res-body` applied

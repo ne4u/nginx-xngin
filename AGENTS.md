@@ -140,3 +140,14 @@ python3 -m pytest test/cases -q
   Go SDK → stdlib `crypto/tls` with `GOFIPS140=v1.0.0` (Go 1.24+) or
   `GOEXPERIMENT=boringcrypto`; Rust SDK → rustls + aws-lc-rs
   (FIPS 140-3 validated); Python harness → `ssl` on FIPS OpenSSL.
+- `r->reading_body` is only set for UNBUFFERED body reads
+  (`request_body_no_buffering`) and v2/v3 — a buffered read-in-flight
+  does NOT set it. To force "answer then close" on a pending buffered
+  read, set `r->keepalive = 0; r->lingering_close = 1;` directly
+  (ngx_http_finalize_connection derives the same pair from
+  reading_body).
+- Borrowed (zero-copy) pkts: `ngx_xnap_pkt_t.owner != NULL` means
+  pos..last references pool memory; `cap == 0` keeps it off the
+  freelist. `ngx_http_xngin_ctx_abort` (request cleanup, pool still
+  valid) sweeps ALL group conns via `ngx_http_xngin_group_materialize`
+  to convert still-queued borrowed pkts to owned copies.

@@ -307,9 +307,10 @@ ngx_http_xngin_send_body(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
             remaining -= n;
             flags = remaining ? 0 : XNAP_FL_BODY_LAST;
 
-            if (ngx_http_xngin_conn_queue(ctx->conn, XNAP_FRAME_BODY, flags,
-                                          ctx->stream_id, ctx->frame_id++,
-                                          pos, n)
+            if (ngx_http_xngin_conn_queue_ref(ctx->conn, XNAP_FRAME_BODY,
+                                              flags, ctx->stream_id,
+                                              ctx->frame_id++, pos, n,
+                                              r->pool)
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -379,8 +380,11 @@ ngx_http_xngin_notify_bound(ngx_http_request_t *r)
  * call hands us the body bytes nginx just read; while ctx->body_stream
  * is set we forward them as BODY frames on the already-open stream, so
  * the agent sees the request body as it arrives instead of after the
- * whole upload is buffered.  The data is memcpy'd into send pkts here,
- * so it is safe for the caller to recycle the chain afterwards.
+ * whole upload is buffered.  In single-buf mode the in-memory regions
+ * are stable (rb->buf is sized for the whole body and never recycled;
+ * the preread chunk lives in the connection's header_in buffer), so the
+ * frames borrow them; otherwise the chunks may be recycled after we
+ * return and we fall back to copying into send pkts.
  */
 
 static ngx_http_request_body_filter_pt ngx_http_xngin_next_body_filter;
@@ -388,7 +392,7 @@ static ngx_http_request_body_filter_pt ngx_http_xngin_next_body_filter;
 static ngx_int_t
 ngx_http_xngin_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    ngx_int_t               rc;
+    ngx_int_t               rc, qrc;
     ngx_chain_t            *cl;
     ngx_buf_t              *b;
     ngx_http_xngin_ctx_t   *ctx;
@@ -451,11 +455,18 @@ ngx_http_xngin_request_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
             flags = (last && pos + n == b->last) ? XNAP_FL_BODY_LAST : 0;
 
-            if (ngx_http_xngin_conn_queue(conn, XNAP_FRAME_BODY, flags,
-                                          ctx->stream_id, ctx->frame_id++,
-                                          pos, n)
-                != NGX_OK)
-            {
+            if (r->request_body_in_single_buf) {
+                qrc = ngx_http_xngin_conn_queue_ref(
+                    conn, XNAP_FRAME_BODY, flags, ctx->stream_id,
+                    ctx->frame_id++, pos, n, r->pool);
+            } else {
+                /* read buffer may be recycled mid-upload: copy */
+                qrc = ngx_http_xngin_conn_queue(
+                    conn, XNAP_FRAME_BODY, flags, ctx->stream_id,
+                    ctx->frame_id++, pos, n);
+            }
+
+            if (qrc != NGX_OK) {
                 return rc;   /* conn_failed will resolve the request */
             }
 
@@ -599,6 +610,10 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
 void
 ngx_http_xngin_ctx_abort(ngx_http_xngin_ctx_t *ctx)
 {
+    ngx_http_xngin_main_conf_t  *mmcf;
+    ngx_http_xngin_group_t      *g;
+    ngx_uint_t                   i;
+
     if (ctx->timer && ctx->timer->timer_set) {
         ngx_del_timer(ctx->timer);
     }
@@ -616,6 +631,25 @@ ngx_http_xngin_ctx_abort(ngx_http_xngin_ctx_t *ctx)
 
     if (ctx->conn) {
         ngx_http_xngin_stream_del(ctx->conn, ctx->stream_id);
+    }
+
+    /*
+     * Request teardown: any still-queued BODY pkts that borrow memory
+     * from this request's pool must become owned copies now — cleanup
+     * handlers run while the pool is still valid.  The frames may sit
+     * on any conn of any group (a retry may have picked another conn,
+     * or ctx->conn was already detached by a verdict), so sweep them
+     * all rather than just ctx->conn.
+     */
+    if (ctx->r) {
+        mmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
+                                                 ngx_http_xngin_module);
+        if (mmcf->groups) {
+            g = mmcf->groups->elts;
+            for (i = 0; i < mmcf->groups->nelts; i++) {
+                ngx_http_xngin_group_materialize(&g[i], ctx->r->pool);
+            }
+        }
     }
 
     ctx->state = XNAP_ST_ABORTED;
@@ -1031,15 +1065,24 @@ void
 ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
     ngx_http_xngin_ctx_t *ctx)
 {
-    ngx_http_request_body_t *rb = r->request_body;
-    ngx_chain_t             *cl;
-    ngx_buf_t               *b;
-    ngx_str_t                cl_val, name;
+    ngx_http_request_body_t   *rb = r->request_body;
+    ngx_http_xngin_loc_conf_t *lcf;
+    ngx_chain_t               *cl;
+    ngx_buf_t                 *b;
+    ngx_str_t                  cl_val, name;
 
     if (rb == NULL) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "xngin: req-body ignored, request body not captured");
         return;
+    }
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
+
+    if (!lcf->body_replace) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "xngin: agent sent req-body despite "
+                      "xngin_body_replace off");
     }
 
     b = ngx_calloc_buf(r->pool);
@@ -1093,16 +1136,17 @@ ngx_int_t
 ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
     u_char *payload, size_t len)
 {
-    ngx_http_request_t     *r = ctx->r;
-    ngx_xnap_rbuf_t         rb;
-    ngx_str_t               name;
-    ngx_xnap_val_t          v;
-    ngx_str_t               action = ngx_null_string;
-    ngx_int_t               status = 0;
-    ngx_str_t               location = ngx_null_string;
-    uint64_t                cache_ttl = 0;
-    unsigned                mutable = 0;   /* verdict has side effects */
-    ngx_int_t               rc;
+    ngx_http_request_t        *r = ctx->r;
+    ngx_http_xngin_loc_conf_t *lcf;
+    ngx_xnap_rbuf_t            rb;
+    ngx_str_t                  name;
+    ngx_xnap_val_t             v;
+    ngx_str_t                  action = ngx_null_string;
+    ngx_int_t                  status = 0;
+    ngx_str_t                  location = ngx_null_string;
+    uint64_t                   cache_ttl = 0;
+    unsigned                   mutable = 0;   /* verdict has side effects */
+    ngx_int_t                  rc;
 
     if (ctx->state != XNAP_ST_SENT) {
         return NGX_OK;
@@ -1228,6 +1272,14 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
         return NGX_OK;
     }
 
+    /*
+     * xngin_upload_drain off: a terminal verdict (deny/redirect/error)
+     * that lands while the upload is still in flight answers right away
+     * and closes the connection instead of draining the body to keep it
+     * alive.  Resume treats early_close as "run phases now".
+     */
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
+
     /* apply */
     if (action.len == 5 && ngx_memcmp(action.data, "allow", 5) == 0) {
         if (ctx->req_body_set && ctx->body_read) {
@@ -1246,6 +1298,10 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
     if (action.len == 4 && ngx_memcmp(action.data, "deny", 4) == 0) {
         ctx->deny_status = (status >= 400 && status < 600)
                            ? status : NGX_HTTP_FORBIDDEN;
+
+        if (!ctx->body_read && !lcf->upload_drain) {
+            ctx->early_close = 1;
+        }
 
         if (ctx->cache_key_val.len && cache_ttl && !mutable) {
             ngx_http_xngin_cache_store(r, ctx, &ctx->cache_key_val,
@@ -1284,6 +1340,10 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
             status = NGX_HTTP_MOVED_TEMPORARILY;
         }
 
+        if (!ctx->body_read && !lcf->upload_drain) {
+            ctx->early_close = 1;
+        }
+
         ngx_http_xngin_resume(r, status);
         return NGX_OK;
     }
@@ -1291,6 +1351,9 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
     /* missing/unknown action: deny 500 (spec fail-closed) */
     ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                   "xngin: malformed verdict action \"%V\"", &action);
+    if (!ctx->body_read && !lcf->upload_drain) {
+        ctx->early_close = 1;
+    }
     ngx_http_xngin_resume(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
     return NGX_OK;
 }

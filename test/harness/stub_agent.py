@@ -46,6 +46,7 @@ class Stats:
         self.res_notifies = 0
         self.verdicts = 0
         self.bodies = 0
+        self.body_bytes = 0
         self.pings = 0
         self.conns = 0
         self.aborts = 0
@@ -80,6 +81,26 @@ def match_rule(rule, kvs, headers):
             if hv not in vals:
                 return False
     # body_contains is evaluated in decide() once BODY frames have arrived
+    return True
+
+
+def msg_match(st, m, header_key):
+    """Match stream kvs/headers against a rule match dict for early
+    (pre-body) decisions: all matchers except body_contains."""
+    kd = dict(st["kvs"])
+    headers = st["headers"]
+    if "uri_contains" in m and m["uri_contains"] not in kd.get("uri", ""):
+        return False
+    if "status" in m and m["status"] != kd.get("status"):
+        return False
+    if "method" in m and m["method"] != kd.get("method", ""):
+        return False
+    if "src_ip" in m and str(kd.get("src-ip")) != m["src_ip"]:
+        return False
+    if header_key in m:
+        for hk, hv in m[header_key].items():
+            if hv not in headers.get(hk.lower(), []):
+                return False
     return True
 
 
@@ -182,6 +203,7 @@ class Conn:
             return None
 
         if fr.type == xnap.FT_BODY:
+            stats.body_bytes += len(fr.payload)
             st = self.streams.get(fr.sid)
             if st is not None:
                 st["bodies"].append(fr.payload)
@@ -224,13 +246,51 @@ class Conn:
                 "bodies": [], "async": bool(fr.flags & xnap.FL_NOTIFY_ASYNC),
             }
             if fr.flags & xnap.FL_NOTIFY_HAS_BODY:
-                return None   # wait for BODY LAST
+                v = await self.decide_early(fr.sid)
+                return v   # None: wait for BODY LAST
             return await self.decide(fr.sid)
 
         if fr.type == xnap.FT_DISCON:
             return None
 
         return None
+
+    async def decide_early(self, sid):
+        """Speculative verdict on NOTIFY for rules marked
+        behavior.early — the stream stays open when no early rule
+        matches (normal decide runs at BODY LAST)."""
+        st = self.streams.get(sid)
+        if st is None:
+            return None
+
+        if st["msg"] == "http-response":
+            key, dflt, skip = "res_rules", "res_default", "res_header"
+        else:
+            key, dflt, skip = "rules", "default", "header"
+
+        rule = None
+        for r in self.rules.get(key, []):
+            m = r.get("match", {})
+            # body_contains can't be evaluated before the body arrives
+            if "body_contains" in m:
+                continue
+            if msg_match(st, m, skip):
+                rule = r
+                break
+
+        if rule is None or not rule.get("behavior", {}).get("early"):
+            return None
+
+        self.streams.pop(sid, None)
+        verdict = rule.get("verdict") or self.rules.get(dflt,
+                                                      {"action": "allow"})
+        behavior = rule.get("behavior", {})
+        if behavior.get("delay_ms"):
+            await asyncio.sleep(behavior["delay_ms"] / 1000)
+        stats.verdicts += 1
+        payload = build_verdict(verdict)
+        return xnap.enc_frame(xnap.FT_VERDICT, xnap.FL_FIN, sid, 0,
+                              payload)
 
     async def decide(self, sid):
         st = self.streams.pop(sid, None)

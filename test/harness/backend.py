@@ -14,11 +14,15 @@ class H(BaseHTTPRequestHandler):
     def _reply(self):
         n = int(self.headers.get("content-length", 0))
         body = self.rfile.read(n).decode(errors="replace") if n else ""
-        payload = json.dumps({
-            "headers": {k.lower(): v for k, v in self.headers.items()},
-            "body": body,
-            "path": self.path,
-        }).encode()
+        if self.path == "/big":
+            # fixed-size plain response for byte-exact assertions
+            payload = b"B" * (512 * 1024)
+        else:
+            payload = json.dumps({
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body,
+                "path": self.path,
+            }).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("x-backend-tag", "backend")

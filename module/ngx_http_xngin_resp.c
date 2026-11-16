@@ -486,9 +486,12 @@ ngx_http_xngin_resp_stream_send(ngx_http_xngin_ctx_t *rctx,
         n = (len > chunk_max) ? chunk_max : len;
         flags = (last && n == len) ? XNAP_FL_BODY_LAST : 0;
 
-        if (ngx_http_xngin_conn_queue(conn, XNAP_FRAME_BODY, flags,
-                                      rctx->stream_id, rctx->frame_id++,
-                                      pos, n)
+        /* pos points into the resp_held pool copy: stable until request
+           cleanup, safe to borrow */
+        if (ngx_http_xngin_conn_queue_ref(conn, XNAP_FRAME_BODY, flags,
+                                          rctx->stream_id,
+                                          rctx->frame_id++, pos, n,
+                                          rctx->r->pool)
             != NGX_OK)
         {
             return;   /* conn_failed resolves the stream */
@@ -823,9 +826,11 @@ ngx_http_xngin_resp_send_body(ngx_http_xngin_ctx_t *rctx)
             remaining -= n;
             flags = remaining ? 0 : XNAP_FL_BODY_LAST;
 
-            if (ngx_http_xngin_conn_send(rctx->conn, XNAP_FRAME_BODY, flags,
-                                         rctx->stream_id, rctx->frame_id++,
-                                         pos, n)
+            /* held-chain bytes are pool memory; borrow, caller flushes */
+            if (ngx_http_xngin_conn_queue_ref(rctx->conn, XNAP_FRAME_BODY,
+                                              flags, rctx->stream_id,
+                                              rctx->frame_id++, pos, n,
+                                              rctx->r->pool)
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -833,6 +838,8 @@ ngx_http_xngin_resp_send_body(ngx_http_xngin_ctx_t *rctx)
             pos += n;
         }
     }
+
+    ngx_http_xngin_conn_flush_conn(rctx->conn);
 
     return NGX_OK;
 }

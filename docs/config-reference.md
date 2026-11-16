@@ -30,6 +30,8 @@ xngin_cache_zone verdicts:8m;   # shm zone for verdict cache (name:size)
 | `xngin_fail open\|close` | close | timeout/down: open=proceed, close=503 |
 | `xngin_body_inspect on\|off` | off | capture request body for agent |
 | `xngin_body_max 64k` | 64k | capture cap; larger bodies → `body-truncated` flag. Also raises `client_body_buffer_size` so the body stays in memory |
+| `xngin_body_replace on\|off` | on | contract that the agent may send `req-body`. `on` keeps the body in one contiguous buffer (`request_body_in_single_buf`) so it can be swapped; `off` skips that allocation and streams BODY frames as copies — a violating `req-body` is still applied, with a warning |
+| `xngin_upload_drain on\|off` | on | `on` (default) reads the client upload to completion before answering a verdict, preserving keep-alive. `off` answers deny/redirect verdicts that arrive mid-upload immediately and closes the connection (keep-alive off + lingering close) |
 | `xngin_cache_key $expr` | — | engine-side cache key template (complex value, e.g. `$binary_remote_addr`) |
 | `xngin_response on\|off` | off | hold the upstream response and send a second `http-response` NOTIFY (status + headers + body) for agent inspection. Requires the agent to negotiate `CAP_RESP` — otherwise the response passes through |
 | `xngin_res_body_max 64k` | 64k | response body capture cap for `http-response`; larger bodies bypass the round-trip entirely (never truncated) |

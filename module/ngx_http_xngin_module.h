@@ -157,6 +157,10 @@ typedef struct ngx_xnap_pkt_s {
     u_char                *pos;
     u_char                *last;
     size_t                 cap;      /* bytes allocated in data[] */
+    ngx_pool_t            *owner;    /* non-NULL: pos..last is borrowed
+                                        memory owned by this pool and
+                                        must be materialized before the
+                                        pool dies (cap==0, never cached) */
     u_char                 data[];
 } ngx_xnap_pkt_t;
 
@@ -255,6 +259,10 @@ struct ngx_http_xngin_ctx_s {
                                                 body_post/resp_collect */
     unsigned                  resp_body_done:1; /* upstream finished the
                                                 response body */
+    unsigned                  early_close:1;   /* terminal verdict while
+                                                the upload is in flight:
+                                                answer now, drop the body
+                                                read, close the conn */
     unsigned                  in_handler:1;
     unsigned                  retried:1;
     unsigned                  dispatched:1;
@@ -327,6 +335,8 @@ typedef struct {
     ngx_uint_t                fail;
     ngx_flag_t                body_inspect;
     size_t                    body_max;
+    ngx_flag_t                body_replace;
+    ngx_flag_t                upload_drain;
     ngx_flag_t                response;
     size_t                    res_body_max;
     ngx_http_complex_value_t *cache_key;   /* engine-side cache key tpl */
@@ -362,6 +372,17 @@ ngx_int_t   ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
 ngx_int_t   ngx_http_xngin_conn_queue(ngx_http_xngin_conn_t *c, u_char type,
                 uint32_t flags, uint64_t sid, uint64_t fid,
                 u_char *payload, size_t len);
+
+/* zero-copy variant: payload is borrowed memory owned by `owner` (a
+   request pool); queued pkts are materialized into owned copies by
+   conn_materialize() before that pool can die */
+ngx_int_t   ngx_http_xngin_conn_queue_ref(ngx_http_xngin_conn_t *c,
+                u_char type, uint32_t flags, uint64_t sid, uint64_t fid,
+                u_char *payload, size_t len, ngx_pool_t *owner);
+void        ngx_http_xngin_conn_materialize(ngx_http_xngin_conn_t *c,
+                ngx_pool_t *owner);
+void        ngx_http_xngin_group_materialize(ngx_http_xngin_group_t *g,
+                ngx_pool_t *owner);
 
 /* encode-in-place: reserve `cap` payload bytes in a fresh pkt; the
    returned pkt's data[] starts XNAP_PKT_HEADROOM before the write ptr.

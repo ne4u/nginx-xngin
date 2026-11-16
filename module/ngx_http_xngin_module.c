@@ -123,6 +123,20 @@ static ngx_command_t ngx_http_xngin_commands[] = {
       offsetof(ngx_http_xngin_loc_conf_t, body_max),
       NULL },
 
+    { ngx_string("xngin_body_replace"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xngin_loc_conf_t, body_replace),
+      NULL },
+
+    { ngx_string("xngin_upload_drain"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xngin_loc_conf_t, upload_drain),
+      NULL },
+
     { ngx_string("xngin_response"),
       NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -308,6 +322,8 @@ ngx_http_xngin_create_loc_conf(ngx_conf_t *cf)
     lcf->fail = NGX_CONF_UNSET_UINT;
     lcf->body_inspect = NGX_CONF_UNSET;
     lcf->body_max = NGX_CONF_UNSET_SIZE;
+    lcf->body_replace = NGX_CONF_UNSET;
+    lcf->upload_drain = NGX_CONF_UNSET;
     lcf->response = NGX_CONF_UNSET;
     lcf->res_body_max = NGX_CONF_UNSET_SIZE;
     lcf->cache_key = NGX_CONF_UNSET_PTR;
@@ -332,6 +348,8 @@ ngx_http_xngin_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->fail, prev->fail, XNAP_FAIL_CLOSE);
     ngx_conf_merge_value(conf->body_inspect, prev->body_inspect, 0);
     ngx_conf_merge_size_value(conf->body_max, prev->body_max, 64 * 1024);
+    ngx_conf_merge_value(conf->body_replace, prev->body_replace, 1);
+    ngx_conf_merge_value(conf->upload_drain, prev->upload_drain, 1);
     ngx_conf_merge_value(conf->response, prev->response, 0);
     ngx_conf_merge_size_value(conf->res_body_max, prev->res_body_max,
                               64 * 1024);
@@ -1011,7 +1029,12 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
         && r->headers_in.content_length_n <= (off_t) lcf->body_max
         && r->request_body == NULL)
     {
-        r->request_body_in_single_buf = 1;
+        /* one contiguous capture buf is only needed when the agent may
+           replace the body upstream; xngin_body_replace off also turns
+           the streaming filter's zero-copy BODY frames into copies */
+        if (lcf->body_replace) {
+            r->request_body_in_single_buf = 1;
+        }
         r->request_body_in_persistent_file = 0;
         r->request_body_in_clean_file = 0;
 
@@ -1134,7 +1157,7 @@ ngx_http_xngin_body_post(ngx_http_request_t *r)
     ngx_http_xngin_loc_conf_t *lcf;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_xngin_module);
-    if (ctx == NULL) {
+    if (ctx == NULL || ctx->early_close) {
         return;
     }
 
@@ -1204,10 +1227,25 @@ ngx_http_xngin_resume(ngx_http_request_t *r, ngx_int_t status)
     r->main->count--;
 
     if (!ctx->body_read) {
-        /* early verdict while the upload is still streaming: stash the
-           outcome; ngx_http_xngin_body_post resumes when the body read
-           completes */
-        return;
+        if (!ctx->early_close) {
+            /* early verdict while the upload is still streaming: stash
+               the outcome; ngx_http_xngin_body_post resumes when the
+               body read completes */
+            return;
+        }
+
+        /*
+         * xngin_upload_drain off: answer immediately and let the
+         * connection close.  Stop BODY streaming, disarm the pending
+         * body read (its count ref was already released in the
+         * handler's first run), and force the same outcome finalize
+         * derives for an in-flight unbuffered read: keepalive off +
+         * lingering close → the response goes out, then the conn dies.
+         */
+        ctx->body_stream = 0;
+        r->read_event_handler = ngx_http_test_reading;
+        r->keepalive = 0;
+        r->lingering_close = 1;
     }
 
     r->write_event_handler = ngx_http_core_run_phases;

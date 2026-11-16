@@ -305,6 +305,7 @@ ngx_http_xngin_pkt_get(ngx_http_xngin_conn_t *c, size_t cap)
         pkt = ngx_alloc(sizeof(ngx_xnap_pkt_t) + cap, ngx_cycle->log);
         if (pkt) {
             pkt->cap = cap;
+            pkt->owner = NULL;
         }
         return pkt;
     }
@@ -315,6 +316,7 @@ ngx_http_xngin_pkt_get(ngx_http_xngin_conn_t *c, size_t cap)
         if (pkt) {
             c->free_pkts[j] = pkt->next;
             c->nfree_pkts[j]--;
+            pkt->owner = NULL;
             return pkt;
         }
     }
@@ -323,6 +325,7 @@ ngx_http_xngin_pkt_get(ngx_http_xngin_conn_t *c, size_t cap)
                     ngx_cycle->log);
     if (pkt) {
         pkt->cap = ngx_xnap_pkt_class_cap[i];
+        pkt->owner = NULL;
     }
     return pkt;
 }
@@ -431,6 +434,154 @@ ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
     ngx_http_xngin_conn_write(c->pc.connection->write);
 
     return NGX_OK;
+}
+
+
+/* zero-copy queue: the frame is emitted as two pkts — an owned header
+   pkt followed by a borrowed pkt that references `payload` directly.
+   The caller guarantees the memory stays valid until either the write
+   completes or ngx_http_xngin_conn_materialize() runs for `owner`
+   (request cleanup converts any still-queued borrowed pkts into owned
+   copies before the pool memory can be freed). */
+ngx_int_t
+ngx_http_xngin_conn_queue_ref(ngx_http_xngin_conn_t *c, u_char type,
+    uint32_t flags, uint64_t sid, uint64_t fid, u_char *payload,
+    size_t len, ngx_pool_t *owner)
+{
+    ngx_xnap_pkt_t  *pkt, *ext;
+    size_t           flen, hlen;
+    u_char          *p;
+
+    if (len == 0 || payload == NULL) {
+        return ngx_http_xngin_conn_queue(c, type, flags, sid, fid,
+                                         payload, len);
+    }
+
+    if (c->down || c->pc.connection == NULL) {
+        return NGX_ERROR;
+    }
+
+    flen = 1 + 4 + ngx_xnap_varint_len(sid) + ngx_xnap_varint_len(fid);
+
+    if (len > XNAP_MAX_FRAME_HARD - flen) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "xngin: refusing to send %uz byte %d frame to %V",
+                      len, type, &c->agent->url_text);
+        return NGX_ERROR;
+    }
+
+    flen += len;
+    hlen = ngx_xnap_varint_len(flen);
+
+    pkt = ngx_http_xngin_pkt_get(c, hlen + flen - len);
+    if (pkt == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = pkt->data;
+    p = xnap_enc_varint(p, flen);
+    *p++ = type;
+    *p++ = (u_char) (flags >> 24);
+    *p++ = (u_char) (flags >> 16);
+    *p++ = (u_char) (flags >> 8);
+    *p++ = (u_char) flags;
+    p = xnap_enc_varint(p, sid);
+    p = xnap_enc_varint(p, fid);
+
+    pkt->pos = pkt->data;
+    pkt->last = p;
+    pkt->owner = NULL;
+    pkt->next = NULL;
+
+    ext = ngx_alloc(sizeof(ngx_xnap_pkt_t), ngx_cycle->log);
+    if (ext == NULL) {
+        ngx_http_xngin_pkt_put(c, pkt);
+        return NGX_ERROR;
+    }
+
+    ext->pos = payload;
+    ext->last = payload + len;
+    ext->cap = 0;
+    ext->owner = owner;
+    ext->next = NULL;
+
+    *c->out_tail = pkt;
+    c->out_tail = &pkt->next;
+    *c->out_tail = ext;
+    c->out_tail = &ext->next;
+
+    return NGX_OK;
+}
+
+
+/* Convert queued pkts that borrow memory from `owner` into owned copies,
+   in place.  Runs from request cleanup while the pool is still valid
+   (cleanups precede block/large frees in ngx_destroy_pool). */
+void
+ngx_http_xngin_conn_materialize(ngx_http_xngin_conn_t *c, ngx_pool_t *owner)
+{
+    ngx_xnap_pkt_t  **pp, *pkt, *np;
+    size_t            n;
+
+    for (pp = &c->out; (pkt = *pp) != NULL; pp = &pkt->next) {
+
+        if (pkt->owner != owner) {
+            continue;
+        }
+
+        n = pkt->last - pkt->pos;
+
+        np = ngx_alloc(sizeof(ngx_xnap_pkt_t) + n, ngx_cycle->log);
+        if (np == NULL) {
+            /* can't preserve the bytes: truncate — the stream desyncs
+               and the agent drops the conn; no silent wrong-body */
+            ngx_log_error(NGX_LOG_CRIT, ngx_cycle->log, 0,
+                          "xngin: materialize alloc failed (%uz), "
+                          "truncating borrowed pkt", n);
+            pkt->pos = pkt->last;
+            pkt->owner = NULL;
+            continue;
+        }
+
+        np->pos = np->data;
+        np->last = ngx_cpymem(np->data, pkt->pos, n);
+        np->cap = n;
+        np->owner = NULL;
+        np->next = pkt->next;
+
+        if (c->out_tail == &pkt->next) {
+            c->out_tail = &np->next;
+        }
+
+        *pp = np;
+        ngx_free(pkt);
+        pkt = np;
+    }
+}
+
+
+/* materialize borrowed pkts for `owner` across every conn of a group —
+   a request's frames may sit on any conn of its group (retry picked a
+   different conn, or ctx->conn was already detached) */
+void
+ngx_http_xngin_group_materialize(ngx_http_xngin_group_t *g,
+    ngx_pool_t *owner)
+{
+    ngx_uint_t              i;
+    ngx_http_xngin_agent_t *a;
+    ngx_http_xngin_conn_t  *c;
+
+    if (g == NULL) {
+        return;
+    }
+
+    a = g->agents.elts;
+
+    for (i = 0; i < g->agents.nelts; i++) {
+        for (c = a[i].conns; c; c = c->next) {
+            ngx_http_xngin_conn_materialize(c, owner);
+        }
+    }
 }
 
 
