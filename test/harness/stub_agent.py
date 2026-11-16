@@ -157,8 +157,12 @@ def build_verdict(v):
         payload += xnap.enc_kv("cache-ttl", xnap.Raw(
             xnap.VT_UINT32, xnap.enc_varint(v["cache_ttl"])))
     if v.get("body_stream"):
-        payload += xnap.enc_kv("body-stream", xnap.Raw(
-            xnap.VT_UINT32, xnap.enc_varint(1)))
+        if v["body_stream"] == "true":
+            # spec TRUE form — engine must accept it like UINT 1
+            payload += xnap.enc_kv("body-stream", True)
+        else:
+            payload += xnap.enc_kv("body-stream", xnap.Raw(
+                xnap.VT_UINT32, xnap.enc_varint(1)))
     if "reason" in v:
         payload += xnap.enc_kv("reason", v["reason"])
     if "score" in v:
@@ -218,7 +222,13 @@ class Conn:
                                 | xnap.CAP_VCACHE | xnap.CAP_RESP
                                 | xnap.CAP_PUSH)))
             p += xnap.enc_kv("agent-id", "xnap-stub/1")
-            return xnap.enc_frame(xnap.FT_AGENT_HELLO, 0, 0, 0, bytes(p))
+            # rules.control_before_hello: protocol violation on purpose —
+            # CONTROL must only take effect once AGENT_HELLO is in
+            pre = self.enc_controls(
+                self.rules.get("control_before_hello", []))
+            return (pre
+                    + xnap.enc_frame(xnap.FT_AGENT_HELLO, 0, 0, 0,
+                                     bytes(p)))
 
         if fr.type == xnap.FT_PING:
             stats.pings += 1

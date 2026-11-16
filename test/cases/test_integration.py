@@ -1432,3 +1432,140 @@ def test_streamed_req_replace(stack):
                             headers={"content-type": "text/plain"})
     assert st == 200
     assert json.loads(body)["body"] == "REPLACED-REQ-BODY"
+
+
+# ---- review-fix regressions ----
+
+def test_control_ban_ip_scoped(stack):
+    """a ban pushed by group A does not deny locations using group B."""
+    rules_a = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/ban"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "ban-ip", "ip": "127.0.0.1",
+                                  "ttl": 60}}}]}
+    s = stack(agents_rules=[rules_a, ALLOW],
+              extra_groups={"gA": [0], "gB": [1]},
+              loc_group="xngin_group gA;",
+              loc_blocks='''
+        location /other {
+            xngin_enable on;
+            xngin_group gB;
+            proxy_pass http://backend;
+        }''').start()
+    assert s.request("/other")[0] == 200
+    assert s.request("/ban")[0] == 200    # gA pushes the ban
+    time.sleep(0.3)
+    assert s.request("/")[0] == 403       # / uses gA -> banned
+    assert s.request("/other")[0] == 200  # /other uses gB -> not banned
+
+
+def test_control_cache_drop_scoped(stack):
+    """cache-drop only evicts entries the pushing group itself stored."""
+    rules_a = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/drop"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "cache-drop",
+                                  "key": "/cb"}}}]}
+    rules_b = {"default": {"action": "allow", "cache_ttl": 60},
+               "rules": []}
+    s = stack(agents_rules=[rules_a, rules_b],
+              extra_groups={"gA": [0], "gB": [1]},
+              loc_group="xngin_group gA;",
+              main_extra="xngin_cache_zone vcache:1m;",
+              loc_blocks='''
+        location /cb {
+            xngin_enable on;
+            xngin_group gB;
+            xngin_cache_key $uri;
+            proxy_pass http://backend;
+        }''').start()
+    s.request("/cb")                     # stored under group gB
+    s.request("/cb")                     # replayed from cache
+    time.sleep(0.7)
+    n0 = s.agents[1].stats().get("notifies", 0)
+    s.request("/drop")                   # gA pushes cache-drop "/cb"
+    time.sleep(0.3)
+    s.request("/cb")                     # entry survives: no re-decide
+    time.sleep(0.7)
+    assert s.agents[1].stats().get("notifies", 0) == n0
+
+
+def test_control_before_hello_ignored(stack):
+    """CONTROL frames sent before AGENT_HELLO are ignored."""
+    rules = {"default": {"action": "allow"}, "rules": [],
+             "control_before_hello": [
+                 {"op": "ban-ip", "ip": "127.0.0.1", "ttl": 60}]}
+    s = stack(agents_rules=[rules]).start()
+    assert s.request("/")[0] == 200      # ban never installed
+
+
+def test_chain_cache_ttl_does_not_skip_step(stack):
+    """a later step's cache-ttl must not replay over the chain:
+    multi-step locations bypass the location verdict cache."""
+    rules2 = {"default": {"action": "allow", "cache_ttl": 60},
+              "rules": []}
+    s = stack(agents_rules=[ALLOW, rules2],
+              extra_groups={"auth": [0], "waf2": [1]},
+              loc_group=CHAIN2,
+              loc_extra="xngin_cache_key $uri;",
+              main_extra="xngin_cache_zone vcache:1m;").start()
+    assert s.request("/c")[0] == 200
+    time.sleep(0.7)
+    n0 = s.agents[0].stats().get("notifies", 0)
+    assert s.request("/c")[0] == 200
+    time.sleep(0.7)
+    # step 1 was consulted again — no location-wide allow replay
+    assert s.agents[0].stats().get("notifies", 0) == n0 + 1
+
+
+def test_cache_deny_keepalive(stack):
+    """cached deny on a keep-alive POST drains the body so the next
+    request on the connection still parses."""
+    rules = {"default": {"action": "deny", "status": 403, "body": "no",
+                        "content_type": "text/plain", "cache_ttl": 60},
+             "rules": []}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_cache_key $binary_remote_addr;",
+              main_extra="xngin_cache_zone vcache:1m;").start()
+    assert s.request("/")[0] == 403      # caches the deny
+    conn = http.client.HTTPConnection("127.0.0.1", s.listen_port,
+                                      timeout=5)
+    for body in (b"x=1", b"x=2", b"x=3"):
+        conn.request("POST", "/", body=body,
+                     headers={"content-type":
+                              "application/x-www-form-urlencoded"})
+        r = conn.getresponse()
+        data = r.read()
+        assert r.status == 403
+        assert data == b"no"
+    conn.close()
+
+
+def test_streamed_req_replace_true(stack):
+    """body-stream encoded as VT_TRUE (not UINT) opens the stream."""
+    rules = {"default": {"action": "allow"},
+             "rules": [
+                 {"match": {"uri_contains": "/p"},
+                  "verdict": {"action": "allow", "body_stream": "true"},
+                  "behavior": {"stream_body": "TRUE-REPL"}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_body_inspect on;").start()
+    st, _, body = s.request("/p", method="POST", data=b"orig",
+                            headers={"content-type": "text/plain"})
+    assert st == 200
+    assert json.loads(body)["body"] == "TRUE-REPL"
+
+
+def test_resp_gzip_over_cap_bypasses(stack):
+    """decoded body over res_body_max passes the original compressed
+    response through instead of failing closed."""
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "deny", "status": 500},
+             "rules": []}
+    s = stack(agents_rules=[rules], loc_extra=RESPOND).start()
+    st, hdrs, body = s.request("/gzip-big")
+    assert st == 200                     # bypass, not 503
+    hdrs = {k.lower(): v for k, v in hdrs.items()}
+    assert hdrs.get("content-encoding") == "gzip"
+    import gzip as _gz
+    assert _gz.decompress(body) == b"P" * (200 * 1024)

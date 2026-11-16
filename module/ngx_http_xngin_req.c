@@ -994,7 +994,14 @@ ngx_http_xngin_req_repl_done(ngx_http_xngin_ctx_t *ctx)
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
     final_step = (ctx->step + 1 >= lcf->steps->nelts);
 
-    if (!final_step && ngx_http_xngin_chain_next(r, ctx, lcf)) {
+    if (!final_step) {
+        if (ctx->body_read) {
+            /* later steps must inspect the replacement, not the
+               original: swap rb->bufs before the next NOTIFY frames
+               its BODY */
+            ngx_http_xngin_apply_req_body(r, ctx);
+        }
+        ngx_http_xngin_chain_next(r, ctx, lcf);
         return;
     }
 
@@ -1019,6 +1026,12 @@ ngx_http_xngin_deny_content(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_xngin_module);
     if (ctx == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* a cached deny can fire before any body read — consume whatever
+       the client still owes or the keep-alive conn desynchronizes */
+    if (ngx_http_discard_request_body(r) != NGX_OK) {
+        return NGX_ERROR;
     }
 
     ctx->own_resp = 1;
@@ -1447,7 +1460,6 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
             ctx->deny_body.data = ngx_pnalloc(r->pool, v.s.len);
             ngx_memcpy(ctx->deny_body.data, v.s.data, v.s.len);
             ctx->deny_body.len = v.s.len;
-            /* deny payload — cacheable */
         }
         else if (name.len == 12
                  && ngx_memcmp(name.data, "content-type", 12) == 0)
@@ -1489,7 +1501,6 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
                  && ngx_memcmp(name.data, "res-hdr-set", 11) == 0)
         {
             ngx_http_xngin_parse_res_hdr_set(r, ctx, v.sub, v.sub_len);
-            /* response-header ops replay identically — cacheable */
         }
         else if (name.len == 13
                  && ngx_memcmp(name.data, "res-hdr-unset", 13) == 0)
@@ -1530,7 +1541,8 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
         else if (name.len == 11
                  && ngx_memcmp(name.data, "body-stream", 11) == 0)
         {
-            bstream = (unsigned) v.u;
+            /* TRUE or any nonzero uint opts in; FALSE/0 opts out */
+            bstream = (v.type == XNAP_VT_TRUE || v.u != 0);
         }
     }
 
@@ -1567,9 +1579,12 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
                           ngx_http_xngin_step_timeout(lcf, ctx));
             return NGX_OK;
         }
-        if (!final_step
-            && ngx_http_xngin_chain_next(r, ctx, lcf))
-        {
+        if (!final_step) {
+            if (ctx->req_body_set && ctx->body_read) {
+                /* swap before the next step's BODY frames are framed */
+                ngx_http_xngin_apply_req_body(r, ctx);
+            }
+            ngx_http_xngin_chain_next(r, ctx, lcf);
             return NGX_OK;
         }
         if (ctx->req_body_set && ctx->body_read) {
@@ -1579,7 +1594,8 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
         }
         if (ctx->cache_key_val.len && cache_ttl && !mutable) {
             ngx_http_xngin_cache_store(r, ctx, &ctx->cache_key_val,
-                                       (uint32_t) cache_ttl);
+                                       (uint32_t) cache_ttl,
+                            &ngx_http_xngin_cur_step(lcf, ctx)->group->name);
         }
         ngx_http_xngin_resume(r, NGX_DECLINED);
         return NGX_OK;
@@ -1595,7 +1611,8 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
 
         if (ctx->cache_key_val.len && cache_ttl && !mutable && final_step) {
             ngx_http_xngin_cache_store(r, ctx, &ctx->cache_key_val,
-                                       (uint32_t) cache_ttl);
+                                       (uint32_t) cache_ttl,
+                            &ngx_http_xngin_cur_step(lcf, ctx)->group->name);
         }
 
         if (ctx->deny_body.len) {

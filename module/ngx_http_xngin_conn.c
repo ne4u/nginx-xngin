@@ -198,7 +198,7 @@ ngx_http_xngin_conn_init_worker(ngx_http_xngin_main_conf_t *mmcf,
     for (i = 0; i < mmcf->groups->nelts; i++) {
 
         if (g[i].has_resolve) {
-            if (g[i].resolver) {
+            if (g[i].resolver && g[i].resolver->connections.nelts) {
                 rev = ngx_pcalloc(cycle->pool, sizeof(ngx_event_t));
                 if (rev == NULL) {
                     return NGX_ERROR;
@@ -1100,6 +1100,12 @@ ngx_http_xngin_conn_frame(ngx_http_xngin_conn_t *c, u_char type,
         return NGX_OK;
 
     case XNAP_FRAME_CONTROL:
+        if (!c->ready) {
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                          "xngin: ignoring CONTROL from %V before "
+                          "AGENT_HELLO", &c->agent->url_text);
+            return NGX_OK;
+        }
         return ngx_http_xngin_control(c, payload, len);
 
     case XNAP_FRAME_BODY:
@@ -1434,35 +1440,66 @@ ngx_http_xngin_conn_timer(ngx_event_t *ev)
 
 /* ---------- pick a connection ---------- */
 
+/* usable-for-pick test shared by the hash and least-loaded paths */
+static ngx_inline ngx_int_t
+ngx_http_xngin_conn_usable(ngx_http_xngin_conn_t *c, uint32_t caps)
+{
+    return c->ready && !c->down && c->nstreams < c->max_streams
+           && (c->agent_caps & caps) == caps;
+}
+
+
 /* two tiers: primary servers first, "backup" servers only when no
    primary conn can serve */
 static ngx_http_xngin_conn_t *
 ngx_http_xngin_pick_tier(ngx_http_xngin_group_t *g, uint32_t caps,
     ngx_str_t *key, ngx_uint_t backup)
 {
-    ngx_uint_t              i, n = 0;
+    ngx_uint_t              i;
     ngx_http_xngin_agent_t *a = g->agents.elts;
+    ngx_http_xngin_agent_t *ba = NULL;
     ngx_http_xngin_conn_t  *c, *best = NULL;
-    ngx_http_xngin_conn_t  *list[128];
+    uint64_t                score, best_score = 0;
 
-    for (i = 0; i < g->agents.nelts; i++) {
-        if (!!a[i].backup != backup) {
-            continue;
-        }
-        for (c = a[i].conns; c; c = c->next) {
-            if (!c->ready || c->down) {
+    if (key) {
+        /*
+         * Rendezvous-style pick: score each agent that can serve right
+         * now from (key, agent-url, weight) and take the argmax.  Only
+         * the losing agent's keys remap when it drops out; keepalive
+         * conns of one agent collapse to a single bucket.
+         */
+        for (i = 0; i < g->agents.nelts; i++) {
+            if (!!a[i].backup != backup) {
                 continue;
             }
-            if (c->nstreams >= c->max_streams) {
-                continue;
-            }
-            if ((c->agent_caps & caps) != caps) {
-                continue;
-            }
-            if (key) {
-                if (n < 128) {
-                    list[n++] = c;
+
+            for (c = a[i].conns; c; c = c->next) {
+                if (ngx_http_xngin_conn_usable(c, caps)) {
+                    break;
                 }
+            }
+            if (c == NULL) {
+                continue;
+            }
+
+            score = ngx_crc32_long(key->data, key->len)
+                    * 0x9e3779b97f4a7c15ULL
+                    ^ ngx_crc32_long(a[i].url_text.data,
+                                     a[i].url_text.len);
+            score *= a[i].weight;
+
+            if (ba == NULL || score > best_score) {
+                ba = &a[i];
+                best_score = score;
+            }
+        }
+
+        if (ba == NULL) {
+            return NULL;
+        }
+
+        for (c = ba->conns; c; c = c->next) {
+            if (!ngx_http_xngin_conn_usable(c, caps)) {
                 continue;
             }
             if (best == NULL
@@ -1472,13 +1509,25 @@ ngx_http_xngin_pick_tier(ngx_http_xngin_group_t *g, uint32_t caps,
                 best = c;
             }
         }
+
+        return best;
     }
 
-    if (key) {
-        if (n == 0) {
-            return NULL;
+    for (i = 0; i < g->agents.nelts; i++) {
+        if (!!a[i].backup != backup) {
+            continue;
         }
-        return list[ngx_crc32_long(key->data, key->len) % n];
+        for (c = a[i].conns; c; c = c->next) {
+            if (!ngx_http_xngin_conn_usable(c, caps)) {
+                continue;
+            }
+            if (best == NULL
+                || (uint64_t) c->nstreams * best->max_streams
+                   < (uint64_t) best->nstreams * c->max_streams)
+            {
+                best = c;
+            }
+        }
     }
 
     return best;

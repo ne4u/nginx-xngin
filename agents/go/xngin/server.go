@@ -619,13 +619,30 @@ func (s *Server) PushControl(op ControlOp) error {
 
 	buf := marshalBuf(&Frame{Type: FrameControl, SID: 2, Payload: payload})
 
+	// snapshot the conn set: enqueue can write to the socket inline,
+	// and a stalled conn must not block registration/teardown under
+	// connsMu
 	s.connsMu.Lock()
-	defer s.connsMu.Unlock()
-	if len(s.conns) == 0 {
+	conns := make([]*writeQueue, 0, len(s.conns))
+	for wq := range s.conns {
+		conns = append(conns, wq)
+	}
+	s.connsMu.Unlock()
+
+	if len(conns) == 0 {
+		marshalPool.Put(buf[:0])
 		return errors.New("xngin: no engine connections")
 	}
-	for wq := range s.conns {
-		wq.enqueue(buf)
+
+	// enqueue takes ownership of its buffer (Puts it back after the
+	// write), so every conn needs a private copy — sharing buf would
+	// double-Put and let later frames alias recycled memory
+	for i, wq := range conns {
+		if i == len(conns)-1 {
+			wq.enqueue(buf)
+			break
+		}
+		wq.enqueue(append(marshalPool.Get().([]byte)[:0], buf...))
 	}
 	return nil
 }

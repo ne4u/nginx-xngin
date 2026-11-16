@@ -223,3 +223,102 @@ func TestNoEarlyHandlerWaitsForLast(t *testing.T) {
 	}
 	readThrough(t, a, FrameVerdict)
 }
+
+// drainConn pushes every decoded frame to ch until the conn errors.
+func drainConn(a net.Conn, ch chan<- Frame) {
+	defer close(ch)
+	var buf []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := a.Read(tmp)
+		if err != nil {
+			return
+		}
+		buf = append(buf, tmp[:n]...)
+		frames, rest, err := ParseFrames(buf)
+		if err != nil {
+			return
+		}
+		buf = rest
+		for _, f := range frames {
+			ch <- f
+		}
+	}
+}
+
+func awaitFrame(t *testing.T, ch <-chan Frame, typ byte) Frame {
+	t.Helper()
+	for {
+		select {
+		case f, ok := <-ch:
+			if !ok {
+				t.Fatalf("conn closed waiting for frame type %x", typ)
+			}
+			if f.Type == typ {
+				return f
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for frame type %x", typ)
+		}
+	}
+}
+
+// PushControl must deliver a private frame buffer to every conn —
+// enqueue returns its buffer to marshalPool after the write, so sharing
+// one pooled slice across conns would double-Put and alias memory.
+func TestPushControlBroadcast(t *testing.T) {
+	srv := &Server{Handler: HandlerFunc(
+		func(_ context.Context, _ *Request) (*Verdict, error) {
+			return Allow(), nil
+		})}
+	a1, b1 := net.Pipe()
+	a2, b2 := net.Pipe()
+	defer a1.Close()
+	defer a2.Close()
+	go srv.serveConn(b1)
+	go srv.serveConn(b2)
+	handshake(t, a1)
+	handshake(t, a2)
+
+	// net.Pipe writes block until read; drain both conns concurrently so
+	// PushControl's inline writes can complete.
+	ch1 := make(chan Frame, 64)
+	ch2 := make(chan Frame, 64)
+	go drainConn(a1, ch1)
+	go drainConn(a2, ch2)
+
+	if err := srv.PushControl(ControlOp{Op: "ban-ip", IP: "203.0.113.7",
+		TTL: 60}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, ch := range []<-chan Frame{ch1, ch2} {
+		f := awaitFrame(t, ch, FrameControl)
+		if f.SID != 2 {
+			t.Fatalf("conn %d: control sid = %d, want 2", i, f.SID)
+		}
+		pairs, err := ParseKV(f.Payload)
+		if err != nil {
+			t.Fatalf("conn %d: %v", i, err)
+		}
+		if got, _ := PairsGet(pairs, "op"); got != "ban-ip" {
+			t.Fatalf("conn %d: op = %v", i, got)
+		}
+		if got, _ := PairsGet(pairs, "ip"); got != "203.0.113.7" {
+			t.Fatalf("conn %d: ip = %v", i, got)
+		}
+	}
+
+	// a verdict after the broadcast must not see recycled CONTROL bytes
+	go a1.Write((&Frame{Type: FrameNotify, SID: 1,
+		Payload: notifyPayload("http-request",
+			Pair{"method", "GET"}, Pair{"uri", "/"})}).Marshal())
+	v := awaitFrame(t, ch1, FrameVerdict)
+	pairs, err := ParseKV(v.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := PairsGet(pairs, "action"); got != "allow" {
+		t.Fatalf("post-broadcast verdict action = %v", got)
+	}
+}

@@ -17,6 +17,19 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/big":
             # fixed-size plain response for byte-exact assertions
             payload = b"B" * (512 * 1024)
+        elif self.path == "/gzip-big":
+            # plaintext far above res_body_max but tiny on the wire:
+            # inflate should hit the cap and bypass, not fail the request
+            import gzip
+            payload = gzip.compress(b"P" * (200 * 1024))
+            self.send_response(200)
+            self.send_header("content-type", "application/octet-stream")
+            self.send_header("content-encoding", "gzip")
+            self.send_header("x-backend-tag", "backend")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         elif self.path in ("/gzip", "/br"):
             # compressed wire body: the agent should see plaintext
             import gzip

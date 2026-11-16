@@ -4,21 +4,11 @@
 #include <brotli/decode.h>
 
 
-/*
- * Held-response decompression for the agent view.  The upstream wire
- * bytes stay compressed for the client; the agent's BODY frames carry
- * the inflated plaintext when Content-Encoding is gzip/deflate/br.
- *
- * Also home to the streamed-replacement BODY frame collector: a verdict
- * carrying "body-stream" keeps the decision stream open so the agent can
- * stream a replacement body back on the same sid, terminated by
- * FL_BODY_LAST.
- */
-
-
 /* inflate an entire buffered chain into one pool buffer.
    enc: XNAP_DEC_GZIP (gzip + deflate via zlib autodetect) or
-   XNAP_DEC_BR.  out->len > cap fails with NGX_BUSY. */
+   XNAP_DEC_BR.  out->len > cap fails with NGX_BUSY — the caller
+   bypasses inspection and passes the original chain through, while
+   NGX_ERROR (corrupt input) runs the fail policy. */
 ngx_int_t
 ngx_http_xngin_inflate(ngx_http_request_t *r, ngx_chain_t *in,
     ngx_str_t *out, unsigned enc, size_t cap)

@@ -5,6 +5,10 @@
  * Agent-pushed bans (CONTROL frame ops ban-ip / ban-ja4).  Entries live
  * in the shared xngin_ban_zone when configured — enforced identically
  * across workers — otherwise in a per-worker rbtree fallback.
+ *
+ * Every ban records the group that pushed it; a lookup only matches
+ * entries owned by one of the supplied groups, so an agent can only
+ * affect locations/servers that actually use its group.
  */
 
 typedef struct {
@@ -12,7 +16,8 @@ typedef struct {
     time_t             expire;
     ngx_queue_t        queue;
     uint16_t           key_len;
-    u_char             data[];
+    uint16_t           group_len;
+    u_char             data[];      /* key bytes, then group name */
 } ngx_xngin_ban_node_t;
 
 typedef struct {
@@ -28,6 +33,7 @@ typedef struct {
 
 #define XNAP_BAN_MAX_KEY     256
 #define XNAP_BAN_LOCAL_CAP   1024
+#define XNAP_BAN_TTL_MAX     86400      /* one day; bounds zone pinning */
 
 
 static ngx_xngin_ban_shctx_t ngx_xngin_ban_local;
@@ -48,9 +54,14 @@ ngx_xngin_ban_rbtree_insert(ngx_rbtree_node_t *root,
         if (node->key != root->key) {
             p = (node->key < root->key) ? &root->left : &root->right;
         } else {
-            /* equal crc: byte compare the full key */
+            /* equal crc: byte compare key then group */
             ngx_int_t rc = ngx_memn2cmp(n->data, t->data,
                                       n->key_len, t->key_len);
+            if (rc == 0) {
+                rc = ngx_memn2cmp(n->data + n->key_len,
+                                  t->data + t->key_len,
+                                  n->group_len, t->group_len);
+            }
             p = (rc < 0) ? &root->left : &root->right;
         }
 
@@ -104,7 +115,8 @@ ngx_xngin_ban_store(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
 
 static ngx_xngin_ban_node_t *
 ngx_xngin_ban_find(ngx_xngin_ban_store_t *st, ngx_rbtree_node_t *node,
-    ngx_rbtree_node_t *sentinel, uint32_t hash, u_char *key, uint16_t len)
+    ngx_rbtree_node_t *sentinel, uint32_t hash, u_char *key, uint16_t len,
+    u_char *group, uint16_t glen)
 {
     ngx_xngin_ban_node_t *n;
 
@@ -119,8 +131,9 @@ ngx_xngin_ban_find(ngx_xngin_ban_store_t *st, ngx_rbtree_node_t *node,
             node = node->right;
             continue;
         }
-        if (n->key_len == len
-            && ngx_memcmp(n->data, key, len) == 0)
+        if (n->key_len == len && n->group_len == glen
+            && ngx_memcmp(n->data, key, len) == 0
+            && ngx_memcmp(n->data + n->key_len, group, glen) == 0)
         {
             return n;
         }
@@ -128,7 +141,7 @@ ngx_xngin_ban_find(ngx_xngin_ban_store_t *st, ngx_rbtree_node_t *node,
         {
             ngx_xngin_ban_node_t *m;
             m = ngx_xngin_ban_find(st, node->left, sentinel,
-                                   hash, key, len);
+                                   hash, key, len, group, glen);
             if (m) {
                 return m;
             }
@@ -155,20 +168,51 @@ ngx_xngin_ban_node_free(ngx_xngin_ban_store_t *st,
 }
 
 
+/* reap every expired entry — the queue is insertion-ordered and
+   expire = inserted + ttl varies across entries, so an early bail on
+   the first live node would leak expired ones parked behind it */
 static void
 ngx_xngin_ban_expire(ngx_xngin_ban_store_t *st, ngx_slab_pool_t *shpool)
 {
-    ngx_queue_t           *q;
+    ngx_queue_t           *q, *nq;
     ngx_xngin_ban_node_t  *n;
     time_t                 now = ngx_time();
 
-    while (!ngx_queue_empty(&st->queue)) {
-        q = ngx_queue_last(&st->queue);
+    for (q = ngx_queue_head(&st->queue);
+         q != ngx_queue_sentinel(&st->queue);
+         q = nq)
+    {
+        nq = ngx_queue_next(q);
         n = ngx_queue_data(q, ngx_xngin_ban_node_t, queue);
-        if (n->expire > now) {
-            return;
+        if (n->expire <= now) {
+            ngx_xngin_ban_node_free(st, shpool, n);
         }
-        ngx_xngin_ban_node_free(st, shpool, n);
+    }
+}
+
+
+/* drop the soonest-expiring entry (zone-full fallback) */
+static void
+ngx_xngin_ban_evict_one(ngx_xngin_ban_store_t *st, ngx_slab_pool_t *shpool)
+{
+    ngx_queue_t           *q, *victim = NULL;
+    ngx_xngin_ban_node_t  *n;
+    time_t                 min = NGX_MAX_TIME_T_VALUE;
+
+    for (q = ngx_queue_head(&st->queue);
+         q != ngx_queue_sentinel(&st->queue);
+         q = ngx_queue_next(q))
+    {
+        n = ngx_queue_data(q, ngx_xngin_ban_node_t, queue);
+        if (n->expire < min) {
+            min = n->expire;
+            victim = q;
+        }
+    }
+
+    if (victim) {
+        ngx_xngin_ban_node_free(st, shpool,
+            ngx_queue_data(victim, ngx_xngin_ban_node_t, queue));
     }
 }
 
@@ -200,7 +244,7 @@ ngx_http_xngin_ban_zone_init(ngx_shm_zone_t *shm_zone, void *data)
 
 void
 ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
-    ngx_str_t *key, uint32_t ttl)
+    ngx_str_t *key, uint32_t ttl, ngx_http_xngin_group_t *group)
 {
     ngx_xngin_ban_store_t *st;
     ngx_xngin_ban_node_t  *n;
@@ -208,9 +252,13 @@ ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
     uint32_t               hash;
     size_t                 size;
 
-    if (key == NULL || key->len == 0 || key->len > XNAP_BAN_MAX_KEY) {
+    if (key == NULL || key->len == 0 || key->len > XNAP_BAN_MAX_KEY
+        || group == NULL)
+    {
         return;
     }
+
+    ttl = ngx_min(ttl, XNAP_BAN_TTL_MAX);
 
     st = ngx_xngin_ban_store(mmcf, kind, &shpool);
     hash = ngx_crc32_long(key->data, key->len);
@@ -222,7 +270,8 @@ ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
     ngx_xngin_ban_expire(st, shpool);
 
     n = ngx_xngin_ban_find(st, st->rbtree.root, &st->sentinel,
-                           hash, key->data, key->len);
+                           hash, key->data, key->len,
+                           group->name.data, (uint16_t) group->name.len);
     if (n) {
         n->expire = ngx_time() + ttl;
         ngx_queue_remove(&n->queue);
@@ -230,9 +279,15 @@ ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
         goto done;
     }
 
-    size = offsetof(ngx_xngin_ban_node_t, data) + key->len;
+    size = offsetof(ngx_xngin_ban_node_t, data) + key->len
+           + group->name.len;
     n = shpool ? ngx_slab_alloc_locked(shpool, size) : ngx_alloc(size,
                                                                ngx_cycle->log);
+    if (n == NULL && shpool) {
+        /* zone full: evict the soonest-expiring entry and retry */
+        ngx_xngin_ban_evict_one(st, shpool);
+        n = ngx_slab_alloc_locked(shpool, size);
+    }
     if (n == NULL) {
         /* local fallback cap: evict oldest */
         if (!shpool && st->nentries >= XNAP_BAN_LOCAL_CAP
@@ -251,15 +306,19 @@ ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
     n->node.key = hash;
     n->expire = ngx_time() + ttl;
     n->key_len = (uint16_t) key->len;
+    n->group_len = (uint16_t) group->name.len;
     ngx_memcpy(n->data, key->data, key->len);
+    ngx_memcpy(n->data + key->len, group->name.data, group->name.len);
 
     ngx_rbtree_insert(&st->rbtree, &n->node);
     ngx_queue_insert_head(&st->queue, &n->queue);
     st->nentries++;
 
     ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
-                  "xngin: %s ban added for \"%V\" (ttl %ui)",
-                  kind == XNAP_BAN_IP ? "ip" : "ja4", key, ttl);
+                  "xngin: %s ban added for \"%V\" by group \"%V\" "
+                  "(ttl %ui)",
+                  kind == XNAP_BAN_IP ? "ip" : "ja4", key, &group->name,
+                  ttl);
 
 done:
     if (shpool) {
@@ -268,41 +327,59 @@ done:
 }
 
 
+/* banned iff any group in `groups` pushed a live ban for `key` */
 ngx_int_t
 ngx_http_xngin_ban_check(ngx_http_xngin_main_conf_t *mmcf, ngx_uint_t kind,
-    ngx_str_t *key)
+    ngx_str_t *key, ngx_array_t *groups)
 {
-    ngx_xngin_ban_store_t *st;
-    ngx_xngin_ban_node_t  *n;
-    ngx_slab_pool_t       *shpool;
-    uint32_t               hash;
-    ngx_int_t              banned = 0;
+    ngx_xngin_ban_store_t   *st;
+    ngx_xngin_ban_node_t    *n;
+    ngx_slab_pool_t         *shpool;
+    ngx_http_xngin_group_t **gp;
+    ngx_uint_t               i;
+    uint32_t                 hash;
+    time_t                   now;
+    ngx_int_t                banned = 0;
 
-    if (key == NULL || key->len == 0 || key->len > XNAP_BAN_MAX_KEY) {
+    if (key == NULL || key->len == 0 || key->len > XNAP_BAN_MAX_KEY
+        || groups == NULL || groups->nelts == 0)
+    {
         return 0;
     }
 
     st = ngx_xngin_ban_store(mmcf, kind, &shpool);
 
-    /* fast path: nothing banned at all */
-    if (st->nentries == 0) {
+    /* local store is worker-private — the unlocked read cannot race */
+    if (!shpool && st->nentries == 0) {
         return 0;
     }
 
     hash = ngx_crc32_long(key->data, key->len);
+    now = ngx_time();
+    gp = groups->elts;
 
     if (shpool) {
         ngx_shmtx_lock(&shpool->mutex);
     }
 
-    n = ngx_xngin_ban_find(st, st->rbtree.root, &st->sentinel,
-                           hash, key->data, key->len);
-    if (n) {
-        if (n->expire <= ngx_time()) {
-            ngx_xngin_ban_node_free(st, shpool, n);
-        } else {
-            banned = 1;
+    for (i = 0; i < groups->nelts; i++) {
+        if (gp[i] == NULL) {
+            continue;
         }
+
+        n = ngx_xngin_ban_find(st, st->rbtree.root, &st->sentinel,
+                               hash, key->data, key->len,
+                               gp[i]->name.data,
+                               (uint16_t) gp[i]->name.len);
+        if (n == NULL) {
+            continue;
+        }
+        if (n->expire <= now) {
+            ngx_xngin_ban_node_free(st, shpool, n);
+            continue;
+        }
+        banned = 1;
+        break;
     }
 
     if (shpool) {
@@ -357,7 +434,8 @@ ngx_http_xngin_control(ngx_http_xngin_conn_t *c, u_char *payload,
 
     if (op.len == 6 && ngx_memcmp(op.data, "ban-ip", 6) == 0) {
         if (ip.len) {
-            ngx_http_xngin_ban_add(mmcf, XNAP_BAN_IP, &ip, (uint32_t) ttl);
+            ngx_http_xngin_ban_add(mmcf, XNAP_BAN_IP, &ip, (uint32_t) ttl,
+                                   c->agent->group);
         }
         return NGX_OK;
     }
@@ -365,13 +443,13 @@ ngx_http_xngin_control(ngx_http_xngin_conn_t *c, u_char *payload,
     if (op.len == 7 && ngx_memcmp(op.data, "ban-ja4", 7) == 0) {
         if (ja4.len) {
             ngx_http_xngin_ban_add(mmcf, XNAP_BAN_JA4, &ja4,
-                                   (uint32_t) ttl);
+                                   (uint32_t) ttl, c->agent->group);
         }
         return NGX_OK;
     }
 
     if (op.len == 10 && ngx_memcmp(op.data, "cache-drop", 10) == 0) {
-        ngx_http_xngin_cache_drop(mmcf, &key);
+        ngx_http_xngin_cache_drop(mmcf, &key, &c->agent->group->name);
         return NGX_OK;
     }
 

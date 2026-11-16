@@ -259,19 +259,27 @@ KV payload:
 | `ip`    | STR    | client address, for `ban-ip`                |
 | `ja4`   | STR    | JA4 fingerprint, for `ban-ja4`              |
 | `key`   | STR    | raw `xngin_cache_key` value, for `cache-drop` |
-| `ttl`   | UINT32 | ban lifetime seconds (default 300)          |
+| `ttl`   | UINT32 | ban lifetime seconds (default 300, max 86400) |
 
-Semantics:
+CONTROL frames received before the conn's AGENT_HELLO completes are
+ignored.
+
+Semantics — every pushed state is scoped to the agent's own group:
 
 - `ban-ip`: subsequent requests from `ip` are refused (403) in the
-  POST_READ phase, before any other request processing.
+  ACCESS phase — only in locations whose `xngin_group` chain includes
+  the pushing group.
 - `ban-ja4`: subsequent ClientHellos carrying `ja4` are aborted during
-  the handshake — the TLS equivalent of `xngin_tls_deny`, but dynamic.
+  the handshake — the TLS equivalent of `xngin_tls_deny`, but dynamic —
+  on servers with `xngin_tls_inspect` whose locations use the pushing
+  group.
 - `cache-drop`: evicts the verdict-cache entry whose key equals the
-  raw `xngin_cache_key` value.
+  raw `xngin_cache_key` value, but only when the entry was stored by a
+  verdict from the pushing group.
 
 Bans live in the shared `xngin_ban_zone` when configured (visible to all
-workers) and otherwise in per-worker memory. Entries expire at `ttl`.
+workers) and otherwise in per-worker memory. Entries expire at `ttl`;
+the effective lifetime is capped at 86400 seconds.
 Unknown `op` values are logged and ignored.
 
 ### 4.5 NOTIFY — `http-response`
