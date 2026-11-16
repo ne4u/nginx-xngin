@@ -21,7 +21,7 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
     ngx_list_part_t        *part;
     ngx_table_elt_t        *h;
     ngx_uint_t              i;
-    ngx_xnap_wbuf_t         hdrs;
+    size_t                  kvl_len;
     struct sockaddr        *sa;
 
     /* message name */
@@ -54,8 +54,10 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
         ngx_xnap_wbuf_kv_str(wb, "http-version", vbuf, v - vbuf);
     }
 
-    /* headers as nested KVL */
-    ngx_xnap_wbuf_init(&hdrs, r->pool, 1024);
+    /* headers as nested KVL: exact payload length first, then entries
+       straight into wb (the reserved send pkt on the fast path) —
+       no staging buffer, no copy */
+    kvl_len = 0;
 
     part = &r->headers_in.headers.part;
     h = part->elts;
@@ -74,22 +76,41 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
             continue;
         }
 
-        ngx_xnap_wbuf_varint(&hdrs, h[i].lowcase_key
-                             ? h[i].key.len : h[i].key.len);
-        ngx_xnap_wbuf_bytes(&hdrs,
+        kvl_len += ngx_xnap_varint_len(h[i].key.len) + h[i].key.len
+                   + 1 + ngx_xnap_varint_len(h[i].value.len)
+                   + h[i].value.len;
+    }
+
+    ngx_xnap_wbuf_kv_name(wb, "headers");
+    ngx_xnap_wbuf_u8(wb, XNAP_VT_KVL);
+    ngx_xnap_wbuf_varint(wb, kvl_len);
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        ngx_xnap_wbuf_varint(wb, h[i].key.len);
+        ngx_xnap_wbuf_bytes(wb,
                             h[i].lowcase_key ? h[i].lowcase_key
                                              : h[i].key.data,
                             h[i].key.len);
-        ngx_xnap_wbuf_u8(&hdrs, XNAP_VT_STR);
-        ngx_xnap_wbuf_varint(&hdrs, h[i].value.len);
-        ngx_xnap_wbuf_bytes(&hdrs, h[i].value.data, h[i].value.len);
+        ngx_xnap_wbuf_u8(wb, XNAP_VT_STR);
+        ngx_xnap_wbuf_varint(wb, h[i].value.len);
+        ngx_xnap_wbuf_bytes(wb, h[i].value.data, h[i].value.len);
     }
-
-    /* emit "headers" KVL value */
-    ngx_xnap_wbuf_kv_name(wb, "headers");
-    ngx_xnap_wbuf_u8(wb, XNAP_VT_KVL);
-    ngx_xnap_wbuf_varint(wb, hdrs.pos - hdrs.start);
-    ngx_xnap_wbuf_bytes(wb, hdrs.start, hdrs.pos - hdrs.start);
 
     /* connection info */
     ngx_xnap_wbuf_kv_ip(wb, "src-ip", r->connection->sockaddr);

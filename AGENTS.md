@@ -122,6 +122,20 @@ python3 -m pytest test/cases -q
 - macOS: overwriting a dlopen'd .so in place invalidates its code
   signature — the process dies with `Killed: 9` ("Code Signature
   Invalid" in the .ips crash report). `rm` the old .so first, then cp.
+- The live build tree is `/tmp/nginx-src/nginx-1.31.8` (the
+  `/tmp/nginx-1.31.8` dir is a stale partial copy — `make modules`
+  fails there on missing src files). Use
+  `XNGIN_MODULE_SO=/tmp/nginx-src/nginx-1.31.8/objs/ngx_http_xngin_module.so`,
+  not the stacklib default.
+- stub_agent serializes `handle()` per conn: a `delay_ms` verdict
+  blocks every stream queued behind it on that conn — later verdicts
+  land in notify order, not delay order. Use this to order same-key
+  cache stores deterministically (e.g. deny with a longer delay
+  replaces an allow sent earlier).
+- The verdict cache rbtree keys on crc32 only — equal-hash nodes need
+  a byte-compare walk of BOTH subtrees (rotations park them either
+  side). `zlib.crc32 == ngx_crc32_long`, so test key pairs can be
+  precomputed in Python (e.g. k29685295/k32060020 → 0x3973d855).
 - FIPS crypto stack per side: engine → OpenSSL FIPS provider;
   Go SDK → stdlib `crypto/tls` with `GOFIPS140=v1.0.0` (Go 1.24+) or
   `GOEXPERIMENT=boringcrypto`; Rust SDK → rustls + aws-lc-rs

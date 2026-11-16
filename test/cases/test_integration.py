@@ -165,6 +165,107 @@ def test_verdict_cache(stack):
     assert s.agents[0].stats()["notifies"] <= 3
 
 
+def test_cache_deny_replaces_allow(stack):
+    """a later verdict for the same key replaces the cached entry —
+    the deny must not sit behind a dead allow duplicate."""
+    import threading
+
+    # the stub resolves streams in notify order on one conn: the allow
+    # lands first (~400ms), the deny — dispatched meanwhile — lands
+    # last (~1.2s) and must replace it
+    rules = {"default": {"action": "allow"},
+             "rules": [
+                 {"match": {"header": {"x-med": "1"}},
+                  "behavior": {"delay_ms": 400},
+                  "verdict": {"action": "allow", "reason": "med-allow",
+                              "cache_ttl": 60}},
+                 {"match": {"header": {"x-slow": "1"}},
+                  "behavior": {"delay_ms": 800},
+                  "verdict": {"action": "deny", "status": 403,
+                              "reason": "late-deny", "cache_ttl": 60}}]}
+    s = stack(agents_rules=[rules], timeout="2s",
+              loc_extra="xngin_cache_key $arg_k;",
+              main_extra="xngin_cache_zone vcache:1m;").start()
+
+    res = {}
+    t1 = threading.Thread(target=lambda: res.__setitem__(
+        "a", s.request("/?k=x", headers={"x-med": "1"})))
+    t1.start()
+    time.sleep(0.15)   # req1's notify precedes req2's on the conn;
+                     # req2's lookup runs while req1 is still in flight
+    t2 = threading.Thread(target=lambda: res.__setitem__(
+        "b", s.request("/?k=x", headers={"x-slow": "1"})))
+    t2.start()
+
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert res["a"][0] == 200   # allow landed first and was cached
+    assert res["b"][0] == 403   # deny landed second: replaced the allow
+
+    # the replace was in place — a cache hit now denies, not a dead
+    # allow duplicate
+    st, _, _ = s.request("/?k=x")
+    assert st == 403
+
+    time.sleep(0.3)
+    assert "cache=hit" in s.access_log()
+
+
+def test_cache_crc32_collision(stack):
+    """different keys sharing a crc32 must coexist: lookup walks every
+    equal-hash node, not just the first on the descent path."""
+    import zlib
+
+    # verified: zlib.crc32 == ngx_crc32_long for both
+    k1, k2 = "k29685295", "k32060020"
+    assert zlib.crc32(k1.encode()) == zlib.crc32(k2.encode()) \
+        == 0x3973d855
+
+    rules = {"default": {"action": "allow", "cache_ttl": 60},
+             "rules": [
+                 {"match": {"uri_contains": k2},
+                  "verdict": {"action": "deny", "status": 403,
+                              "reason": "k2-blocked", "cache_ttl": 60}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_cache_key $arg_k;",
+              main_extra="xngin_cache_zone vcache:1m;").start()
+
+    st, _, _ = s.request(f"/?k={k1}")
+    assert st == 200                      # miss -> allow stored
+    st, _, _ = s.request(f"/?k={k2}")
+    assert st == 403                      # miss -> deny stored beside k1
+
+    # repeats resolve to their own cached verdicts, not each other's
+    st, _, _ = s.request(f"/?k={k2}")
+    assert st == 403
+    st, _, _ = s.request(f"/?k={k1}")
+    assert st == 200
+
+    time.sleep(0.3)
+    # both repeats were hits — a key hidden behind its crc32 sibling
+    # would have fallen through to the agent again
+    assert s.access_log().count("cache=hit") == 2
+
+
+def test_stream_table_churn(stack):
+    """600 requests over one keepalive conn: every stream-table slot
+    on the single agent conn cycles (> XNAP_STREAM_TABLE_CAP)."""
+    import http.client
+
+    s = stack(agents_rules=[ALLOW]).start()
+    conn = http.client.HTTPConnection("127.0.0.1", s.listen_port,
+                                      timeout=10)
+    try:
+        for i in range(600):
+            conn.request("GET", f"/r{i}")
+            resp = conn.getresponse()
+            body = resp.read()
+            assert resp.status == 200
+            assert json.loads(body)["path"] == f"/r{i}"
+    finally:
+        conn.close()
+
+
 def test_garbage_agent(stack):
     """agent sends garbage: conn reset, fail close -> 503."""
     rules = {"default": {"action": "allow"}, "rules": [

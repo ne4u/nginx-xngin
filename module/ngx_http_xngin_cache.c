@@ -1,6 +1,11 @@
 #include "ngx_http_xngin_module.h"
 
 
+/* stored reason is clamped so a lookup can stage it on the stack
+   without pool allocation under the shm mutex */
+#define XNAP_CACHE_REASON_MAX  1024
+
+
 typedef struct {
     ngx_rbtree_node_t   node;
     ngx_queue_t         queue;
@@ -10,6 +15,7 @@ typedef struct {
     int64_t             score;
     u_short             key_len;
     u_short             reason_len;
+    u_short             reason_cap; /* alloc'd reason bytes (>= len) */
     u_char              data[];     /* key bytes then reason bytes */
 } ngx_http_xngin_cache_node_t;
 
@@ -49,6 +55,47 @@ ngx_http_xngin_cache_sh(ngx_http_xngin_main_conf_t *mmcf)
 }
 
 
+/* find the node whose stored key byte-matches `key` among the nodes
+   sharing tree key `key_h` (crc32 collisions insert equal tree keys;
+   rbtree rotations can park them in either subtree, so an equal-key
+   node requires walking both children).  Caller holds the slab mutex. */
+static ngx_http_xngin_cache_node_t *
+ngx_http_xngin_cache_find(ngx_http_xngin_cache_shctx_t *sh,
+    ngx_rbtree_node_t *node, uint64_t key_h, u_char *kdata, size_t klen)
+{
+    ngx_http_xngin_cache_node_t *n, *f;
+
+    if (node == sh->rbtree.sentinel) {
+        return NULL;
+    }
+
+    if ((ngx_rbtree_key_t) key_h < node->key) {
+        return ngx_http_xngin_cache_find(sh, node->left, key_h,
+                                         kdata, klen);
+    }
+
+    if ((ngx_rbtree_key_t) key_h > node->key) {
+        return ngx_http_xngin_cache_find(sh, node->right, key_h,
+                                         kdata, klen);
+    }
+
+    n = (ngx_http_xngin_cache_node_t *) node;
+
+    if (n->key_len == klen
+        && ngx_memcmp(n->data, kdata, klen) == 0)
+    {
+        return n;
+    }
+
+    f = ngx_http_xngin_cache_find(sh, node->left, key_h, kdata, klen);
+    if (f) {
+        return f;
+    }
+
+    return ngx_http_xngin_cache_find(sh, node->right, key_h, kdata, klen);
+}
+
+
 static void
 ngx_http_xngin_cache_expire_locked(ngx_http_xngin_cache_shctx_t *sh,
     ngx_slab_pool_t *shpool)
@@ -82,7 +129,6 @@ ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
     ngx_http_xngin_cache_node_t  *n;
     ngx_slab_pool_t              *shpool;
     uint64_t                      key_h;
-    ngx_rbtree_node_t            *node, *sentinel;
 
     mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
     sh = ngx_http_xngin_cache_sh(mmcf);
@@ -97,49 +143,40 @@ ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
 
     ngx_shmtx_lock(&shpool->mutex);
 
-    sentinel = sh->rbtree.sentinel;
-    node = sh->rbtree.root;
+    n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
+                                  key->data, key->len);
 
-    while (node != sentinel) {
-        if ((ngx_rbtree_key_t) key_h < node->key) {
-            node = node->left;
-            continue;
-        }
-        if ((ngx_rbtree_key_t) key_h > node->key) {
-            node = node->right;
-            continue;
-        }
+    if (n && n->expire <= ngx_time()) {
+        ngx_queue_remove(&n->queue);
+        ngx_rbtree_delete(&sh->rbtree, &n->node);
+        ngx_slab_free_locked(shpool, n);
+        n = NULL;
+    }
 
-        n = (ngx_http_xngin_cache_node_t *) node;
+    if (n) {
+        /* stage the reason on the stack so the pool alloc below runs
+           after the mutex is released */
+        u_char   rbuf[XNAP_CACHE_REASON_MAX];
+        size_t   rlen;
 
-        if (n->key_len == key->len
-            && ngx_memcmp(n->data, key->data, key->len) == 0)
-        {
-            if (n->expire <= ngx_time()) {
-                ngx_queue_remove(&n->queue);
-                ngx_rbtree_delete(&sh->rbtree, node);
-                ngx_slab_free_locked(shpool, n);
-                break;
-            }
+        rlen = ngx_min(n->reason_len, sizeof(rbuf));
 
-            ngx_queue_remove(&n->queue);
-            ngx_queue_insert_head(&sh->queue, &n->queue);
+        ngx_queue_remove(&n->queue);
+        ngx_queue_insert_head(&sh->queue, &n->queue);
 
-            *out_status = n->action;
-            *out_score = n->score;
-            out_reason->data = ngx_pnalloc(r->pool, n->reason_len);
-            ngx_memcpy(out_reason->data,
-                       n->data + n->key_len, n->reason_len);
-            out_reason->len = n->reason_len;
+        *out_status = n->action;
+        *out_score = n->score;
+        ngx_memcpy(rbuf, n->data + n->key_len, rlen);
 
-            sh->nhit++;
-            ngx_shmtx_unlock(&shpool->mutex);
+        sh->nhit++;
+        ngx_shmtx_unlock(&shpool->mutex);
 
-            ctx->cache_status = XNAP_CACHE_HIT;
-            return NGX_OK;
-        }
+        out_reason->data = ngx_pnalloc(r->pool, rlen);
+        ngx_memcpy(out_reason->data, rbuf, rlen);
+        out_reason->len = rlen;
 
-        break;
+        ctx->cache_status = XNAP_CACHE_HIT;
+        return NGX_OK;
     }
 
     sh->nmiss++;
@@ -161,6 +198,7 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     size_t                        size;
     uint64_t                      key_h;
     ngx_int_t                     action;
+    u_short                       rlen;
 
     mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
     sh = ngx_http_xngin_cache_sh(mmcf);
@@ -174,13 +212,41 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     action = ctx->deny_status ? ctx->deny_status : (ngx_int_t) NGX_DECLINED;
 
     key_h = ngx_crc32_long(key->data, key->len);
-    size = sizeof(ngx_http_xngin_cache_node_t) + key->len + ctx->reason.len;
+    rlen = (u_short) ngx_min(ctx->reason.len, XNAP_CACHE_REASON_MAX);
+    size = sizeof(ngx_http_xngin_cache_node_t) + key->len + rlen;
 
     shpool = (ngx_slab_pool_t *) mmcf->cache_zone->shm.addr;
 
     ngx_shmtx_lock(&shpool->mutex);
 
     ngx_http_xngin_cache_expire_locked(sh, shpool);
+
+    /* replace a byte-equal key in place — never park a dead duplicate
+       behind it (a same-key second verdict arrives e.g. when requests
+       for the key interleave across the agent round-trip) */
+    n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
+                                  key->data, key->len);
+
+    if (n && rlen <= n->reason_cap) {
+        n->expire = ngx_time() + ttl;
+        n->action = action;
+        n->score = ctx->score;
+        n->reason_len = rlen;
+        ngx_memcpy(n->data + n->key_len, ctx->reason.data, rlen);
+
+        ngx_queue_remove(&n->queue);
+        ngx_queue_insert_head(&sh->queue, &n->queue);
+
+        ngx_shmtx_unlock(&shpool->mutex);
+        return;
+    }
+
+    if (n) {
+        /* same key, bigger reason: out with the old node */
+        ngx_queue_remove(&n->queue);
+        ngx_rbtree_delete(&sh->rbtree, &n->node);
+        ngx_slab_free_locked(shpool, n);
+    }
 
     n = ngx_slab_alloc_locked(shpool, size);
 
@@ -208,10 +274,11 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     n->action = action;
     n->score = ctx->score;
     n->key_len = (u_short) key->len;
-    n->reason_len = (u_short) ctx->reason.len;
+    n->reason_len = rlen;
+    n->reason_cap = rlen;
 
     ngx_memcpy(n->data, key->data, key->len);
-    ngx_memcpy(n->data + key->len, ctx->reason.data, ctx->reason.len);
+    ngx_memcpy(n->data + key->len, ctx->reason.data, rlen);
 
     ngx_rbtree_insert(&sh->rbtree, &n->node);
     ngx_queue_insert_head(&sh->queue, &n->queue);

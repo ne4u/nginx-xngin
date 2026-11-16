@@ -1,7 +1,6 @@
 #include "ngx_http_xngin_module.h"
 
 
-#define XNAP_SID_TOMBSTONE  ((uint64_t) -1)
 #define XNAP_RBUF_MAX       (1024 * 1024)
 
 
@@ -58,32 +57,24 @@ xnap_enc_kv_str(u_char *p, const char *name, u_char *val, size_t len)
 }
 
 
-/* ---------- stream table (open addressing + tombstones) ---------- */
+/* ---------- stream table (open addressing, backward-shift del) ---------- */
 
 void
 ngx_http_xngin_stream_add(ngx_http_xngin_conn_t *c, uint64_t sid,
     ngx_http_xngin_ctx_t *ctx)
 {
     ngx_uint_t          i;
-    ngx_xnap_stream_t  *st, *first = NULL;
+    ngx_xnap_stream_t  *st;
 
     for (i = 0; i < c->streams_cap; i++) {
         st = &c->streams[(sid + i) % c->streams_cap];
 
-        if (st->id == 0 || st->id == XNAP_SID_TOMBSTONE) {
-            if (first == NULL) {
-                first = st;
-            }
-            if (st->id == 0) {
-                break;
-            }
+        if (st->id == 0) {
+            st->id = sid;
+            st->ctx = ctx;
+            c->nstreams++;
+            return;
         }
-    }
-
-    if (first) {
-        first->id = sid;
-        first->ctx = ctx;
-        c->nstreams++;
     }
 }
 
@@ -113,27 +104,59 @@ ngx_http_xngin_stream_find(ngx_http_xngin_conn_t *c, uint64_t sid)
 void
 ngx_http_xngin_stream_del(ngx_http_xngin_conn_t *c, uint64_t sid)
 {
-    ngx_uint_t          i;
-    ngx_xnap_stream_t  *st;
+    ngx_uint_t          i, g, j, r, cap, idx;
+    ngx_xnap_stream_t  *st = NULL;
 
     if (c->streams == NULL) {
         return;
     }
 
-    for (i = 0; i < c->streams_cap; i++) {
-        st = &c->streams[(sid + i) % c->streams_cap];
+    cap = c->streams_cap;
+    idx = 0;
+
+    /* locate sid in its probe chain */
+    for (i = 0; i < cap; i++) {
+        idx = (ngx_uint_t) ((sid + i) % cap);
+        st = &c->streams[idx];
 
         if (st->id == 0) {
             return;
         }
 
         if (st->id == sid) {
-            st->id = XNAP_SID_TOMBSTONE;
-            st->ctx = NULL;
-            if (c->nstreams) {
-                c->nstreams--;
-            }
+            break;
+        }
+    }
+
+    if (i == cap) {
+        return;
+    }
+
+    st->id = 0;
+    st->ctx = NULL;
+    if (c->nstreams) {
+        c->nstreams--;
+    }
+
+    /* backward-shift the rest of the cluster (Knuth 6.4R): an entry
+       at j can slide into the gap g iff probing from its home r
+       reaches g at-or-before j — keeps every probe chain contiguous
+       so no tombstones are needed */
+    for (g = idx, j = idx; ; ) {
+        j = (j + 1) % cap;
+        st = &c->streams[j];
+
+        if (st->id == 0) {
             return;
+        }
+
+        r = (ngx_uint_t) (st->id % cap);
+
+        if ((g + cap - r) % cap <= (j + cap - r) % cap) {
+            c->streams[g] = *st;
+            st->id = 0;
+            st->ctx = NULL;
+            g = j;
         }
     }
 }
@@ -255,24 +278,51 @@ ngx_http_xngin_conn_connect(ngx_http_xngin_conn_t *c)
 
 /* ---------- send ---------- */
 
+/* freelist size classes: allocations normalize up to the class cap so
+   a returned pkt actually fits a future request; pkts above the last
+   class are exact allocs and never cached */
+static const size_t     ngx_xnap_pkt_class_cap[XNAP_PKT_NCLASS] = {
+    512, 4096, 16384
+};
+static const ngx_uint_t ngx_xnap_pkt_class_max[XNAP_PKT_NCLASS] = {
+    32, 16, 8
+};
+
+
 static ngx_xnap_pkt_t *
 ngx_http_xngin_pkt_get(ngx_http_xngin_conn_t *c, size_t cap)
 {
-    ngx_xnap_pkt_t  *pkt, **pp;
+    ngx_xnap_pkt_t  *pkt;
+    ngx_uint_t       i, j;
 
-    /* freelist: first entry that fits */
-    for (pp = &c->free_pkts; *pp; pp = &(*pp)->next) {
-        if ((*pp)->cap >= cap) {
-            pkt = *pp;
-            *pp = pkt->next;
-            c->nfree_pkts--;
+    for (i = 0; i < XNAP_PKT_NCLASS; i++) {
+        if (cap <= ngx_xnap_pkt_class_cap[i]) {
+            break;
+        }
+    }
+
+    if (i == XNAP_PKT_NCLASS) {
+        pkt = ngx_alloc(sizeof(ngx_xnap_pkt_t) + cap, ngx_cycle->log);
+        if (pkt) {
+            pkt->cap = cap;
+        }
+        return pkt;
+    }
+
+    /* own class first, then any larger class */
+    for (j = i; j < XNAP_PKT_NCLASS; j++) {
+        pkt = c->free_pkts[j];
+        if (pkt) {
+            c->free_pkts[j] = pkt->next;
+            c->nfree_pkts[j]--;
             return pkt;
         }
     }
 
-    pkt = ngx_alloc(sizeof(ngx_xnap_pkt_t) + cap, ngx_cycle->log);
+    pkt = ngx_alloc(sizeof(ngx_xnap_pkt_t) + ngx_xnap_pkt_class_cap[i],
+                    ngx_cycle->log);
     if (pkt) {
-        pkt->cap = cap;
+        pkt->cap = ngx_xnap_pkt_class_cap[i];
     }
     return pkt;
 }
@@ -281,14 +331,24 @@ ngx_http_xngin_pkt_get(ngx_http_xngin_conn_t *c, size_t cap)
 static void
 ngx_http_xngin_pkt_put(ngx_http_xngin_conn_t *c, ngx_xnap_pkt_t *pkt)
 {
-    if (c->nfree_pkts >= XNAP_PKT_FREE_MAX) {
+    ngx_uint_t  i;
+
+    for (i = 0; i < XNAP_PKT_NCLASS; i++) {
+        if (pkt->cap == ngx_xnap_pkt_class_cap[i]) {
+            break;
+        }
+    }
+
+    if (i == XNAP_PKT_NCLASS
+        || c->nfree_pkts[i] >= ngx_xnap_pkt_class_max[i])
+    {
         ngx_free(pkt);
         return;
     }
 
-    pkt->next = c->free_pkts;
-    c->free_pkts = pkt;
-    c->nfree_pkts++;
+    pkt->next = c->free_pkts[i];
+    c->free_pkts[i] = pkt;
+    c->nfree_pkts[i]++;
 }
 
 
@@ -1043,6 +1103,7 @@ static void
 ngx_http_xngin_conn_close(ngx_http_xngin_conn_t *c)
 {
     ngx_xnap_pkt_t *pkt, *next;
+    ngx_uint_t      i;
 
     if (c->down) {
         return;
@@ -1071,12 +1132,14 @@ ngx_http_xngin_conn_close(ngx_http_xngin_conn_t *c)
     c->out = NULL;
     c->out_tail = &c->out;
 
-    for (pkt = c->free_pkts; pkt; pkt = next) {
-        next = pkt->next;
-        ngx_free(pkt);
+    for (i = 0; i < XNAP_PKT_NCLASS; i++) {
+        for (pkt = c->free_pkts[i]; pkt; pkt = next) {
+            next = pkt->next;
+            ngx_free(pkt);
+        }
+        c->free_pkts[i] = NULL;
+        c->nfree_pkts[i] = 0;
     }
-    c->free_pkts = NULL;
-    c->nfree_pkts = 0;
 
     c->rpos = c->rlast = c->rbuf;
 
@@ -1097,7 +1160,7 @@ ngx_http_xngin_conn_fail_streams(ngx_http_xngin_conn_t *c)
     ngx_http_xngin_ctx_t *ctx;
 
     for (i = 0; i < c->streams_cap; i++) {
-        if (c->streams[i].id && c->streams[i].id != XNAP_SID_TOMBSTONE) {
+        if (c->streams[i].id) {
             ctx = c->streams[i].ctx;
             c->streams[i].id = 0;
             c->streams[i].ctx = NULL;
@@ -1179,8 +1242,8 @@ ngx_http_xngin_conn_pick_caps(ngx_http_xngin_group_t *g, uint32_t caps)
                 continue;
             }
             if (best == NULL
-                || (double) c->nstreams / c->max_streams
-                   < (double) best->nstreams / best->max_streams)
+                || (uint64_t) c->nstreams * best->max_streams
+                   < (uint64_t) best->nstreams * c->max_streams)
             {
                 best = c;
             }

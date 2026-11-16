@@ -59,6 +59,7 @@
 #define XNAP_MAX_FRAME_HARD     (16 * 1024 * 1024)
 #define XNAP_DEFAULT_MAX_STREAM 256
 #define XNAP_STREAM_TABLE_CAP   512
+#define XNAP_PKT_NCLASS         3   /* freelist size classes */
 #define XNAP_RBUF_SIZE          65536
 #define XNAP_MAX_PONG_MISSES    2
 #define XNAP_RECONNECT_DELAY    1000
@@ -182,8 +183,8 @@ struct ngx_http_xngin_conn_s {
 
     ngx_xnap_pkt_t         *out;
     ngx_xnap_pkt_t        **out_tail;
-    ngx_xnap_pkt_t         *free_pkts;
-    ngx_uint_t              nfree_pkts;
+    ngx_xnap_pkt_t         *free_pkts[XNAP_PKT_NCLASS];
+    ngx_uint_t              nfree_pkts[XNAP_PKT_NCLASS];
 
     u_char                 *rbuf;
     u_char                 *rpos;
@@ -352,7 +353,6 @@ ngx_http_xngin_conn_t *ngx_http_xngin_conn_pick_caps(
    header fields (flen varint ≤9, type 1, flags 4, sid varint ≤9,
    fid varint ≤9) */
 #define XNAP_PKT_HEADROOM       32
-#define XNAP_PKT_FREE_MAX       64
 
 ngx_int_t   ngx_http_xngin_conn_send(ngx_http_xngin_conn_t *c, u_char type,
                 uint32_t flags, uint64_t sid, uint64_t fid,
