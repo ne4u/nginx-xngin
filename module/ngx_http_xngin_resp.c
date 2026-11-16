@@ -21,7 +21,7 @@ static ngx_http_output_body_filter_pt   ngx_http_xngin_next_body;
 
 static void    ngx_http_xngin_resp_timeout(ngx_event_t *ev);
 static ngx_int_t ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx);
-static void    ngx_http_xngin_resp_fail(ngx_http_xngin_ctx_t *rctx,
+void           ngx_http_xngin_resp_fail(ngx_http_xngin_ctx_t *rctx,
                    const char *err);
 static ngx_int_t ngx_http_xngin_resp_collect(ngx_http_request_t *r,
                    ngx_http_xngin_ctx_t *ctx, ngx_chain_t *in);
@@ -296,7 +296,9 @@ static ngx_int_t
 ngx_http_xngin_resp_eligible(ngx_http_request_t *r,
     ngx_http_xngin_ctx_t *ctx, ngx_http_xngin_loc_conf_t *lcf)
 {
-    if (ctx->resp_ctx || ctx->res_body_set || r->header_only) {
+    if (ctx->resp_ctx || ctx->res_body_set || r->header_only
+        || ctx->own_resp)
+    {
         return 0;
     }
 
@@ -312,13 +314,74 @@ ngx_http_xngin_resp_eligible(ngx_http_request_t *r,
         return 0;
     }
 
-    /* only responses that came from an upstream */
-    if (r->upstream == NULL || lcf->group == NULL) {
+    /* upstream AND local responses are inspected — the only exclusion
+       is content the module itself generated (own_resp above) */
+    if (lcf->group == NULL) {
         return 0;
     }
 
+    ngx_http_xngin_group_t *g = lcf->response_group
+                                ? lcf->response_group : lcf->group;
+
     /* hold only if some ready conn negotiated RESP */
-    return ngx_http_xngin_conn_pick_caps(lcf->group, XNAP_CAP_RESP) != NULL;
+    return ngx_http_xngin_conn_pick_caps(g, XNAP_CAP_RESP) != NULL;
+}
+
+
+/* response Content-Encoding → XNAP_DEC_*; name kept for the NOTIFY */
+static unsigned
+ngx_http_xngin_content_enc(ngx_http_request_t *r,
+    ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+    ngx_str_t        *v;
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len != sizeof("content-encoding") - 1
+            || ngx_strncasecmp(h[i].key.data,
+                               (u_char *) "content-encoding",
+                               h[i].key.len) != 0)
+        {
+            continue;
+        }
+
+        v = &h[i].value;
+        ctx->dec_name = *v;
+
+        if ((v->len == 4 && ngx_strncasecmp(v->data, (u_char *) "gzip", 4)
+             == 0)
+            || (v->len == 6
+                && ngx_strncasecmp(v->data, (u_char *) "x-gzip", 6) == 0)
+            || (v->len == 7
+                && ngx_strncasecmp(v->data, (u_char *) "deflate", 7) == 0))
+        {
+            return XNAP_DEC_GZIP;
+        }
+
+        if (v->len == 2
+            && ngx_strncasecmp(v->data, (u_char *) "br", 2) == 0)
+        {
+            return XNAP_DEC_BR;
+        }
+
+        return XNAP_DEC_NONE;   /* unknown encoding: leave bytes alone */
+    }
+
+    return XNAP_DEC_NONE;
 }
 
 
@@ -376,6 +439,7 @@ ngx_http_xngin_header_filter(ngx_http_request_t *r)
          */
         rctx = ngx_http_xngin_resp_ctx_new(r, ctx);
         if (rctx != NULL) {
+            ctx->decompress = ngx_http_xngin_content_enc(r, ctx);
             /* stream body frames only when a body is coming:
                CL > 0 or unknown (chunked); CL == 0 means none */
             rctx->body_stream = (r->headers_out.content_length_n != 0);
@@ -575,8 +639,11 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
         ctx->resp_held_tail = &nl->next;
         ctx->resp_held_len += n;
 
-        /* stream this chunk to the agent while the download continues */
-        if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+        /* stream this chunk to the agent while the download continues;
+           compressed bodies are inflated whole at last_buf instead */
+        if (rctx != NULL && rctx->body_stream && rctx->conn != NULL
+            && ctx->decompress == XNAP_DEC_NONE)
+        {
             t0 = ngx_http_xngin_now_us();
             ngx_http_xngin_resp_stream_send(rctx, data, n,
                 nb->last_buf || nb->last_in_chain);
@@ -645,7 +712,40 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
     /* body complete: the stream is fully delivered */
     ctx->resp_body_done = 1;
 
-    if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
+    if (rctx != NULL && rctx->body_stream && rctx->conn != NULL
+        && ctx->decompress != XNAP_DEC_NONE)
+    {
+        /*
+         * compressed body: inflate the held copy once and stream the
+         * plaintext to the agent; the wire bytes stay compressed.
+         * Failure is treated like a mid-download conn loss — the body
+         * is fully held so the fail policy can resolve it.
+         */
+        ngx_str_t   dec = ngx_null_string;
+        ngx_int_t   irc;
+
+        t0 = ngx_http_xngin_now_us();
+        irc = ngx_http_xngin_inflate(r, ctx->resp_held, &dec,
+                                     ctx->decompress, lcf->res_body_max);
+        rctx->enc_us += ngx_http_xngin_now_us() - t0;
+
+        if (irc == NGX_OK) {
+            ngx_http_xngin_resp_stream_send(rctx, dec.data, dec.len, 1);
+            t0 = ngx_http_xngin_now_us();
+            ngx_http_xngin_conn_flush_conn(rctx->conn);
+            rctx->sys_us += ngx_http_xngin_now_us() - t0;
+            rctx->body_stream = 0;
+            send_last = 0;
+        } else {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "xngin: response inflate failed (rc=%i)", irc);
+            rctx->body_stream = 0;
+            rctx->stream_failed = 1;
+            ngx_http_xngin_resp_fail(rctx, "inflate");
+            return NGX_OK;
+        }
+
+    } else if (rctx != NULL && rctx->body_stream && rctx->conn != NULL) {
         if (send_last) {
             /* the final buf carried no data — the LAST flag still
                has to reach the agent */
@@ -692,12 +792,11 @@ static ngx_int_t
 ngx_http_xngin_resp_notify(ngx_http_request_t *r,
     ngx_http_xngin_ctx_t *ctx, ngx_xnap_wbuf_t *wb, off_t body_len)
 {
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-    ngx_uint_t        i;
-    size_t            kvl_len;
-    ngx_str_t         msg = ngx_string("http-response");
-    u_char            vbuf[8], *v;
+    ngx_http_xngin_loc_conf_t *lcf;
+    ngx_str_t                  msg = ngx_string("http-response");
+    u_char                     vbuf[8], *v;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
     if (ngx_xnap_wbuf_varint(wb, msg.len) != NGX_OK
         || ngx_xnap_wbuf_bytes(wb, msg.data, msg.len) != NGX_OK)
@@ -732,68 +831,50 @@ ngx_http_xngin_resp_notify(ngx_http_request_t *r,
         ngx_xnap_wbuf_kv_ip(wb, "src-ip", r->connection->sockaddr);
     }
 
-    /* response headers as a KVL, lower-cased names: exact payload
-       length first, then entries straight into wb — no staging
-       buffer, no copy */
-    kvl_len = 0;
-
-    part = &r->headers_out.headers.part;
-    h = part->elts;
-
-    for (i = 0; ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].hash == 0 || h[i].key.len == 0) {
-            continue;
-        }
-
-        kvl_len += ngx_xnap_varint_len(h[i].key.len) + h[i].key.len
-                   + 1 + ngx_xnap_varint_len(h[i].value.len)
-                   + h[i].value.len;
+    /* response headers as a filtered KVL */
+    if (ngx_http_xngin_emit_headers(wb, "headers", &r->headers_out.headers,
+                                    lcf) != NGX_OK)
+    {
+        return NGX_ERROR;
     }
 
-    ngx_xnap_wbuf_kv_name(wb, "headers");
-    ngx_xnap_wbuf_u8(wb, XNAP_VT_KVL);
-    ngx_xnap_wbuf_varint(wb, kvl_len);
+    /* request context the response-side message lacks by default:
+       filtered request headers, JA4, and operator vars let a stateless
+       agent correlate this response with the caller */
+    if (ngx_http_xngin_emit_headers(wb, "req-headers",
+                                    &r->headers_in.headers, lcf)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
-    part = &r->headers_out.headers.part;
-    h = part->elts;
+#if (NGX_SSL)
+    {
+        ngx_http_xngin_hello_t *hello;
 
-    for (i = 0; ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
+        hello = ngx_http_xngin_tls_hello(r->connection);
+        if (hello && hello->ja4.len) {
+            ngx_xnap_wbuf_kv_str(wb, "ja4", hello->ja4.data,
+                                 hello->ja4.len);
         }
+    }
+#endif
 
-        if (h[i].hash == 0 || h[i].key.len == 0) {
-            continue;
-        }
-
-        ngx_xnap_wbuf_varint(wb, h[i].key.len);
-        ngx_xnap_wbuf_bytes(wb,
-                            h[i].lowcase_key ? h[i].lowcase_key
-                                             : h[i].key.data,
-                            h[i].key.len);
-        ngx_xnap_wbuf_u8(wb, XNAP_VT_STR);
-        ngx_xnap_wbuf_varint(wb, h[i].value.len);
-        ngx_xnap_wbuf_bytes(wb, h[i].value.data, h[i].value.len);
+    if (ngx_http_xngin_emit_vars(r, wb, lcf) != NGX_OK) {
+        return NGX_ERROR;
     }
 
     if (body_len > 0) {
         ngx_xnap_wbuf_kv_name(wb, "body-len");
         ngx_xnap_wbuf_u8(wb, XNAP_VT_UINT32);
         ngx_xnap_wbuf_varint(wb, body_len);
+    }
+
+    /* compressed wire body: the BODY frames carry the inflated bytes,
+       this field names the encoding the client actually receives */
+    if (ctx->decompress && ctx->dec_name.len) {
+        ngx_xnap_wbuf_kv_str(wb, "decompressed", ctx->dec_name.data,
+                             ctx->dec_name.len);
     }
 
     return NGX_OK;
@@ -860,7 +941,11 @@ ngx_http_xngin_resp_dispatch(ngx_http_xngin_ctx_t *rctx)
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
-    conn = ngx_http_xngin_conn_pick_caps(lcf->group, XNAP_CAP_RESP);
+    {
+        ngx_http_xngin_group_t *g = lcf->response_group
+                                    ? lcf->response_group : lcf->group;
+        conn = ngx_http_xngin_pick(g, XNAP_CAP_RESP, r);
+    }
     if (conn == NULL) {
         return NGX_BUSY;
     }
@@ -996,7 +1081,7 @@ ngx_http_xngin_resp_conn_failed(ngx_http_xngin_ctx_t *rctx)
 
 
 /* fail policy on the response path */
-static void
+void
 ngx_http_xngin_resp_fail(ngx_http_xngin_ctx_t *rctx, const char *err)
 {
     ngx_http_xngin_ctx_t      *ctx = rctx->parent;
@@ -1038,7 +1123,7 @@ ngx_http_xngin_resp_fail(ngx_http_xngin_ctx_t *rctx, const char *err)
 /* verdict on an http-response stream */
 ngx_int_t
 ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
-    ngx_http_xngin_ctx_t *rctx, u_char *payload, size_t len)
+    ngx_http_xngin_ctx_t *rctx, uint64_t sid, u_char *payload, size_t len)
 {
     ngx_http_request_t     *r;
     ngx_http_xngin_ctx_t   *ctx;
@@ -1053,8 +1138,10 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
     ngx_str_t               reason = ngx_null_string;
     ngx_int_t               rc;
     ngx_chain_t            *out;
+    ngx_http_xngin_loc_conf_t *lcf;
+    unsigned                 bstream = 0;
 
-    if (rctx->state != XNAP_ST_SENT) {
+    if (rctx->state != XNAP_ST_SENT || rctx->stream_id != sid) {
         return NGX_OK;
     }
 
@@ -1136,6 +1223,11 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
         else if (name.len == 5 && ngx_memcmp(name.data, "score", 5) == 0) {
             ctx->score = v.i;
         }
+        else if (name.len == 11
+                 && ngx_memcmp(name.data, "body-stream", 11) == 0)
+        {
+            bstream = (unsigned) v.u;
+        }
     }
 
     /* resp verdict res-hdr ops apply first, parent's second (parent wins
@@ -1171,6 +1263,23 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
         return NGX_OK;
     }
 
+    if (bstream) {
+        /*
+         * agent wants to stream the replacement body back on this
+         * stream: keep the stream registered (the early teardown above
+         * is undone) and wait for BODY frames terminated by LAST.
+         */
+        lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
+
+        ngx_http_xngin_stream_add(c, rctx->stream_id, rctx);
+        rctx->conn = c;
+        rctx->state = XNAP_ST_SENT;
+        rctx->repl_wait = 1;
+        rctx->retried = 1;   /* mid-replacement loss → fail, no retry */
+        ngx_add_timer(rctx->timer, lcf->timeout);
+        return NGX_OK;
+    }
+
     /* allow: optional status override / res-body replacement */
     if (status >= 200 && status < 600) {
         r->headers_out.status = status;
@@ -1194,6 +1303,33 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
     ngx_http_xngin_resp_finish(ctx);
 
     return NGX_OK;
+}
+
+
+/* streamed replacement complete (BODY LAST arrived): emit it */
+void
+ngx_http_xngin_resp_repl_done(ngx_http_xngin_ctx_t *rctx)
+{
+    ngx_http_xngin_ctx_t *ctx = rctx->parent;
+    ngx_http_request_t   *r = ctx->r;
+    ngx_chain_t          *cl;
+
+    if (rctx->repl == NULL) {
+        ngx_str_t empty = ngx_null_string;
+        rctx->repl = ngx_http_xngin_mem_chain(r, &empty);
+        if (rctx->repl == NULL) {
+            return;
+        }
+    } else {
+        /* mark the terminal buf so the write filter flushes */
+        for (cl = rctx->repl; cl->next; cl = cl->next) { }
+        cl->buf->last_buf = 1;
+        cl->buf->last_in_chain = 1;
+    }
+
+    ctx->res_body_set = 1;   /* release clears C-L/ETag */
+    ngx_http_xngin_resp_release(ctx, rctx->repl);
+    ngx_http_xngin_resp_finish(ctx);
 }
 
 

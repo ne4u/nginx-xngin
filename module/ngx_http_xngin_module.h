@@ -21,6 +21,16 @@
 #define XNAP_FRAME_ABORT        0x07
 #define XNAP_FRAME_PING         0x08
 #define XNAP_FRAME_PONG         0x09
+#define XNAP_FRAME_CONTROL      0x0A
+
+/* CONTROL ops target these ban stores */
+#define XNAP_BAN_IP             0
+#define XNAP_BAN_JA4            1
+
+/* held response content-encoding */
+#define XNAP_DEC_NONE           0
+#define XNAP_DEC_GZIP           1
+#define XNAP_DEC_BR             2
 
 /* value types */
 #define XNAP_VT_NULL    0x00
@@ -52,6 +62,7 @@
 #define XNAP_CAP_ASYNC  0x02
 #define XNAP_CAP_VCACHE 0x04
 #define XNAP_CAP_RESP   0x08
+#define XNAP_CAP_PUSH   0x10
 
 #define XNAP_DEFAULT_MAX_FRAME  16384
 /* absolute ceiling on a frame we will emit: keeps the frame-len arithmetic
@@ -198,6 +209,9 @@ struct ngx_http_xngin_conn_s {
     ngx_msec_t              last_rtt;
     ngx_uint_t              missed_pongs;
 
+    struct sockaddr_storage bound;      /* sockaddr this conn dialed */
+    socklen_t               bound_len;
+
     int64_t                 rx_us;      /* µs inside recv this read event */
 
     unsigned                ready:1;
@@ -207,6 +221,8 @@ struct ngx_http_xngin_conn_s {
     unsigned                ssl_ready:1;  /* TLS handshake complete */
 };
 
+#define XNAP_MAX_ADDRS          8
+
 struct ngx_http_xngin_agent_s {
     ngx_str_t                url_text;
     ngx_addr_t               addr;
@@ -214,6 +230,19 @@ struct ngx_http_xngin_agent_s {
     ngx_uint_t               max_streams;
     ngx_http_xngin_group_t  *group;
     ngx_http_xngin_conn_t   *conns;
+
+    /* "server ... resolve": DNS set refreshed by the group timer */
+    ngx_str_t                host;
+    in_port_t                port;
+    ngx_addr_t               addrs[XNAP_MAX_ADDRS];
+    struct sockaddr_storage  ss[XNAP_MAX_ADDRS];
+    ngx_uint_t               naddrs;
+    ngx_uint_t               rr;         /* connect addr cursor */
+    ngx_resolver_ctx_t      *rctx;       /* in-flight query */
+
+    unsigned                 backup:1;   /* used only when primaries out */
+    unsigned                 resolve:1;
+    unsigned                 resolving:1;
 };
 
 struct ngx_http_xngin_group_s {
@@ -222,6 +251,13 @@ struct ngx_http_xngin_group_s {
     ngx_uint_t               keepalive;
     ngx_msec_t               ping_interval;
     ngx_uint_t               max_streams;
+
+    ngx_http_complex_value_t *balance_cv; /* hash pick expr (NULL: least-
+                                             loaded pick) */
+    ngx_msec_t               resolve_interval; /* DNS refresh cadence */
+    ngx_resolver_t          *resolver;    /* http-level resolver */
+    ngx_event_t             *resolve_timer; /* per-worker refresh */
+    unsigned                 has_resolve:1;
 
     /* mTLS transport (SPEC.md §1.1): engine is the TLS client */
     unsigned                 ssl_on:1;
@@ -236,6 +272,11 @@ typedef struct {
     ngx_str_t                name;
     ngx_str_t                value;
 } ngx_http_xngin_var_t;
+
+typedef struct {
+    ngx_str_t                name;
+    ngx_http_complex_value_t *cv;
+} ngx_http_xngin_named_cv_t;
 
 struct ngx_http_xngin_ctx_s {
     ngx_http_request_t       *r;
@@ -266,6 +307,8 @@ struct ngx_http_xngin_ctx_s {
     unsigned                  in_handler:1;
     unsigned                  retried:1;
     unsigned                  dispatched:1;
+    unsigned                  counted:1;   /* r->main->count ref held */
+    ngx_uint_t                step;      /* chain position (lcf->steps) */
 
     int64_t                   sent_at;    /* µs, from ngx_timeofday */
     int64_t                   agent_rtt;  /* µs */
@@ -279,6 +322,7 @@ struct ngx_http_xngin_ctx_s {
     int64_t                   score;
     ngx_str_t                 reason;
     ngx_str_t                 error;      /* "", timeout, down, proto */
+    ngx_str_t                 agent_name; /* group server url ($xngin_agent) */
     ngx_array_t              *vars;       /* ngx_http_xngin_var_t */
     ngx_int_t                 deny_status;
     ngx_str_t                 deny_body;
@@ -293,16 +337,31 @@ struct ngx_http_xngin_ctx_s {
     ngx_str_t                 res_body;
     ngx_array_t              *res_hdr_set;   /* ngx_http_xngin_var_t */
     ngx_array_t              *res_hdr_unset; /* ngx_str_t */
+    ngx_str_t                 dec_name;      /* content-encoding seen */
 
     unsigned                  req_body_set:1;
     unsigned                  res_body_set:1;
     unsigned                  res_done:1;    /* replacement body emitted */
+
+    /* streamed replacement: verdict asked for BODY frames back on the
+       same stream; the agent streams the new body and terminates with
+       FL_BODY_LAST.  Applies to both req_body and res_body. */
+    unsigned                  repl_wait:1;   /* awaiting agent BODY frames */
+    ngx_chain_t              *repl;
+    ngx_chain_t             **repl_tail;
+    size_t                    repl_len;
+
+    /* held upstream response is compressed: agent gets the inflated
+       copy, the client gets the original wire bytes */
+    unsigned                  decompress;    /* XNAP_DEC_* */
 
     /* http-response round-trip (see ngx_http_xngin_resp.c) */
     unsigned                  is_resp:1;     /* this ctx is a resp stream */
     unsigned                  resp_hold:1;   /* headers held for verdict */
     unsigned                  resp_pass:1;   /* cap exceeded: passthrough */
     unsigned                  resp_sent:1;   /* output released */
+    unsigned                  own_resp:1;    /* module generated this
+                                                response — never inspect */
     ngx_http_xngin_ctx_t     *parent;        /* req ctx, when is_resp */
     ngx_http_xngin_ctx_t     *resp_ctx;      /* resp ctx, when !is_resp */
     ngx_chain_t              *resp_held;
@@ -313,6 +372,7 @@ struct ngx_http_xngin_ctx_s {
 typedef struct {
     ngx_array_t              *groups;     /* ngx_http_xngin_group_t */
     ngx_shm_zone_t           *cache_zone;
+    ngx_shm_zone_t           *ban_zone;
 } ngx_http_xngin_main_conf_t;
 
 typedef struct {
@@ -326,10 +386,22 @@ typedef struct {
     ngx_str_t                 ja4_raw;   /* unhashed JA4_r, debugging */
 } ngx_http_xngin_hello_t;
 
+/* one leg of a sequential group chain: `xngin_group name [params]` */
+typedef struct {
+    ngx_str_t                 group_name;
+    ngx_http_xngin_group_t   *group;
+    ngx_msec_t                timeout;   /* NGX_CONF_UNSET_MSEC: inherit */
+    ngx_uint_t                fail;      /* NGX_CONF_UNSET_UINT: inherit */
+    ngx_uint_t                mode;      /* NGX_CONF_UNSET_UINT: inherit */
+} ngx_http_xngin_step_t;
+
 typedef struct {
     ngx_flag_t                enable;
     ngx_str_t                 group_name;
     ngx_http_xngin_group_t   *group;
+    ngx_array_t              *steps;       /* ngx_http_xngin_step_t */
+    ngx_str_t                 response_group_name;
+    ngx_http_xngin_group_t   *response_group;
     ngx_uint_t                mode;
     ngx_msec_t                timeout;
     ngx_uint_t                fail;
@@ -340,6 +412,11 @@ typedef struct {
     ngx_flag_t                response;
     size_t                    res_body_max;
     ngx_http_complex_value_t *cache_key;   /* engine-side cache key tpl */
+    ngx_array_t              *vars;        /* ngx_http_xngin_named_cv_t */
+    ngx_array_t              *hdr_include; /* ngx_str_t (lowercase) */
+    ngx_array_t              *hdr_exclude; /* ngx_str_t (lowercase) */
+    ngx_flag_t                internal_req; /* consult agent on internal
+                                               redirects/subrequests */
 } ngx_http_xngin_loc_conf_t;
 
 typedef struct {
@@ -348,6 +425,7 @@ typedef struct {
     ngx_queue_t               queue;
     ngx_uint_t                nhit;
     ngx_uint_t                nmiss;
+    ngx_uint_t                nentries;
 } ngx_http_xngin_cache_shctx_t;
 
 /* ---------- conn layer ---------- */
@@ -359,6 +437,8 @@ void        ngx_http_xngin_conn_free_worker(ngx_http_xngin_main_conf_t *mmcf,
 ngx_http_xngin_conn_t *ngx_http_xngin_conn_pick(ngx_http_xngin_group_t *g);
 ngx_http_xngin_conn_t *ngx_http_xngin_conn_pick_caps(
                 ngx_http_xngin_group_t *g, uint32_t caps);
+ngx_http_xngin_conn_t *ngx_http_xngin_pick(ngx_http_xngin_group_t *g,
+                uint32_t caps, ngx_http_request_t *r);
 /* headroom reserved in every pkt for the frame-length varint + frame
    header fields (flen varint ≤9, type 1, flags 4, sid varint ≤9,
    fid varint ≤9) */
@@ -406,16 +486,34 @@ void        ngx_http_xngin_stream_del(ngx_http_xngin_conn_t *c, uint64_t sid);
 
 ngx_int_t   ngx_http_xngin_dispatch(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx);
+ngx_int_t   ngx_http_xngin_advance(ngx_http_request_t *r,
+                ngx_http_xngin_ctx_t *ctx,
+                ngx_http_xngin_loc_conf_t *lcf);
 void        ngx_http_xngin_ctx_abort(ngx_http_xngin_ctx_t *ctx);
 void        ngx_http_xngin_timeout(ngx_event_t *ev);
 ngx_int_t   ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c,
-                ngx_http_xngin_ctx_t *ctx, u_char *payload, size_t len);
+                ngx_http_xngin_ctx_t *ctx, uint64_t sid,
+                u_char *payload, size_t len);
+ngx_msec_t  ngx_http_xngin_step_timeout(ngx_http_xngin_loc_conf_t *lcf,
+                ngx_http_xngin_ctx_t *ctx);
+ngx_uint_t  ngx_http_xngin_step_fail(ngx_http_xngin_loc_conf_t *lcf,
+                ngx_http_xngin_ctx_t *ctx);
+ngx_uint_t  ngx_http_xngin_step_mode(ngx_http_xngin_loc_conf_t *lcf,
+                ngx_http_xngin_ctx_t *ctx);
 ngx_int_t   ngx_http_xngin_build_notify(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_xnap_wbuf_t *wb);
+unsigned    ngx_http_xngin_hdr_pass(ngx_http_xngin_loc_conf_t *lcf,
+                ngx_str_t *key);
+ngx_int_t   ngx_http_xngin_emit_headers(ngx_xnap_wbuf_t *wb,
+                const char *kvl_name, ngx_list_t *list,
+                ngx_http_xngin_loc_conf_t *lcf);
+ngx_int_t   ngx_http_xngin_emit_vars(ngx_http_request_t *r,
+                ngx_xnap_wbuf_t *wb, ngx_http_xngin_loc_conf_t *lcf);
 ngx_int_t   ngx_http_xngin_send_body(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx);
 void        ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx);
+ngx_int_t   ngx_http_xngin_deny_content(ngx_http_request_t *r);
 void        ngx_http_xngin_parse_vars(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, u_char *data, size_t len);
 void        ngx_http_xngin_parse_res_hdr_set(ngx_http_request_t *r,
@@ -434,7 +532,8 @@ ngx_int_t   ngx_http_xngin_header_filter(ngx_http_request_t *r);
 ngx_int_t   ngx_http_xngin_body_filter(ngx_http_request_t *r,
                 ngx_chain_t *in);
 ngx_int_t   ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
-                ngx_http_xngin_ctx_t *ctx, u_char *payload, size_t len);
+                ngx_http_xngin_ctx_t *ctx, uint64_t sid,
+                u_char *payload, size_t len);
 void        ngx_http_xngin_resp_conn_failed(ngx_http_xngin_ctx_t *ctx);
 void        ngx_http_xngin_resp_release(ngx_http_xngin_ctx_t *ctx,
                 ngx_chain_t *body);
@@ -449,12 +548,43 @@ ngx_http_xngin_hello_t *ngx_http_xngin_tls_hello(ngx_connection_t *c);
 
 ngx_int_t   ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_str_t *key,
-                ngx_int_t *out_status, int64_t *out_score,
-                ngx_str_t *out_reason);
+                ngx_int_t *out_status);
 void        ngx_http_xngin_cache_store(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, uint32_t ttl);
+void        ngx_http_xngin_cache_drop(ngx_http_xngin_main_conf_t *mmcf,
+                ngx_str_t *key);
+
+/* ---------- ban store + CONTROL ---------- */
+
+ngx_int_t   ngx_http_xngin_ban_zone_init(ngx_shm_zone_t *shm_zone,
+                void *data);
+void        ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf,
+                ngx_uint_t kind, ngx_str_t *key, uint32_t ttl);
+ngx_int_t   ngx_http_xngin_ban_check(ngx_http_xngin_main_conf_t *mmcf,
+                ngx_uint_t kind, ngx_str_t *key);
+ngx_int_t   ngx_http_xngin_control(ngx_http_xngin_conn_t *c,
+                u_char *payload, size_t len);
+
+/* ---------- streamed replacement / decompress ---------- */
+
+ngx_int_t   ngx_http_xngin_repl_body(ngx_http_xngin_conn_t *c,
+                ngx_http_xngin_ctx_t *ctx, uint32_t flags,
+                u_char *payload, size_t len);
+ngx_int_t   ngx_http_xngin_inflate(ngx_http_request_t *r,
+                ngx_chain_t *in, ngx_str_t *out, unsigned enc,
+                size_t cap);
+void        ngx_http_xngin_req_repl_done(ngx_http_xngin_ctx_t *ctx);
+void        ngx_http_xngin_resp_repl_done(ngx_http_xngin_ctx_t *ctx);
+void        ngx_http_xngin_fail(ngx_http_xngin_ctx_t *ctx,
+                const char *err);
+void        ngx_http_xngin_resp_fail(ngx_http_xngin_ctx_t *ctx,
+                const char *err);
 ngx_int_t   ngx_http_xngin_cache_zone_init(ngx_shm_zone_t *shm_zone,
                 void *data);
+
+/* ---------- status endpoint ---------- */
+
+ngx_int_t   ngx_http_xngin_status_handler(ngx_http_request_t *r);
 
 /* ---------- module glue ---------- */
 

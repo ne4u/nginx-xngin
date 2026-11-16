@@ -1,8 +1,11 @@
 #include "ngx_http_xngin_module.h"
 
 
-static void  ngx_http_xngin_fail(ngx_http_xngin_ctx_t *ctx,
+void         ngx_http_xngin_fail(ngx_http_xngin_ctx_t *ctx,
                 const char *err);
+static ngx_int_t ngx_http_xngin_chain_next(ngx_http_request_t *r,
+                ngx_http_xngin_ctx_t *ctx,
+                ngx_http_xngin_loc_conf_t *lcf);
 static ngx_int_t ngx_http_xngin_body_in_mem(ngx_http_request_t *r);
 static ngx_int_t ngx_http_xngin_hdr_set(ngx_http_request_t *r,
                 ngx_str_t *name, ngx_str_t *value);
@@ -14,15 +17,190 @@ void         ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
 
 /* ---------- NOTIFY construction ---------- */
 
+/* include/exclude gate for one header name (headers_in keys are already
+   lowercase; configured names are stored lowercase too) */
+unsigned
+ngx_http_xngin_hdr_pass(ngx_http_xngin_loc_conf_t *lcf, ngx_str_t *key)
+{
+    ngx_str_t   *f;
+    ngx_uint_t   i;
+
+    if (lcf->hdr_include) {
+        unsigned found = 0;
+
+        f = lcf->hdr_include->elts;
+        for (i = 0; i < lcf->hdr_include->nelts; i++) {
+            if (f[i].len == key->len
+                && ngx_strncasecmp(f[i].data, key->data, key->len) == 0)
+            {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            return 0;
+        }
+    }
+
+    if (lcf->hdr_exclude) {
+        f = lcf->hdr_exclude->elts;
+        for (i = 0; i < lcf->hdr_exclude->nelts; i++) {
+            if (f[i].len == key->len
+                && ngx_strncasecmp(f[i].data, key->data, key->len) == 0)
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+
+/* shared two-pass KVL header emitter (http-request "headers" and
+   http-response "headers"/"req-headers"): exact payload length first,
+   then entries straight into wb — no staging buffer, no copy */
+ngx_int_t
+ngx_http_xngin_emit_headers(ngx_xnap_wbuf_t *wb, const char *kvl_name,
+    ngx_list_t *list, ngx_http_xngin_loc_conf_t *lcf)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+    size_t            kvl_len = 0;
+
+    part = &list->part;
+    h = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0 || h[i].key.len == 0) {
+            continue;
+        }
+
+        if (!ngx_http_xngin_hdr_pass(lcf, &h[i].key)) {
+            continue;
+        }
+
+        kvl_len += ngx_xnap_varint_len(h[i].key.len) + h[i].key.len
+                   + 1 + ngx_xnap_varint_len(h[i].value.len)
+                   + h[i].value.len;
+    }
+
+    if (ngx_xnap_wbuf_kv_name(wb, kvl_name) != NGX_OK
+        || ngx_xnap_wbuf_u8(wb, XNAP_VT_KVL) != NGX_OK
+        || ngx_xnap_wbuf_varint(wb, kvl_len) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    part = &list->part;
+    h = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0 || h[i].key.len == 0) {
+            continue;
+        }
+
+        if (!ngx_http_xngin_hdr_pass(lcf, &h[i].key)) {
+            continue;
+        }
+
+        if (ngx_xnap_wbuf_varint(wb, h[i].key.len) != NGX_OK
+            || ngx_xnap_wbuf_bytes(wb,
+                    h[i].lowcase_key ? h[i].lowcase_key : h[i].key.data,
+                    h[i].key.len) != NGX_OK
+            || ngx_xnap_wbuf_u8(wb, XNAP_VT_STR) != NGX_OK
+            || ngx_xnap_wbuf_varint(wb, h[i].value.len) != NGX_OK
+            || ngx_xnap_wbuf_bytes(wb, h[i].value.data, h[i].value.len)
+               != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+/* xngin_var entries as a "vars" KVL — forwarded nginx variables */
+ngx_int_t
+ngx_http_xngin_emit_vars(ngx_http_request_t *r, ngx_xnap_wbuf_t *wb,
+    ngx_http_xngin_loc_conf_t *lcf)
+{
+    ngx_http_xngin_named_cv_t *v;
+    ngx_str_t                 *vals;
+    ngx_uint_t                 i;
+    size_t                     kvl_len = 0;
+
+    if (lcf->vars == NULL || lcf->vars->nelts == 0) {
+        return NGX_OK;
+    }
+
+    vals = ngx_pnalloc(r->pool, lcf->vars->nelts * sizeof(ngx_str_t));
+    if (vals == NULL) {
+        return NGX_ERROR;
+    }
+
+    v = lcf->vars->elts;
+
+    for (i = 0; i < lcf->vars->nelts; i++) {
+        if (ngx_http_complex_value(r, v[i].cv, &vals[i]) != NGX_OK) {
+            vals[i].len = 0;
+            vals[i].data = NULL;
+        }
+        kvl_len += ngx_xnap_varint_len(v[i].name.len) + v[i].name.len
+                   + 1 + ngx_xnap_varint_len(vals[i].len) + vals[i].len;
+    }
+
+    if (ngx_xnap_wbuf_kv_name(wb, "vars") != NGX_OK
+        || ngx_xnap_wbuf_u8(wb, XNAP_VT_KVL) != NGX_OK
+        || ngx_xnap_wbuf_varint(wb, kvl_len) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < lcf->vars->nelts; i++) {
+        if (ngx_xnap_wbuf_varint(wb, v[i].name.len) != NGX_OK
+            || ngx_xnap_wbuf_bytes(wb, v[i].name.data, v[i].name.len)
+               != NGX_OK
+            || ngx_xnap_wbuf_u8(wb, XNAP_VT_STR) != NGX_OK
+            || ngx_xnap_wbuf_varint(wb, vals[i].len) != NGX_OK
+            || (vals[i].len
+                && ngx_xnap_wbuf_bytes(wb, vals[i].data, vals[i].len)
+                   != NGX_OK))
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 ngx_int_t
 ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
     ngx_xnap_wbuf_t *wb)
 {
-    ngx_list_part_t        *part;
-    ngx_table_elt_t        *h;
-    ngx_uint_t              i;
-    size_t                  kvl_len;
     struct sockaddr        *sa;
+    ngx_http_xngin_loc_conf_t *lcf;
 
     /* message name */
     ngx_str_t msg = ngx_string("http-request");
@@ -31,6 +209,8 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
     {
         return NGX_ERROR;
     }
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
     ngx_xnap_wbuf_kv_str(wb, "method",
                        r->method_name.data, r->method_name.len);
@@ -54,62 +234,11 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
         ngx_xnap_wbuf_kv_str(wb, "http-version", vbuf, v - vbuf);
     }
 
-    /* headers as nested KVL: exact payload length first, then entries
-       straight into wb (the reserved send pkt on the fast path) —
-       no staging buffer, no copy */
-    kvl_len = 0;
-
-    part = &r->headers_in.headers.part;
-    h = part->elts;
-
-    for (i = 0; ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].hash == 0) {
-            continue;
-        }
-
-        kvl_len += ngx_xnap_varint_len(h[i].key.len) + h[i].key.len
-                   + 1 + ngx_xnap_varint_len(h[i].value.len)
-                   + h[i].value.len;
-    }
-
-    ngx_xnap_wbuf_kv_name(wb, "headers");
-    ngx_xnap_wbuf_u8(wb, XNAP_VT_KVL);
-    ngx_xnap_wbuf_varint(wb, kvl_len);
-
-    part = &r->headers_in.headers.part;
-    h = part->elts;
-
-    for (i = 0; ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].hash == 0) {
-            continue;
-        }
-
-        ngx_xnap_wbuf_varint(wb, h[i].key.len);
-        ngx_xnap_wbuf_bytes(wb,
-                            h[i].lowcase_key ? h[i].lowcase_key
-                                             : h[i].key.data,
-                            h[i].key.len);
-        ngx_xnap_wbuf_u8(wb, XNAP_VT_STR);
-        ngx_xnap_wbuf_varint(wb, h[i].value.len);
-        ngx_xnap_wbuf_bytes(wb, h[i].value.data, h[i].value.len);
+    /* request headers as a filtered KVL */
+    if (ngx_http_xngin_emit_headers(wb, "headers", &r->headers_in.headers,
+                                    lcf) != NGX_OK)
+    {
+        return NGX_ERROR;
     }
 
     /* connection info */
@@ -201,10 +330,8 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
     }
 
     {
-        ngx_http_xngin_loc_conf_t *lcf;
         unsigned has_body;
 
-        lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
         has_body = ngx_http_xngin_body_in_mem(r);
 
         if (lcf->body_inspect
@@ -216,7 +343,8 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
         }
     }
 
-    return NGX_OK;
+    /* operator-configured variable forwarding */
+    return ngx_http_xngin_emit_vars(r, wb, lcf);
 }
 
 
@@ -329,10 +457,19 @@ ngx_http_xngin_send_body(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
 static size_t
 ngx_http_xngin_notify_bound(ngx_http_request_t *r)
 {
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-    ngx_uint_t        i;
-    size_t            bound = 1024;   /* fixed fields + TLS strings */
+    ngx_list_part_t           *part;
+    ngx_table_elt_t           *h;
+    ngx_uint_t                 i;
+    ngx_http_xngin_loc_conf_t *lcf;
+    size_t                     bound = 1024;   /* fixed fields + TLS strings */
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
+
+    /* xngin_var values: name + generous 256B per value; a bigger value
+       just misses the fast path and falls back to the pool wbuf */
+    if (lcf->vars) {
+        bound += lcf->vars->nelts * 280;
+    }
 
     bound += r->unparsed_uri.len + r->method_name.len + r->schema.len;
     if (r->headers_in.host) {
@@ -516,7 +653,11 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
-    conn = ngx_http_xngin_conn_pick(lcf->group);
+    {
+        ngx_http_xngin_step_t *st;
+        st = ((ngx_http_xngin_step_t *) lcf->steps->elts) + ctx->step;
+        conn = ngx_http_xngin_pick(st->group, 0, r);
+    }
     if (conn == NULL) {
         return NGX_BUSY;
     }
@@ -525,6 +666,7 @@ ngx_http_xngin_dispatch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx)
                && (ctx->body_stream || ngx_http_xngin_body_in_mem(r));
 
     ctx->conn = conn;
+    ctx->agent_name = conn->agent->url_text;
     ctx->stream_id = conn->next_sid;
     conn->next_sid += 2;
     ctx->frame_id = 0;
@@ -657,6 +799,52 @@ ngx_http_xngin_ctx_abort(ngx_http_xngin_ctx_t *ctx)
 }
 
 
+/* ---------- sequential-step helpers ---------- */
+
+static ngx_http_xngin_step_t *
+ngx_http_xngin_cur_step(ngx_http_xngin_loc_conf_t *lcf,
+    ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_http_xngin_step_t *st = lcf->steps->elts;
+
+    if (ctx->step >= lcf->steps->nelts) {
+        return &st[lcf->steps->nelts - 1];
+    }
+    return &st[ctx->step];
+}
+
+
+ngx_msec_t
+ngx_http_xngin_step_timeout(ngx_http_xngin_loc_conf_t *lcf,
+    ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_http_xngin_step_t *st = ngx_http_xngin_cur_step(lcf, ctx);
+
+    return (st->timeout != NGX_CONF_UNSET_MSEC) ? st->timeout
+                                                : lcf->timeout;
+}
+
+
+ngx_uint_t
+ngx_http_xngin_step_fail(ngx_http_xngin_loc_conf_t *lcf,
+    ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_http_xngin_step_t *st = ngx_http_xngin_cur_step(lcf, ctx);
+
+    return (st->fail != NGX_CONF_UNSET_UINT) ? st->fail : lcf->fail;
+}
+
+
+ngx_uint_t
+ngx_http_xngin_step_mode(ngx_http_xngin_loc_conf_t *lcf,
+    ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_http_xngin_step_t *st = ngx_http_xngin_cur_step(lcf, ctx);
+
+    return (st->mode != NGX_CONF_UNSET_UINT) ? st->mode : lcf->mode;
+}
+
+
 /* ---------- timeout / failure ---------- */
 
 void
@@ -690,7 +878,8 @@ ngx_http_xngin_timeout(ngx_event_t *ev)
                 ngx_http_xngin_loc_conf_t *lcf;
                 lcf = ngx_http_get_module_loc_conf(r,
                                                    ngx_http_xngin_module);
-                ngx_add_timer(ctx->timer, lcf->timeout);
+                ngx_add_timer(ctx->timer,
+                              ngx_http_xngin_step_timeout(lcf, ctx));
             }
             return;
         }
@@ -701,9 +890,14 @@ ngx_http_xngin_timeout(ngx_event_t *ev)
 
 
 void
-ngx_http_xngin_ctx_conn_failed(ngx_http_xngin_ctx_t *ctx)
+ngx_http_xngin_ctx_conn_failed(ngx_http_xngin_ctx_t *ctx, uint64_t sid)
 {
     ngx_http_request_t *r = ctx->r;
+
+    if (ctx->stream_id != sid) {
+        /* stale stream from an earlier chain step — the ctx moved on */
+        return;
+    }
 
     ctx->conn = NULL;
 
@@ -741,7 +935,7 @@ ngx_http_xngin_ctx_conn_failed(ngx_http_xngin_ctx_t *ctx)
 }
 
 
-static void
+void
 ngx_http_xngin_fail(ngx_http_xngin_ctx_t *ctx, const char *err)
 {
     ngx_http_xngin_loc_conf_t *lcf;
@@ -755,7 +949,13 @@ ngx_http_xngin_fail(ngx_http_xngin_ctx_t *ctx, const char *err)
         return;
     }
 
-    if (lcf->fail == XNAP_FAIL_OPEN) {
+    if (ngx_http_xngin_step_fail(lcf, ctx) == XNAP_FAIL_OPEN) {
+        /* a mid-chain fail-open step doesn't block the request —
+           later steps still apply */
+        if (ctx->step + 1 < lcf->steps->nelts) {
+            ngx_http_xngin_chain_next(r, ctx, lcf);
+            return;
+        }
         ngx_http_xngin_resume(r, NGX_DECLINED);
     } else {
         ngx_http_xngin_resume(r, NGX_HTTP_SERVICE_UNAVAILABLE);
@@ -763,9 +963,52 @@ ngx_http_xngin_fail(ngx_http_xngin_ctx_t *ctx, const char *err)
 }
 
 
+/* streamed request-body replacement complete (BODY LAST arrived):
+   flatten the accumulated chain into req_body and continue like an
+   allow verdict at the current step */
+void
+ngx_http_xngin_req_repl_done(ngx_http_xngin_ctx_t *ctx)
+{
+    ngx_http_request_t        *r = ctx->r;
+    ngx_http_xngin_loc_conf_t *lcf;
+    ngx_chain_t               *cl;
+    u_char                    *p;
+    unsigned                   final_step;
+
+    ctx->req_body.data = ngx_pnalloc(r->pool,
+                                     ctx->repl_len ? ctx->repl_len : 1);
+    if (ctx->req_body.data == NULL) {
+        ngx_http_xngin_fail(ctx, "nomem");
+        return;
+    }
+
+    p = ctx->req_body.data;
+    for (cl = ctx->repl; cl; cl = cl->next) {
+        if (cl->buf) {
+            p = ngx_cpymem(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
+        }
+    }
+    ctx->req_body.len = p - ctx->req_body.data;
+    ctx->req_body_set = 1;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
+    final_step = (ctx->step + 1 >= lcf->steps->nelts);
+
+    if (!final_step && ngx_http_xngin_chain_next(r, ctx, lcf)) {
+        return;
+    }
+
+    if (ctx->body_read) {
+        ngx_http_xngin_apply_req_body(r, ctx);
+    }
+
+    ngx_http_xngin_resume(r, NGX_DECLINED);
+}
+
+
 /* ---------- deny content handler (custom body) ---------- */
 
-static ngx_int_t
+ngx_int_t
 ngx_http_xngin_deny_content(ngx_http_request_t *r)
 {
     ngx_http_xngin_ctx_t *ctx;
@@ -778,6 +1021,7 @@ ngx_http_xngin_deny_content(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    ctx->own_resp = 1;
     r->headers_out.status = ctx->deny_status;
     r->headers_out.content_length_n = ctx->deny_body.len;
 
@@ -1132,9 +1376,28 @@ ngx_http_xngin_apply_req_body(ngx_http_request_t *r,
 }
 
 
+/* advance a sequential group chain past the just-allowed step: dispatch
+   the next step while the request stays suspended.  Always consumes
+   the verdict — returns 1 so the caller can simply return NGX_OK. */
+static ngx_int_t
+ngx_http_xngin_chain_next(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
+    ngx_http_xngin_loc_conf_t *lcf)
+{
+    ctx->step++;
+
+    if (ngx_http_xngin_advance(r, ctx, lcf)) {
+        return 1;      /* suspended on the new step */
+    }
+
+    /* chain resolved inline (async tail / fail-open skips) */
+    ngx_http_xngin_resume(r, ctx->status);
+    return 1;
+}
+
+
 ngx_int_t
 ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
-    u_char *payload, size_t len)
+    uint64_t sid, u_char *payload, size_t len)
 {
     ngx_http_request_t        *r = ctx->r;
     ngx_http_xngin_loc_conf_t *lcf;
@@ -1146,10 +1409,12 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
     ngx_str_t                  location = ngx_null_string;
     uint64_t                   cache_ttl = 0;
     unsigned                   mutable = 0;   /* verdict has side effects */
+    unsigned                   bstream = 0;
+    unsigned                   final_step;
     ngx_int_t                  rc;
 
-    if (ctx->state != XNAP_ST_SENT) {
-        return NGX_OK;
+    if (ctx->state != XNAP_ST_SENT || ctx->stream_id != sid) {
+        return NGX_OK;        /* stale frame for an earlier chain step */
     }
 
     ctx->agent_rtt = ngx_http_xngin_now_us() - ctx->sent_at;
@@ -1182,7 +1447,7 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
             ctx->deny_body.data = ngx_pnalloc(r->pool, v.s.len);
             ngx_memcpy(ctx->deny_body.data, v.s.data, v.s.len);
             ctx->deny_body.len = v.s.len;
-            mutable = 1;
+            /* deny payload — cacheable */
         }
         else if (name.len == 12
                  && ngx_memcmp(name.data, "content-type", 12) == 0)
@@ -1224,13 +1489,12 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
                  && ngx_memcmp(name.data, "res-hdr-set", 11) == 0)
         {
             ngx_http_xngin_parse_res_hdr_set(r, ctx, v.sub, v.sub_len);
-            mutable = 1;
+            /* response-header ops replay identically — cacheable */
         }
         else if (name.len == 13
                  && ngx_memcmp(name.data, "res-hdr-unset", 13) == 0)
         {
             ngx_http_xngin_parse_res_hdr_unset(r, ctx, v.sub, v.sub_len, v.u);
-            mutable = 1;
         }
         else if (name.len == 8
                  && ngx_memcmp(name.data, "res-body", 8) == 0)
@@ -1263,6 +1527,11 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
         else if (name.len == 5 && ngx_memcmp(name.data, "score", 5) == 0) {
             ctx->score = v.i;
         }
+        else if (name.len == 11
+                 && ngx_memcmp(name.data, "body-stream", 11) == 0)
+        {
+            bstream = (unsigned) v.u;
+        }
     }
 
     ctx->action = action;
@@ -1279,9 +1548,30 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
      * alive.  Resume treats early_close as "run phases now".
      */
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
+    final_step = (ctx->step + 1 >= lcf->steps->nelts);
 
     /* apply */
     if (action.len == 5 && ngx_memcmp(action.data, "allow", 5) == 0) {
+        if (bstream) {
+            /*
+             * streamed request-body replacement: keep the stream
+             * registered (undoing the early teardown above) and wait
+             * for the agent's BODY frames, terminated by LAST.
+             */
+            ngx_http_xngin_stream_add(c, ctx->stream_id, ctx);
+            ctx->conn = c;
+            ctx->state = XNAP_ST_SENT;
+            ctx->repl_wait = 1;
+            ctx->retried = 1;   /* mid-replacement loss → fail */
+            ngx_add_timer(ctx->timer,
+                          ngx_http_xngin_step_timeout(lcf, ctx));
+            return NGX_OK;
+        }
+        if (!final_step
+            && ngx_http_xngin_chain_next(r, ctx, lcf))
+        {
+            return NGX_OK;
+        }
         if (ctx->req_body_set && ctx->body_read) {
             /* mid-upload early verdict: body_post applies once the
                read machinery has finished with rb->bufs */
@@ -1303,7 +1593,7 @@ ngx_http_xngin_verdict(ngx_http_xngin_conn_t *c, ngx_http_xngin_ctx_t *ctx,
             ctx->early_close = 1;
         }
 
-        if (ctx->cache_key_val.len && cache_ttl && !mutable) {
+        if (ctx->cache_key_val.len && cache_ttl && !mutable && final_step) {
             ngx_http_xngin_cache_store(r, ctx, &ctx->cache_key_val,
                                        (uint32_t) cache_ttl);
         }

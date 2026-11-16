@@ -22,6 +22,7 @@ const (
 	FrameAbort       = 0x07
 	FramePing        = 0x08
 	FramePong        = 0x09
+	FrameControl     = 0x0A
 )
 
 // Value types.
@@ -61,6 +62,7 @@ const (
 	CapAsync  = 0x02
 	CapVCache = 0x04
 	CapResp   = 0x08
+	CapPush   = 0x10
 )
 
 // DefaultMaxFrame is the SPEC default max-frame-size.

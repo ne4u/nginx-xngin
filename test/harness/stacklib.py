@@ -37,7 +37,7 @@ http {{
                         'cache=$xngin_cache rule=$xngin_rule '
                         'ja4=$xngin_ja4 aja4=$xngin_agent_ja4 '
                         'aja4r=$xngin_agent_ja4_r jm=$xngin_ja4_match '
-                        'res=$xngin_res_rule';
+                        'res=$xngin_res_rule agent=$xngin_agent';
     access_log {root}/logs/access.log xnginlog;
 
     {main_extra}
@@ -50,12 +50,13 @@ http {{
 
         location / {{
             xngin_enable on;
-            xngin_group waf;
+            {loc_group}
             xngin_timeout {timeout};
             xngin_fail {fail};
             {loc_extra}
             proxy_pass http://backend;
         }}
+        {loc_blocks}
     }}
 }}
 """
@@ -190,7 +191,10 @@ class Stack:
                  loc_extra="", main_extra="", tcp_agents=False,
                  loglevel="warn", ssl=False, srv_extra="",
                  http_ready=True, sub="", go_agent=None, mtls=False,
-                 agent_tls=True, client_cert=True, wrong_ca=False):
+                 agent_tls=True, client_cert=True, wrong_ca=False,
+                 loc_blocks="", server_hosts=None, server_suffix=None,
+                 group_extra="", extra_groups=None,
+                 loc_group="xngin_group waf;"):
         if sub:
             root = os.path.join(root, sub)
         self.root = root
@@ -223,8 +227,14 @@ class Stack:
                        for i, r in enumerate(agents_rules)]
         if go_agent:
             self.agents[0].cmd = go_agent
-        servers = "\n        ".join(
-            f"server {a.addr};" for a in self.agents)
+        lines = []
+        for i, a in enumerate(self.agents):
+            addr = a.addr
+            if server_hosts and server_hosts[i] and a.tcp:
+                addr = f"{server_hosts[i]}:{a.port}"
+            sfx = server_suffix[i] if server_suffix else ""
+            lines.append(f"server {addr}{sfx};")
+        servers = "\n        ".join(lines)
 
         tls_conf = ""
         if mtls:
@@ -242,13 +252,23 @@ class Stack:
             tls_conf = "\n        ".join(lines)
 
         self.conf = os.path.join(root, "nginx.conf")
+        groups = ""
+        for gname, addrs in (extra_groups or {}).items():
+            srvs = "\n        ".join(
+                f"server {a if isinstance(a, str) else self.agents[a].addr};"
+                for a in addrs)
+            groups += (f"\n    xngin_agent_group {gname} {{\n"
+                       f"        {srvs}\n        keepalive 1;\n    }}\n")
+
         main = f"""
     xngin_agent_group waf {{
         {servers}
+        {group_extra}
         {tls_conf}
         keepalive 1;
         ping_interval 60s;
     }}
+{groups}
 {main_extra}"""
         with open(self.conf, "w") as f:
             f.write(NGINX_CONF.format(
@@ -257,7 +277,9 @@ class Stack:
                 listen_port=self.listen_port, listen_opts=listen_opts,
                 srv_extra=srv_extra,
                 timeout=timeout, fail=fail,
-                loc_extra=loc_extra, main_extra=main))
+                loc_extra=loc_extra, loc_blocks=loc_blocks,
+                loc_group=loc_group,
+                main_extra=main))
         self.procs = []
 
     def url(self, path="/"):

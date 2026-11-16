@@ -3,6 +3,7 @@ package xngin
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"log"
 	"net"
 	"strings"
@@ -59,8 +60,13 @@ type Verdict struct {
 	ResBody  []byte
 	Vars     map[string]string // exposed as $xngin_<name>
 	CacheTTL uint32            // >0 lets engine cache this verdict
-	Reason   string
-	Score    int64
+	// BodyStream asks the engine to keep the decision stream open so the
+	// agent can stream a replacement body back via BODY frames on the
+	// same sid (terminated by FL_BODY_LAST). Replaces ResBody/ReqBody
+	// for payloads larger than one frame.
+	BodyStream bool
+	Reason     string
+	Score      int64
 }
 
 // Allow is a shorthand allow verdict.
@@ -121,6 +127,9 @@ func (v *Verdict) marshalInto(out []byte) ([]byte, error) {
 	if v.CacheTTL > 0 {
 		put("cache-ttl", v.CacheTTL)
 	}
+	if v.BodyStream {
+		put("body-stream", uint32(1))
+	}
 	if v.Reason != "" {
 		put("reason", v.Reason)
 	}
@@ -173,6 +182,9 @@ type Server struct {
 	// engine connects as the TLS client. Build it with TLSConfig().
 	TLSConfig *tls.Config
 	Logger    *log.Logger // nil -> silent
+
+	connsMu sync.Mutex
+	conns   map[*writeQueue]struct{}
 }
 
 // Serve accepts XNAP connections on l until it is closed.
@@ -391,11 +403,23 @@ func (s *Server) serveConn(c net.Conn) {
 	)
 	wq := newWriteQueue(c)
 
+	s.connsMu.Lock()
+	if s.conns == nil {
+		s.conns = make(map[*writeQueue]struct{})
+	}
+	s.conns[wq] = struct{}{}
+	s.connsMu.Unlock()
+
 	// teardown order (LIFO): cancel handlers -> stop writer -> wait for
 	// stream goroutines -> close the socket.
 	defer connCancel()
 	defer wq.close()
 	defer wg.Wait()
+	defer func() {
+		s.connsMu.Lock()
+		delete(s.conns, wq)
+		s.connsMu.Unlock()
+	}()
 
 	buf := make([]byte, 0, 64*1024)
 	for {
@@ -424,7 +448,8 @@ func (s *Server) serveConn(c net.Conn) {
 					Pair{"max-frame-size", maxFrame},
 					Pair{"max-streams", maxStreams},
 					Pair{"capabilities",
-						uint32(CapBody | CapAsync | CapVCache | CapResp)},
+						uint32(CapBody | CapAsync | CapVCache | CapResp |
+							CapPush)},
 					Pair{"agent-id", agentID},
 				)
 				wq.enqueue(marshalBuf(&Frame{Type: FrameAgentHello,
@@ -549,6 +574,60 @@ func (s *Server) handleStream(st *streamState, sid uint64,
 		v = Allow()
 	}
 	s.sendVerdict(wq, sid, v)
+}
+
+// ControlOp is an agent-pushed engine control action (CONTROL frame,
+// agent-allocated even sid 2 — requires the engine's CAP_PUSH).
+type ControlOp struct {
+	Op   string            // "ban-ip" | "ban-ja4" | "cache-drop"
+	IP   string            // for ban-ip
+	JA4  string            // for ban-ja4
+	Key  string            // for cache-drop
+	TTL  uint32            // ban lifetime seconds (0 -> engine default)
+	Args map[string]Value  // extra/forward-compat fields
+}
+
+// PushControl broadcasts a CONTROL op to every live engine conn.
+func (s *Server) PushControl(op ControlOp) error {
+	payload, err := appendKV(nil, "op", op.Op)
+	if err != nil {
+		return err
+	}
+	put := func(name string, val Value) {
+		if err == nil {
+			payload, err = appendKV(payload, name, val)
+		}
+	}
+	if op.IP != "" {
+		put("ip", op.IP)
+	}
+	if op.JA4 != "" {
+		put("ja4", op.JA4)
+	}
+	if op.Key != "" {
+		put("key", op.Key)
+	}
+	if op.TTL != 0 {
+		put("ttl", op.TTL)
+	}
+	for k, v := range op.Args {
+		put(k, v)
+	}
+	if err != nil {
+		return err
+	}
+
+	buf := marshalBuf(&Frame{Type: FrameControl, SID: 2, Payload: payload})
+
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if len(s.conns) == 0 {
+		return errors.New("xngin: no engine connections")
+	}
+	for wq := range s.conns {
+		wq.enqueue(buf)
+	}
+	return nil
 }
 
 func (s *Server) sendVerdict(wq *writeQueue, sid uint64, v *Verdict) {

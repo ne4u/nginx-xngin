@@ -18,6 +18,10 @@ static char *ngx_http_xngin_agent_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_xngin_cache_zone(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_xngin_ban_zone_set(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_xngin_group_set(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_xngin_mode(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_xngin_fail_mode(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -26,6 +30,12 @@ static char *ngx_http_xngin_cache_key_set(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_xngin_tls_deny_add(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_xngin_var_add(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_xngin_header_add(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_xngin_status_loc(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_xngin_group_ssl(ngx_conf_t *cf,
     ngx_http_xngin_group_t *g);
 static char *ngx_http_xngin_group_arg(ngx_conf_t *cf, ngx_str_t *field,
@@ -33,6 +43,7 @@ static char *ngx_http_xngin_group_arg(ngx_conf_t *cf, ngx_str_t *field,
 
 
 static ngx_int_t ngx_http_xngin_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_xngin_postread(ngx_http_request_t *r);
 static void ngx_http_xngin_body_post(ngx_http_request_t *r);
 static void ngx_http_xngin_req_cleanup(void *data);
 static void ngx_http_xngin_launch(ngx_http_request_t *r,
@@ -56,6 +67,8 @@ static ngx_int_t ngx_http_xngin_var_ja4(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_xngin_var_prefix(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_xngin_var_agent(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 
 
 static ngx_command_t ngx_http_xngin_commands[] = {
@@ -74,6 +87,13 @@ static ngx_command_t ngx_http_xngin_commands[] = {
       0,
       NULL },
 
+    { ngx_string("xngin_ban_zone"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_http_xngin_ban_zone_set,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("xngin_enable"),
       NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -82,10 +102,17 @@ static ngx_command_t ngx_http_xngin_commands[] = {
       NULL },
 
     { ngx_string("xngin_group"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_xngin_group_set,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("xngin_response_group"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_xngin_loc_conf_t, group_name),
+      offsetof(ngx_http_xngin_loc_conf_t, response_group_name),
       NULL },
 
     { ngx_string("xngin_mode"),
@@ -163,6 +190,41 @@ static ngx_command_t ngx_http_xngin_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_xngin_srv_conf_t, tls_inspect),
+      NULL },
+
+    { ngx_string("xngin_var"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      ngx_http_xngin_var_add,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("xngin_header_include"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_xngin_header_add,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xngin_loc_conf_t, hdr_include),
+      NULL },
+
+    { ngx_string("xngin_internal"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xngin_loc_conf_t, internal_req),
+      NULL },
+
+    { ngx_string("xngin_status"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
+      ngx_http_xngin_status_loc,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("xngin_header_exclude"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_xngin_header_add,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xngin_loc_conf_t, hdr_exclude),
       NULL },
 
     { ngx_string("xngin_tls_deny"),
@@ -249,6 +311,10 @@ static ngx_http_variable_t ngx_http_xngin_vars[] = {
       ngx_http_xngin_var_ja4, 0,
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
+    { ngx_string("xngin_agent"), NULL,
+      ngx_http_xngin_var_agent, 0,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
     { ngx_string("xngin_"), NULL,
       ngx_http_xngin_var_prefix, 0,
       NGX_HTTP_VAR_PREFIX|NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_CHANGEABLE,
@@ -327,6 +393,7 @@ ngx_http_xngin_create_loc_conf(ngx_conf_t *cf)
     lcf->response = NGX_CONF_UNSET;
     lcf->res_body_max = NGX_CONF_UNSET_SIZE;
     lcf->cache_key = NGX_CONF_UNSET_PTR;
+    lcf->internal_req = NGX_CONF_UNSET;
 
     return lcf;
 }
@@ -355,29 +422,76 @@ ngx_http_xngin_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               64 * 1024);
     ngx_conf_merge_ptr_value(conf->cache_key, prev->cache_key, NULL);
 
-    /* resolve group name → group pointer */
-    if (conf->enable && conf->group_name.len) {
+    if (conf->vars == NULL) {
+        conf->vars = prev->vars;
+    }
+    if (conf->hdr_include == NULL) {
+        conf->hdr_include = prev->hdr_include;
+    }
+    if (conf->hdr_exclude == NULL) {
+        conf->hdr_exclude = prev->hdr_exclude;
+    }
+    ngx_conf_merge_value(conf->internal_req, prev->internal_req, 1);
+    ngx_conf_merge_ptr_value(conf->steps, prev->steps, NULL);
+    ngx_conf_merge_str_value(conf->response_group_name,
+                             prev->response_group_name, "");
+
+    /* resolve group names → group pointers */
+    if (conf->enable && conf->steps) {
+        ngx_http_xngin_step_t   *st = conf->steps->elts;
+        ngx_http_xngin_group_t  *g = NULL;
+        ngx_uint_t               s;
+
         mmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_xngin_module);
-
         if (mmcf->groups) {
-            ngx_http_xngin_group_t *g = mmcf->groups->elts;
+            g = mmcf->groups->elts;
+        }
 
-            for (i = 0; i < mmcf->groups->nelts; i++) {
-                if (g[i].name.len == conf->group_name.len
-                    && ngx_memcmp(g[i].name.data, conf->group_name.data,
-                                  conf->group_name.len) == 0)
-                {
-                    conf->group = &g[i];
-                    break;
+        for (s = 0; s < conf->steps->nelts; s++) {
+            st[s].group = NULL;
+            if (g) {
+                for (i = 0; i < mmcf->groups->nelts; i++) {
+                    if (g[i].name.len == st[s].group_name.len
+                        && ngx_memcmp(g[i].name.data, st[s].group_name.data,
+                                      st[s].group_name.len) == 0)
+                    {
+                        st[s].group = &g[i];
+                        break;
+                    }
                 }
+            }
+            if (st[s].group == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "xngin: unknown agent group \"%V\"",
+                                   &st[s].group_name);
+                return NGX_CONF_ERROR;
             }
         }
 
-        if (conf->group == NULL) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "xngin: unknown agent group \"%V\"",
-                               &conf->group_name);
-            return NGX_CONF_ERROR;
+        conf->group = st[0].group;
+        conf->group_name = st[0].group_name;
+
+        /* xngin_response_group: which group's agents see responses */
+        if (conf->response_group_name.len) {
+            conf->response_group = NULL;
+            if (g) {
+                for (i = 0; i < mmcf->groups->nelts; i++) {
+                    if (g[i].name.len == conf->response_group_name.len
+                        && ngx_memcmp(g[i].name.data,
+                                      conf->response_group_name.data,
+                                      conf->response_group_name.len) == 0)
+                    {
+                        conf->response_group = &g[i];
+                        break;
+                    }
+                }
+            }
+            if (conf->response_group == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "xngin: unknown agent group \"%V\"",
+                                   &conf->response_group_name);
+                return NGX_CONF_ERROR;
+            }
         }
     }
 
@@ -436,6 +550,7 @@ ngx_http_xngin_agent_group(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     g->keepalive = 2;
     g->ping_interval = 10000;
     g->max_streams = XNAP_DEFAULT_MAX_STREAM;
+    g->resolve_interval = 30000;
 
     if (ngx_array_init(&g->agents, cf->pool, 4,
                        sizeof(ngx_http_xngin_agent_t))
@@ -491,21 +606,58 @@ ngx_http_xngin_agent_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         a->group = g;
         a->url_text = value[1];
 
+        /* pre-scan: "resolve" tolerates names that don't resolve at
+           config load (k8s Service etc.) */
+        for (i = 2; i < cf->args->nelts; i++) {
+            if (ngx_strcmp(value[i].data, "resolve") == 0) {
+                a->resolve = 1;
+            }
+        }
+
         ngx_memzero(&u, sizeof(ngx_url_t));
         u.url = value[1];
         u.no_resolve = 0;
 
         if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
-            if (u.err) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "xngin: %s in server \"%V\"",
-                                   u.err, &value[1]);
+            if (a->resolve && u.err
+                && ngx_strstr(u.err, "host not found"))
+            {
+                u.naddrs = 0;
+            } else {
+                if (u.err) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "xngin: %s in server \"%V\"",
+                                       u.err, &value[1]);
+                }
+                return NGX_CONF_ERROR;
             }
-            return NGX_CONF_ERROR;
+        }
+
+        if (a->resolve) {
+            if (u.family == AF_UNIX) {
+                return "resolve not allowed for unix socket";
+            }
+            a->host = u.host;
+            a->port = u.port;
+            g->has_resolve = 1;
         }
 
         if (u.naddrs) {
-            a->addr = u.addrs[0];
+            a->naddrs = ngx_min(u.naddrs, XNAP_MAX_ADDRS);
+            for (i = 0; i < a->naddrs; i++) {
+                if (u.addrs[i].socklen
+                    > sizeof(struct sockaddr_storage))
+                {
+                    a->naddrs = i;
+                    break;
+                }
+                ngx_memcpy(&a->ss[i], u.addrs[i].sockaddr,
+                           u.addrs[i].socklen);
+                a->addrs[i].sockaddr = (struct sockaddr *) &a->ss[i];
+                a->addrs[i].socklen = u.addrs[i].socklen;
+                a->addrs[i].name = a->url_text;
+            }
+            a->addr = a->addrs[0];
         } else if (u.family == AF_UNIX) {
             /* unix socket path: sockaddr lives inside the stack url,
                copy it into the config pool */
@@ -516,12 +668,13 @@ ngx_http_xngin_agent_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             ngx_memcpy(a->addr.sockaddr, &u.sockaddr, u.socklen);
             a->addr.socklen = u.socklen;
             a->addr.name = u.url;
-        } else {
+        } else if (!a->resolve) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "xngin: cannot resolve server \"%V\"",
                                &value[1]);
             return NGX_CONF_ERROR;
         }
+        /* else: resolve with 0 addrs — first DNS refresh fills them in */
 
         for (i = 2; i < cf->args->nelts; i++) {
             if (ngx_strncmp(value[i].data, "weight=", 7) == 0) {
@@ -536,6 +689,10 @@ ngx_http_xngin_agent_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 if (a->max_streams == (ngx_uint_t) NGX_ERROR) {
                     return "invalid max_streams";
                 }
+            } else if (ngx_strcmp(value[i].data, "backup") == 0) {
+                a->backup = 1;
+            } else if (ngx_strcmp(value[i].data, "resolve") == 0) {
+                /* handled in pre-scan */
             } else {
                 return "invalid server parameter";
             }
@@ -560,6 +717,42 @@ ngx_http_xngin_agent_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             || g->ping_interval < 1000)
         {
             return "invalid ping_interval";
+        }
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_strcmp(value[0].data, "balance") == 0) {
+        ngx_http_compile_complex_value_t  ccv;
+
+        if (cf->args->nelts != 3
+            || ngx_strcmp(value[1].data, "hash") != 0)
+        {
+            return "expected \"balance hash <value>\"";
+        }
+        if (g->balance_cv) {
+            return "is duplicate";
+        }
+        g->balance_cv = ngx_palloc(cf->pool,
+                                 sizeof(ngx_http_complex_value_t));
+        if (g->balance_cv == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+        ccv.cf = cf;
+        ccv.value = &value[2];
+        ccv.complex_value = g->balance_cv;
+        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_strcmp(value[0].data, "resolve_interval") == 0) {
+        g->resolve_interval = ngx_parse_time(&value[1], 0);
+        if (g->resolve_interval == (ngx_msec_t) NGX_ERROR
+            || g->resolve_interval < 5000)
+        {
+            return "invalid resolve_interval";
         }
         return NGX_CONF_OK;
     }
@@ -754,6 +947,49 @@ ngx_http_xngin_cache_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 static char *
+ngx_http_xngin_ban_zone_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_xngin_main_conf_t *mmcf = conf;
+    ngx_str_t                  *value, name, s;
+    ssize_t                     size;
+    u_char                     *p;
+
+    if (mmcf->ban_zone) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    p = ngx_strlchr(value[1].data, value[1].data + value[1].len, ':');
+    if (p == NULL) {
+        return "expected name:size";
+    }
+
+    name.data = value[1].data;
+    name.len = p - value[1].data;
+
+    s.data = p + 1;
+    s.len = value[1].data + value[1].len - (p + 1);
+
+    size = ngx_parse_size(&s);
+    if (size == NGX_ERROR || size < 81920) {
+        return "invalid zone size (min 80k)";
+    }
+
+    mmcf->ban_zone = ngx_shared_memory_add(cf, &name, size,
+                                           &ngx_http_xngin_module);
+    if (mmcf->ban_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    mmcf->ban_zone->init = ngx_http_xngin_ban_zone_init;
+    mmcf->ban_zone->data = NULL;
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
 ngx_http_xngin_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_xngin_loc_conf_t *lcf = conf;
@@ -791,6 +1027,70 @@ ngx_http_xngin_fail_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         lcf->fail = XNAP_FAIL_CLOSE;
     } else {
         return "expected open|close";
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* xngin_group name [timeout=T] [fail=open|close] [mode=blocking|async]
+   — repeatable: each line is one sequential step */
+static char *
+ngx_http_xngin_group_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_xngin_loc_conf_t *lcf = conf;
+    ngx_str_t                 *value = cf->args->elts;
+    ngx_http_xngin_step_t     *st;
+    ngx_uint_t                 i;
+    ngx_msec_t                 msec;
+
+    if (lcf->steps == NULL) {
+        lcf->steps = ngx_array_create(cf->pool, 2,
+                                      sizeof(ngx_http_xngin_step_t));
+        if (lcf->steps == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    st = ngx_array_push(lcf->steps);
+    if (st == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(st, sizeof(ngx_http_xngin_step_t));
+    st->group_name = value[1];
+    st->timeout = NGX_CONF_UNSET_MSEC;
+    st->fail = NGX_CONF_UNSET_UINT;
+    st->mode = NGX_CONF_UNSET_UINT;
+
+    for (i = 2; i < cf->args->nelts; i++) {
+        if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
+            value[i].data += 8;
+            value[i].len -= 8;
+            msec = ngx_parse_time(&value[i], 0);
+            if (msec == (ngx_msec_t) NGX_ERROR) {
+                return "invalid step timeout";
+            }
+            st->timeout = msec;
+        } else if (ngx_strncmp(value[i].data, "fail=", 5) == 0) {
+            if (ngx_strcmp(value[i].data + 5, "open") == 0) {
+                st->fail = XNAP_FAIL_OPEN;
+            } else if (ngx_strcmp(value[i].data + 5, "close") == 0) {
+                st->fail = XNAP_FAIL_CLOSE;
+            } else {
+                return "expected fail=open|close";
+            }
+        } else if (ngx_strncmp(value[i].data, "mode=", 5) == 0) {
+            if (ngx_strcmp(value[i].data + 5, "blocking") == 0) {
+                st->mode = XNAP_MODE_BLOCKING;
+            } else if (ngx_strcmp(value[i].data + 5, "async") == 0) {
+                st->mode = XNAP_MODE_ASYNC;
+            } else {
+                return "expected mode=blocking|async";
+            }
+        } else {
+            return "invalid step parameter";
+        }
     }
 
     return NGX_CONF_OK;
@@ -860,6 +1160,108 @@ ngx_http_xngin_tls_deny_add(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/* xngin_var <name> <complex value>: extra KV pairs the NOTIFY carries —
+   lets operators forward nginx variables (client cert DN, GeoIP, userid,
+   session data) that the agent can't otherwise see */
+static char *
+ngx_http_xngin_var_add(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_xngin_loc_conf_t       *lcf = conf;
+    ngx_str_t                       *value;
+    ngx_http_xngin_named_cv_t       *v;
+    ngx_http_compile_complex_value_t ccv;
+
+    value = cf->args->elts;
+
+    if (value[1].len == 0) {
+        return "empty variable name";
+    }
+
+    if (lcf->vars == NULL) {
+        lcf->vars = ngx_array_create(cf->pool, 4,
+                                     sizeof(ngx_http_xngin_named_cv_t));
+        if (lcf->vars == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    v = ngx_array_push(lcf->vars);
+    if (v == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    v->name = value[1];
+    v->cv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+    if (v->cv == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &value[2];
+    ccv.complex_value = v->cv;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* xngin_header_include/exclude <name>: allowlist for request/response
+   headers forwarded to the agent (Cookie/Authorization hygiene) */
+static char *
+ngx_http_xngin_header_add(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_xngin_loc_conf_t *lcf = conf;
+    ngx_str_t                 *value, *f;
+    ngx_array_t              **a;
+
+    value = cf->args->elts;
+
+    if (value[1].len == 0) {
+        return "empty header name";
+    }
+
+    a = (ngx_array_t **) ((u_char *) lcf + cmd->offset);
+
+    if (*a == NULL) {
+        *a = ngx_array_create(cf->pool, 4, sizeof(ngx_str_t));
+        if (*a == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    f = ngx_array_push(*a);
+    if (f == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    f->len = value[1].len;
+    f->data = ngx_pnalloc(cf->pool, value[1].len);
+    if (f->data == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    ngx_strlow(f->data, value[1].data, value[1].len);
+
+    return NGX_CONF_OK;
+}
+
+
+/* xngin_status: stub_status-style content handler */
+static char *
+ngx_http_xngin_status_loc(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_core_loc_conf_t *clcf;
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_xngin_status_handler;
+
+    return NGX_CONF_OK;
+}
+
+
 /* ---------- init ---------- */
 
 static ngx_int_t
@@ -867,9 +1269,23 @@ ngx_http_xngin_init(ngx_conf_t *cf)
 {
     ngx_http_handler_pt       *h;
     ngx_http_core_main_conf_t *cmcf;
+    ngx_http_core_loc_conf_t  *clcf;
+    ngx_http_xngin_main_conf_t *mmcf;
+    ngx_http_xngin_group_t    *g;
+    ngx_uint_t                 i;
     ngx_http_variable_t       *v, *nv;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    /* http-level "resolver" for "server ... resolve" groups */
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    mmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_xngin_module);
+    if (mmcf->groups) {
+        g = mmcf->groups->elts;
+        for (i = 0; i < mmcf->groups->nelts; i++) {
+            g[i].resolver = clcf->resolver;
+        }
+    }
 
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
     if (h == NULL) {
@@ -877,6 +1293,13 @@ ngx_http_xngin_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_xngin_handler;
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_xngin_postread;
 
     ngx_http_xngin_filters_init();
     ngx_http_xngin_stream_filter_init();
@@ -945,6 +1368,28 @@ ngx_http_xngin_req_cleanup(void *data)
 
 /* ---------- phase handler ---------- */
 
+/* POSTREAD: enforce agent-pushed IP bans before any request work */
+static ngx_int_t
+ngx_http_xngin_postread(ngx_http_request_t *r)
+{
+    ngx_http_xngin_main_conf_t *mmcf;
+
+    mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
+
+    if (mmcf == NULL) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_http_xngin_ban_check(mmcf, XNAP_BAN_IP,
+                                 &r->connection->addr_text))
+    {
+        return NGX_HTTP_FORBIDDEN;
+    }
+
+    return NGX_DECLINED;
+}
+
+
 static ngx_int_t
 ngx_http_xngin_handler(ngx_http_request_t *r)
 {
@@ -954,12 +1399,16 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
     ngx_int_t                   rc;
     ngx_str_t                   key;
     ngx_int_t                   cstatus;
-    int64_t                     cscore;
-    ngx_str_t                   creason;
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xngin_module);
 
-    if (!lcf->enable || lcf->group == NULL) {
+    if (!lcf->enable || lcf->steps == NULL || lcf->steps->nelts == 0) {
+        return NGX_DECLINED;
+    }
+
+    /* xngin_internal off: skip internal redirects and subrequests
+       (auth_request double-counting a rate limiter, e.g.) */
+    if (!lcf->internal_req && (r->internal || r != r->main)) {
         return NGX_DECLINED;
     }
 
@@ -1007,16 +1456,19 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
         {
             ctx->cache_key_val = key;
 
-            rc = ngx_http_xngin_cache_lookup(r, ctx, &key,
-                                             &cstatus, &cscore, &creason);
+            rc = ngx_http_xngin_cache_lookup(r, ctx, &key, &cstatus);
             if (rc == NGX_OK) {
-                ctx->score = cscore;
-                ctx->reason = creason;
                 if (cstatus == NGX_DECLINED) {
                     ngx_str_set(&ctx->action, "allow");
-                } else {
-                    ngx_str_set(&ctx->action, "deny");
-                    ctx->deny_status = cstatus;
+                    return NGX_DECLINED;
+                }
+                ngx_str_set(&ctx->action, "deny");
+                ctx->deny_status = cstatus;
+                if (ctx->deny_body.len) {
+                    /* cached deny carries its own body: proceed to the
+                       content phase so deny_content can emit it */
+                    r->content_handler = ngx_http_xngin_deny_content;
+                    return NGX_DECLINED;
                 }
                 return cstatus;
             }
@@ -1044,10 +1496,14 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
          * as chunks arrive, overlapping the upload with agent analysis.
          * If dispatch fails inline (state DONE) the body is skipped
          * entirely — same as any other early deny.
+         * Sequential groups can't stream: each step needs the whole
+         * body, so the chain waits for the buffered read to finish.
          */
-        ctx->body_stream = 1;
-        ctx->in_handler = 1;
-        ngx_http_xngin_launch(r, ctx, lcf);
+        if (lcf->steps->nelts == 1) {
+            ctx->body_stream = 1;
+            ctx->in_handler = 1;
+            ngx_http_xngin_launch(r, ctx, lcf);
+        }
 
         if (ctx->state == XNAP_ST_DONE) {
             ctx->body_stream = 0;
@@ -1107,45 +1563,80 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
 
 
 /* dispatch + suspend bookkeeping shared by phase handler and body post */
-static void
-ngx_http_xngin_launch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
+
+/* walk the step chain from ctx->step: dispatch each step, skipping
+   fail-open/async steps that can't block the request.  Returns 1 when
+   suspended on a blocking step; 0 when the chain resolved inline
+   (ctx->state DONE, ctx->status set — count ref NOT released, callers
+   own it) */
+ngx_int_t
+ngx_http_xngin_advance(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
     ngx_http_xngin_loc_conf_t *lcf)
 {
     ngx_int_t rc;
 
+    while (ctx->step < lcf->steps->nelts) {
+
+        ctx->retried = 0;
+        ctx->stream_failed = 0;
+        ctx->async = (ngx_http_xngin_step_mode(lcf, ctx)
+                      == XNAP_MODE_ASYNC);
+
+        if (!ctx->async && !ctx->counted) {
+            r->main->count++;
+            ctx->counted = 1;
+        }
+
+        rc = ngx_http_xngin_dispatch(r, ctx);
+
+        if (rc != NGX_OK) {
+            ngx_str_set(&ctx->error, "down");
+            ctx->cache_status = XNAP_CACHE_BYPASS;
+            if (ctx->async
+                || ngx_http_xngin_step_fail(lcf, ctx) == XNAP_FAIL_OPEN)
+            {
+                ctx->step++;   /* step can't block — move on */
+                continue;
+            }
+            ctx->state = XNAP_ST_DONE;
+            ctx->status = NGX_HTTP_SERVICE_UNAVAILABLE;
+            return 0;
+        }
+
+        if (!ctx->async) {
+            /*
+             * Streaming dispatch: the verdict wait can't start until the
+             * whole upload has been forwarded, so the verdict timer is
+             * armed in body_post instead of here.  Body_post always runs
+             * (read complete, or conn_failed/timeout defers there too).
+             */
+            if (!ctx->body_stream) {
+                ngx_add_timer(ctx->timer,
+                              ngx_http_xngin_step_timeout(lcf, ctx));
+            }
+            r->read_event_handler = ngx_http_test_reading;
+            return 1;
+        }
+
+        ctx->step++;   /* async step: fire-and-forget, keep walking */
+    }
+
+    ctx->state = XNAP_ST_DONE;
+    ctx->status = NGX_DECLINED;
+    return 0;
+}
+
+
+static void
+ngx_http_xngin_launch(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
+    ngx_http_xngin_loc_conf_t *lcf)
+{
     ctx->dispatched = 1;
 
-    if (!ctx->async) {
-        r->main->count++;
-    }
-
-    rc = ngx_http_xngin_dispatch(r, ctx);
-
-    if (rc != NGX_OK) {
-        if (!ctx->async) {
-            r->main->count--;
-        }
-
-        ngx_str_set(&ctx->error, "down");
-        ctx->cache_status = XNAP_CACHE_BYPASS;
-        ctx->state = XNAP_ST_DONE;
-        ctx->status = (ctx->async || lcf->fail == XNAP_FAIL_OPEN)
-                      ? NGX_DECLINED
-                      : NGX_HTTP_SERVICE_UNAVAILABLE;
-        return;
-    }
-
-    if (!ctx->async) {
-        /*
-         * Streaming dispatch: the verdict wait can't start until the
-         * whole upload has been forwarded, so the verdict timer is
-         * armed in body_post instead of here.  Body_post always runs
-         * (read complete, or conn_failed/timeout defers there too).
-         */
-        if (!ctx->body_stream) {
-            ngx_add_timer(ctx->timer, lcf->timeout);
-        }
-        r->read_event_handler = ngx_http_test_reading;
+    if (!ngx_http_xngin_advance(r, ctx, lcf) && ctx->counted) {
+        /* resolved inline — release the suspend ref */
+        r->main->count--;
+        ctx->counted = 0;
     }
 }
 
@@ -1178,7 +1669,8 @@ ngx_http_xngin_body_post(ngx_http_request_t *r)
         /* the stream died mid-upload: apply the fail policy now that
            the request body has been fully consumed */
         ctx->state = XNAP_ST_DONE;
-        ctx->status = (ctx->async || lcf->fail == XNAP_FAIL_OPEN)
+        ctx->status = (ctx->async
+                      || ngx_http_xngin_step_fail(lcf, ctx) == XNAP_FAIL_OPEN)
                       ? NGX_DECLINED : NGX_HTTP_SERVICE_UNAVAILABLE;
         ngx_str_set(&ctx->error, "down");
         ctx->cache_status = XNAP_CACHE_BYPASS;
@@ -1203,7 +1695,8 @@ ngx_http_xngin_body_post(ngx_http_request_t *r)
         if (!ctx->async && ctx->state == XNAP_ST_SENT
             && !ctx->timer->timer_set)
         {
-            ngx_add_timer(ctx->timer, lcf->timeout);
+            ngx_add_timer(ctx->timer,
+                          ngx_http_xngin_step_timeout(lcf, ctx));
         }
     }
 }
@@ -1224,7 +1717,16 @@ ngx_http_xngin_resume(ngx_http_request_t *r, ngx_int_t status)
     ctx->status = status;
     ctx->state = XNAP_ST_DONE;
 
-    r->main->count--;
+    /* the module is answering the request itself — the response it
+       generates must not be offered to xngin_response inspection */
+    if (status != NGX_DECLINED && status != NGX_DONE) {
+        ctx->own_resp = 1;
+    }
+
+    if (ctx->counted) {
+        r->main->count--;
+        ctx->counted = 0;
+    }
 
     if (!ctx->body_read) {
         if (!ctx->early_close) {
@@ -1451,6 +1953,24 @@ ngx_http_xngin_var_ja4(ngx_http_request_t *r,
 
     v->data = hello->ja4.data;
     v->len = hello->ja4.len;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_xngin_var_agent(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_xngin_ctx_t *ctx = ngx_http_xngin_get_ctx(r, v);
+    if (ctx == NULL || ctx->agent_name.len == 0) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+    v->data = ctx->agent_name.data;
+    v->len = ctx->agent_name.len;
     v->valid = 1;
     v->no_cacheable = 0;
     v->not_found = 0;

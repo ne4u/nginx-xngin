@@ -17,6 +17,26 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/big":
             # fixed-size plain response for byte-exact assertions
             payload = b"B" * (512 * 1024)
+        elif self.path in ("/gzip", "/br"):
+            # compressed wire body: the agent should see plaintext
+            import gzip
+            import brotli
+            plain = json.dumps({
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body,
+                "path": self.path,
+            }).encode()
+            payload = (gzip.compress(plain) if self.path == "/gzip"
+                       else brotli.compress(plain))
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-encoding",
+                             "gzip" if self.path == "/gzip" else "br")
+            self.send_header("x-backend-tag", "backend")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         else:
             payload = json.dumps({
                 "headers": {k.lower(): v for k, v in self.headers.items()},

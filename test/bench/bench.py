@@ -15,6 +15,13 @@ still runs):
   /goblock   blocking verdict, Go edge-guard agent (rate=0, UDS)
   /cecho     blocking verdict, C echo agent (fixed allow, UDS)
   /rustblock blocking verdict, Rust mini_waf agent (UDS)
+  /rustasync fire-and-forget, Rust mini_waf
+  /rustcache blocking + cache key, Rust mini_waf
+  /rustbody  blocking + body inspect, Rust mini_waf (POST 1k / 64k)
+  /rustresp  blocking + response inspect, Rust mini_waf
+  /rustdeny  Rust mini_waf deny (threshold 80; /etc/passwd URI)
+  /rusttcp   blocking verdict, Rust mini_waf on loopback TCP
+  /rustmtls  blocking verdict, Rust mini_waf over mTLS
   /mtlsblock blocking verdict, Python stub agent over mTLS (agent-bound)
   /gomtls    blocking verdict, Go edge-guard agent over mTLS
 
@@ -96,6 +103,25 @@ http {{
         keepalive 2;
         ping_interval 60s;
     }}
+    xngin_agent_group rustdeny {{
+        server unix:{rust_deny_sock};
+        keepalive 2;
+        ping_interval 60s;
+    }}
+    xngin_agent_group rusttcp {{
+        server 127.0.0.1:{rust_tcp_port};
+        keepalive 2;
+        ping_interval 60s;
+    }}
+    xngin_agent_group rustmtls {{
+        server unix:{rust_mtls_sock};
+        ssl on;
+        ssl_trusted_certificate {mtls_ca};
+        ssl_certificate {mtls_eng_crt};
+        ssl_certificate_key {mtls_eng_key};
+        keepalive 2;
+        ping_interval 60s;
+    }}
     xngin_agent_group mtls {{
         server unix:{mtls_sock};
         ssl on;
@@ -166,6 +192,36 @@ http {{
             xngin_enable on; xngin_group rust;
             empty_gif;
         }}
+        location /rustasync {{
+            xngin_enable on; xngin_group rust; xngin_mode async;
+            empty_gif;
+        }}
+        location /rustcache {{
+            xngin_enable on; xngin_group rust;
+            xngin_cache_key $uri;
+            empty_gif;
+        }}
+        location /rustbody {{
+            xngin_enable on; xngin_group rust;
+            xngin_body_inspect on; xngin_body_max 128k;
+            empty_gif;
+        }}
+        location /rustresp {{
+            xngin_enable on; xngin_group rust; xngin_response on;
+            empty_gif;
+        }}
+        location /rustdeny {{
+            xngin_enable on; xngin_group rustdeny;
+            empty_gif;
+        }}
+        location /rusttcp {{
+            xngin_enable on; xngin_group rusttcp;
+            empty_gif;
+        }}
+        location /rustmtls {{
+            xngin_enable on; xngin_group rustmtls;
+            empty_gif;
+        }}
         location /mtlsblock {{
             xngin_enable on; xngin_group mtls;
             empty_gif;
@@ -201,6 +257,14 @@ LANES = [
     ("go-block",  "/goblock/x",   "GET",  None,          200),
     ("c-echo",    "/cecho/x",     "GET",  None,          200),
     ("rust-block", "/rustblock/x", "GET", None,          200),
+    ("rust-async", "/rustasync/x", "GET", None,          200),
+    ("rust-cache", "/rustcache/x", "GET", None,          200),
+    ("rust-body-1k", "/rustbody/x", "POST", POST_BODY,   405),
+    ("rust-body-64k", "/rustbody/x", "POST", POST_BODY_64K, 405),
+    ("rust-resp",  "/rustresp/x",  "GET",  None,          200),
+    ("rust-deny",  "/rustdeny/x/etc/passwd", "GET", None, 403),
+    ("rust-tcp",   "/rusttcp/x",   "GET",  None,          200),
+    ("rust-mtls",  "/rustmtls/x",  "GET",  None,          200),
     ("mtls-block", "/mtlsblock/x", "GET", None,          200),
     ("go-mtls",   "/gomtls/x",    "GET",  None,          200),
 ]
@@ -469,6 +533,9 @@ def main():
     go_mtls_sock = os.path.join(root, "edge-guard-mtls.sock")
     c_sock = os.path.join(root, "xnap-echo.sock")
     rust_sock = os.path.join(root, "mini-waf.sock")
+    rust_deny_sock = os.path.join(root, "mini-waf-deny.sock")
+    rust_mtls_sock = os.path.join(root, "mini-waf-mtls.sock")
+    rust_tcp_port = stacklib.free_port()
     go_bin = build_go_agent(root)
     c_bin = build_c_agent(root)
     rust_bin = build_rust_agent()
@@ -478,10 +545,13 @@ def main():
     if not c_bin:
         lanes = [l for l in lanes if l[0] != "c-echo"]
     if not rust_bin:
-        lanes = [l for l in lanes if l[0] != "rust-block"]
+        lanes = [l for l in lanes if not l[0].startswith("rust-")]
     if args.lanes:
         want = set(args.lanes.split(","))
         lanes = [l for l in lanes if l[0] in want]
+    if not lanes:
+        print("no lanes to run")
+        return
     have_k6 = shutil.which("k6") is not None
     if not have_k6:
         print("note: k6 not found, falling back to ab for throughput",
@@ -492,6 +562,8 @@ def main():
         uds_sock=uds_agent.sock, tcp_port=tcp_agent.port,
         go_sock=go_sock, go_mtls_sock=go_mtls_sock,
         c_sock=c_sock, rust_sock=rust_sock,
+        rust_deny_sock=rust_deny_sock, rust_tcp_port=rust_tcp_port,
+        rust_mtls_sock=rust_mtls_sock,
         mtls_sock=mtls_agent.sock, mtls_ca=certs["ca"],
         mtls_eng_crt=certs["engine_cert"],
         mtls_eng_key=certs["engine_key"],
@@ -502,32 +574,43 @@ def main():
 
     port = int(re.search(r"listen (\d+);", conf).group(1))
     procs = []
-    go_proc = None
-    go_mtls_proc = None
-    c_proc = None
-    rust_proc = None
+    agent_procs = []
     try:
         uds_agent.start(root)
         tcp_agent.start(root)
         mtls_agent.start(root)
         if go_bin:
-            go_proc = subprocess.Popen(
-                [go_bin, "-listen", f"unix:{go_sock}", "-rate", "0"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            go_mtls_proc = subprocess.Popen(
-                [go_bin, "-listen", f"unix:{go_mtls_sock}", "-rate", "0",
-                 "-tls-cert", certs["agent_cert"],
-                 "-tls-key", certs["agent_key"],
-                 "-tls-client-ca", certs["ca"]],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            agent_procs += [
+                subprocess.Popen(
+                    [go_bin, "-listen", f"unix:{go_sock}", "-rate", "0"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+                subprocess.Popen(
+                    [go_bin, "-listen", f"unix:{go_mtls_sock}",
+                     "-rate", "0",
+                     "-tls-cert", certs["agent_cert"],
+                     "-tls-key", certs["agent_key"],
+                     "-tls-client-ca", certs["ca"]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)]
         if c_bin:
-            c_proc = subprocess.Popen(
+            agent_procs.append(subprocess.Popen(
                 [c_bin, "-listen", f"unix:{c_sock}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         if rust_bin:
-            rust_proc = subprocess.Popen(
+            rust_cmds = [
                 [rust_bin, "--listen", f"unix:{rust_sock}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # rust-deny: /etc/passwd hits proto-environ (85)
+                [rust_bin, "--listen", f"unix:{rust_deny_sock}",
+                 "--threshold", "80"],
+                [rust_bin, "--listen",
+                 f"tcp:127.0.0.1:{rust_tcp_port}"],
+                [rust_bin, "--listen", f"unix:{rust_mtls_sock}",
+                 "--tls-cert", certs["agent_cert"],
+                 "--tls-key", certs["agent_key"],
+                 "--tls-client-ca", certs["ca"]],
+            ]
+            agent_procs += [subprocess.Popen(
+                c, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL) for c in rust_cmds]
         procs.append(subprocess.Popen(
             [stacklib.NGINX_BIN, "-c", conf_path, "-p", root],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -545,7 +628,10 @@ def main():
                            "/goblock/x" if go_bin else None,
                            "/gomtls/x" if go_bin else None,
                            "/cecho/x" if c_bin else None,
-                           "/rustblock/x" if rust_bin else None):
+                           "/rustblock/x" if rust_bin else None,
+                           "/rustdeny/x" if rust_bin else None,
+                           "/rusttcp/x" if rust_bin else None,
+                           "/rustmtls/x" if rust_bin else None):
             if ready_path is None:
                 continue
             for _ in range(100):
@@ -638,9 +724,8 @@ def main():
     finally:
         for p in procs:
             p.terminate()
-        for p in (go_proc, go_mtls_proc, c_proc, rust_proc):
-            if p:
-                p.terminate()
+        for p in agent_procs:
+            p.terminate()
         for a in (uds_agent, tcp_agent, mtls_agent):
             if a.proc:
                 a.proc.terminate()

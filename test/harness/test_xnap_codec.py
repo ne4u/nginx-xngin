@@ -20,7 +20,7 @@ def load_vectors():
 def norm(v):
     """Normalize a decoded value to the JSON-native 'expect' shape."""
     if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
-        return str(v)
+        return {"$ip": str(v)}
     if isinstance(v, bytes):
         return {"$bytes": v.hex()}
     if isinstance(v, tuple):

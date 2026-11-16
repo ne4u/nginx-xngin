@@ -17,6 +17,7 @@ pub const FT_BODY: u8 = 0x06;
 pub const FT_ABORT: u8 = 0x07;
 pub const FT_PING: u8 = 0x08;
 pub const FT_PONG: u8 = 0x09;
+pub const FT_CONTROL: u8 = 0x0A;
 
 // stream flags
 pub const FL_FIN: u32 = 0x01;
@@ -31,6 +32,7 @@ pub const CAP_BODY: u32 = 0x01;
 pub const CAP_ASYNC: u32 = 0x02;
 pub const CAP_VCACHE: u32 = 0x04;
 pub const CAP_RESP: u32 = 0x08;
+pub const CAP_PUSH: u32 = 0x10;
 
 #[derive(Debug)]
 pub struct ProtoError(pub &'static str);

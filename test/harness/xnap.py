@@ -20,6 +20,7 @@ FT_BODY = 0x06
 FT_ABORT = 0x07
 FT_PING = 0x08
 FT_PONG = 0x09
+FT_CONTROL = 0x0A
 
 # value types
 VT_NULL = 0x00
@@ -48,6 +49,7 @@ CAP_BODY = 0x01
 CAP_ASYNC = 0x02
 CAP_VCACHE = 0x04
 CAP_RESP = 0x08
+CAP_PUSH = 0x10
 
 
 class ProtoError(Exception):

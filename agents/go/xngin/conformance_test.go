@@ -65,6 +65,9 @@ func normExpect(t *testing.T, v any) Value {
 	case []any:
 		return normList(t, x)
 	case map[string]any:
+		if h, ok := x["$ip"]; ok {
+			return h.(string)
+		}
 		if h, ok := x["$bytes"]; ok {
 			b, err := hex.DecodeString(h.(string))
 			if err != nil {

@@ -26,16 +26,7 @@ fn expect_to_value(j: &J) -> Value {
         J::Null => Value::Null,
         J::Bool(b) => Value::Bool(*b),
         J::Number(n) => Value::Int(n.as_i64().unwrap()),
-        J::String(s) => {
-            // ip strings decode to Ipv4/Ipv6
-            if let Ok(a) = s.parse::<Ipv4Addr>() {
-                return Value::Ipv4(a);
-            }
-            if let Ok(a) = s.parse::<Ipv6Addr>() {
-                return Value::Ipv6(a);
-            }
-            Value::Str(s.clone())
-        }
+        J::String(s) => Value::Str(s.clone()),
         J::Array(arr) => {
             let items: Vec<String> = arr
                 .iter()
@@ -44,6 +35,13 @@ fn expect_to_value(j: &J) -> Value {
             Value::StrList(items)
         }
         J::Object(o) => {
+            if let Some(h) = o.get("$ip") {
+                let s = h.as_str().unwrap();
+                if let Ok(a) = s.parse::<Ipv4Addr>() {
+                    return Value::Ipv4(a);
+                }
+                return Value::Ipv6(s.parse::<Ipv6Addr>().unwrap());
+            }
             if let Some(h) = o.get("$bytes") {
                 return Value::Bin(unhex(h.as_str().unwrap()));
             }

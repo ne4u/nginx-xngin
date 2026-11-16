@@ -1,11 +1,20 @@
 #include "ngx_http_xngin_module.h"
 
 
-/* stored reason is clamped so a lookup can stage it on the stack
-   without pool allocation under the shm mutex */
+/* stored reason/body are clamped so one slab entry stays sane next to
+   an 80KB-minimum zone; a larger payload simply isn't cached */
 #define XNAP_CACHE_REASON_MAX  1024
+#define XNAP_CACHE_BODY_MAX    (64 * 1024)
+#define XNAP_CACHE_NODE_MAX    (80 * 1024)
 
 
+/* node->data layout:
+   [key      key_len]
+   [reason   reason_len]
+   [body     body_len]      deny body (0 for plain allows)
+   [ctype    ctype_len]
+   [hdrset   hdrset_len]    u16 count + count*(u16 nlen, name, u16 vlen, val)
+   [hdrunset hdrunset_len]  u16 count + count*(u16 nlen, name) */
 typedef struct {
     ngx_rbtree_node_t   node;
     ngx_queue_t         queue;
@@ -15,8 +24,12 @@ typedef struct {
     int64_t             score;
     u_short             key_len;
     u_short             reason_len;
-    u_short             reason_cap; /* alloc'd reason bytes (>= len) */
-    u_char              data[];     /* key bytes then reason bytes */
+    uint32_t            body_len;
+    u_short             ctype_len;
+    uint32_t            hdrset_len;
+    uint32_t            hdrunset_len;
+    uint32_t            tail_cap;   /* alloc'd tail bytes beyond key */
+    u_char              data[];
 } ngx_http_xngin_cache_node_t;
 
 
@@ -97,6 +110,19 @@ ngx_http_xngin_cache_find(ngx_http_xngin_cache_shctx_t *sh,
 
 
 static void
+ngx_http_xngin_cache_node_free(ngx_http_xngin_cache_shctx_t *sh,
+    ngx_slab_pool_t *shpool, ngx_http_xngin_cache_node_t *n)
+{
+    ngx_queue_remove(&n->queue);
+    ngx_rbtree_delete(&sh->rbtree, &n->node);
+    ngx_slab_free_locked(shpool, n);
+    if (sh->nentries) {
+        sh->nentries--;
+    }
+}
+
+
+static void
 ngx_http_xngin_cache_expire_locked(ngx_http_xngin_cache_shctx_t *sh,
     ngx_slab_pool_t *shpool)
 {
@@ -112,23 +138,116 @@ ngx_http_xngin_cache_expire_locked(ngx_http_xngin_cache_shctx_t *sh,
             return;
         }
 
-        ngx_queue_remove(q);
-        ngx_rbtree_delete(&sh->rbtree, &n->node);
-        ngx_slab_free_locked(shpool, n);
+        ngx_http_xngin_cache_node_free(sh, shpool, n);
+    }
+}
+
+
+/* populate ctx (deny payload + res-hdr ops) from a node's staged tail
+   copy; runs after the slab mutex is released */
+static void
+ngx_http_xngin_cache_unpack(ngx_http_request_t *r,
+    ngx_http_xngin_ctx_t *ctx, ngx_http_xngin_cache_node_t *n,
+    u_char *tail)
+{
+    u_char               *p, *end;
+    ngx_http_xngin_var_t *kv;
+    ngx_str_t            *nm;
+    uint64_t              cnt;
+
+    p = tail;
+    end = tail + n->reason_len + n->body_len + n->ctype_len
+          + n->hdrset_len + n->hdrunset_len;
+
+    ctx->reason.len = n->reason_len;
+    ctx->reason.data = p;
+    p += n->reason_len;
+
+    ctx->deny_body.len = n->body_len;
+    ctx->deny_body.data = p;
+    p += n->body_len;
+
+    ctx->deny_ctype.len = n->ctype_len;
+    ctx->deny_ctype.data = p;
+    p += n->ctype_len;
+
+    if (n->hdrset_len >= 2) {
+        cnt = ((uint64_t) p[0] << 8) | p[1];
+        p += 2;
+
+        while (cnt-- && p + 2 <= end) {
+            size_t nl = ((size_t) p[0] << 8) | p[1];
+            size_t vl;
+            p += 2;
+            if (p + nl + 2 > end) {
+                break;
+            }
+            if (ctx->res_hdr_set == NULL) {
+                ctx->res_hdr_set = ngx_array_create(r->pool, 4,
+                                          sizeof(ngx_http_xngin_var_t));
+            }
+            if (ctx->res_hdr_set) {
+                kv = ngx_array_push(ctx->res_hdr_set);
+            } else {
+                kv = NULL;
+            }
+            if (kv) {
+                kv->name.len = nl;
+                kv->name.data = p;
+            }
+            p += nl;
+            vl = ((size_t) p[0] << 8) | p[1];
+            p += 2;
+            if (p + vl > end) {
+                break;
+            }
+            if (kv) {
+                kv->value.len = vl;
+                kv->value.data = p;
+            }
+            p += vl;
+        }
+    }
+
+    if (n->hdrunset_len >= 2) {
+        cnt = ((uint64_t) p[0] << 8) | p[1];
+        p += 2;
+
+        while (cnt-- && p + 2 <= end) {
+            size_t nl = ((size_t) p[0] << 8) | p[1];
+            p += 2;
+            if (p + nl > end) {
+                break;
+            }
+            nm = NULL;
+            if (ctx->res_hdr_unset == NULL) {
+                ctx->res_hdr_unset = ngx_array_create(r->pool, 4,
+                                                    sizeof(ngx_str_t));
+            }
+            if (ctx->res_hdr_unset) {
+                nm = ngx_array_push(ctx->res_hdr_unset);
+            }
+            if (nm) {
+                nm->len = nl;
+                nm->data = p;
+            }
+            p += nl;
+        }
     }
 }
 
 
 ngx_int_t
 ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
-    ngx_http_xngin_ctx_t *ctx, ngx_str_t *key,
-    ngx_int_t *out_status, int64_t *out_score, ngx_str_t *out_reason)
+    ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, ngx_int_t *out_status)
 {
     ngx_http_xngin_main_conf_t   *mmcf;
     ngx_http_xngin_cache_shctx_t *sh;
-    ngx_http_xngin_cache_node_t  *n;
+    ngx_http_xngin_cache_node_t  *n, hn;
     ngx_slab_pool_t              *shpool;
     uint64_t                      key_h;
+    size_t                        tail_len;
+    u_char                       *tail;
 
     mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
     sh = ngx_http_xngin_cache_sh(mmcf);
@@ -147,43 +266,86 @@ ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
                                   key->data, key->len);
 
     if (n && n->expire <= ngx_time()) {
-        ngx_queue_remove(&n->queue);
-        ngx_rbtree_delete(&sh->rbtree, &n->node);
-        ngx_slab_free_locked(shpool, n);
+        ngx_http_xngin_cache_node_free(sh, shpool, n);
         n = NULL;
     }
 
-    if (n) {
-        /* stage the reason on the stack so the pool alloc below runs
-           after the mutex is released */
-        u_char   rbuf[XNAP_CACHE_REASON_MAX];
-        size_t   rlen;
-
-        rlen = ngx_min(n->reason_len, sizeof(rbuf));
-
-        ngx_queue_remove(&n->queue);
-        ngx_queue_insert_head(&sh->queue, &n->queue);
-
-        *out_status = n->action;
-        *out_score = n->score;
-        ngx_memcpy(rbuf, n->data + n->key_len, rlen);
-
-        sh->nhit++;
+    if (n == NULL) {
+        sh->nmiss++;
         ngx_shmtx_unlock(&shpool->mutex);
-
-        out_reason->data = ngx_pnalloc(r->pool, rlen);
-        ngx_memcpy(out_reason->data, rbuf, rlen);
-        out_reason->len = rlen;
-
-        ctx->cache_status = XNAP_CACHE_HIT;
-        return NGX_OK;
+        ctx->cache_status = XNAP_CACHE_MISS;
+        return NGX_DECLINED;
     }
 
-    sh->nmiss++;
+    ngx_queue_remove(&n->queue);
+    ngx_queue_insert_head(&sh->queue, &n->queue);
+
+    *out_status = n->action;
+    ctx->score = n->score;
+
+    hn = *n;   /* header copy under lock — node may be freed after it */
+
+    tail_len = (size_t) n->reason_len + n->body_len + n->ctype_len
+               + n->hdrset_len + n->hdrunset_len;
+
+    /* stage the whole tail in one pool alloc — reason/body/headers are
+       replayed verbatim so they must outlive the lock */
+    tail = ngx_pnalloc(r->pool, tail_len ? tail_len : 1);
+    if (tail == NULL) {
+        ngx_shmtx_unlock(&shpool->mutex);
+        return NGX_DECLINED;
+    }
+    ngx_memcpy(tail, n->data + n->key_len, tail_len);
+
+    sh->nhit++;
     ngx_shmtx_unlock(&shpool->mutex);
 
-    ctx->cache_status = XNAP_CACHE_MISS;
-    return NGX_DECLINED;
+    ngx_http_xngin_cache_unpack(r, ctx, &hn, tail);
+
+    ctx->cache_status = XNAP_CACHE_HIT;
+    return NGX_OK;
+}
+
+
+/* hdr-set blob length: u16 count + per entry u16 nlen + name + u16 vlen + val */
+static size_t
+ngx_http_xngin_kv_tail_len(ngx_array_t *a)
+{
+    ngx_http_xngin_var_t  *kv;
+    ngx_uint_t             i;
+    size_t                 n = 2;
+
+    if (a == NULL) {
+        return n;
+    }
+
+    kv = a->elts;
+    for (i = 0; i < a->nelts; i++) {
+        n += 2 + kv[i].name.len + 2 + kv[i].value.len;
+    }
+
+    return n;
+}
+
+
+/* hdr-unset blob length: u16 count + per entry u16 nlen + name */
+static size_t
+ngx_http_xngin_str_tail_len(ngx_array_t *a)
+{
+    ngx_str_t   *nm;
+    ngx_uint_t   i;
+    size_t       n = 2;
+
+    if (a == NULL) {
+        return n;
+    }
+
+    nm = a->elts;
+    for (i = 0; i < a->nelts; i++) {
+        n += 2 + nm[i].len;
+    }
+
+    return n;
 }
 
 
@@ -195,10 +357,14 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     ngx_http_xngin_cache_shctx_t *sh;
     ngx_http_xngin_cache_node_t  *n;
     ngx_slab_pool_t              *shpool;
-    size_t                        size;
+    size_t                        size, tail_len;
     uint64_t                      key_h;
     ngx_int_t                     action;
-    u_short                       rlen;
+    u_short                       rlen, ctlen;
+    u_char                       *p;
+    ngx_http_xngin_var_t         *kv;
+    ngx_str_t                    *nm;
+    ngx_uint_t                    i;
 
     mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
     sh = ngx_http_xngin_cache_sh(mmcf);
@@ -211,9 +377,21 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
 
     action = ctx->deny_status ? ctx->deny_status : (ngx_int_t) NGX_DECLINED;
 
-    key_h = ngx_crc32_long(key->data, key->len);
     rlen = (u_short) ngx_min(ctx->reason.len, XNAP_CACHE_REASON_MAX);
-    size = sizeof(ngx_http_xngin_cache_node_t) + key->len + rlen;
+    ctlen = (u_short) ngx_min(ctx->deny_ctype.len, 256);
+
+    tail_len = rlen + ctx->deny_body.len + ctlen
+               + ngx_http_xngin_kv_tail_len(ctx->res_hdr_set)
+               + ngx_http_xngin_str_tail_len(ctx->res_hdr_unset);
+
+    if (ctx->deny_body.len > XNAP_CACHE_BODY_MAX
+        || tail_len > XNAP_CACHE_NODE_MAX)
+    {
+        return;
+    }
+
+    key_h = ngx_crc32_long(key->data, key->len);
+    size = sizeof(ngx_http_xngin_cache_node_t) + key->len + tail_len;
 
     shpool = (ngx_slab_pool_t *) mmcf->cache_zone->shm.addr;
 
@@ -227,25 +405,20 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
                                   key->data, key->len);
 
-    if (n && rlen <= n->reason_cap) {
+    if (n && tail_len <= n->tail_cap) {
         n->expire = ngx_time() + ttl;
         n->action = action;
         n->score = ctx->score;
-        n->reason_len = rlen;
-        ngx_memcpy(n->data + n->key_len, ctx->reason.data, rlen);
 
         ngx_queue_remove(&n->queue);
         ngx_queue_insert_head(&sh->queue, &n->queue);
 
-        ngx_shmtx_unlock(&shpool->mutex);
-        return;
+        goto fill;
     }
 
     if (n) {
-        /* same key, bigger reason: out with the old node */
-        ngx_queue_remove(&n->queue);
-        ngx_rbtree_delete(&sh->rbtree, &n->node);
-        ngx_slab_free_locked(shpool, n);
+        /* same key, bigger tail: out with the old node */
+        ngx_http_xngin_cache_node_free(sh, shpool, n);
     }
 
     n = ngx_slab_alloc_locked(shpool, size);
@@ -256,9 +429,7 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
         ngx_http_xngin_cache_node_t *victim;
 
         victim = ngx_queue_data(q, ngx_http_xngin_cache_node_t, queue);
-        ngx_queue_remove(q);
-        ngx_rbtree_delete(&sh->rbtree, &victim->node);
-        ngx_slab_free_locked(shpool, victim);
+        ngx_http_xngin_cache_node_free(sh, shpool, victim);
 
         n = ngx_slab_alloc_locked(shpool, size);
     }
@@ -274,14 +445,90 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     n->action = action;
     n->score = ctx->score;
     n->key_len = (u_short) key->len;
-    n->reason_len = rlen;
-    n->reason_cap = rlen;
+    n->tail_cap = tail_len;
 
     ngx_memcpy(n->data, key->data, key->len);
-    ngx_memcpy(n->data + key->len, ctx->reason.data, rlen);
 
     ngx_rbtree_insert(&sh->rbtree, &n->node);
     ngx_queue_insert_head(&sh->queue, &n->queue);
+    sh->nentries++;
+
+fill:
+
+    n->reason_len = rlen;
+    n->body_len = ctx->deny_body.len;
+    n->ctype_len = ctlen;
+    n->hdrset_len = ngx_http_xngin_kv_tail_len(ctx->res_hdr_set);
+    n->hdrunset_len = ngx_http_xngin_str_tail_len(ctx->res_hdr_unset);
+
+    p = n->data + n->key_len;
+
+    ngx_memcpy(p, ctx->reason.data, rlen);
+    p += rlen;
+    ngx_memcpy(p, ctx->deny_body.data, ctx->deny_body.len);
+    p += ctx->deny_body.len;
+    ngx_memcpy(p, ctx->deny_ctype.data, ctlen);
+    p += ctlen;
+
+    /* res-hdr-set blob */
+    *p++ = (u_char) ((ctx->res_hdr_set ? ctx->res_hdr_set->nelts : 0)
+                     >> 8);
+    *p++ = (u_char) ((ctx->res_hdr_set ? ctx->res_hdr_set->nelts : 0)
+                     & 0xff);
+    if (ctx->res_hdr_set) {
+        kv = ctx->res_hdr_set->elts;
+        for (i = 0; i < ctx->res_hdr_set->nelts; i++) {
+            *p++ = (u_char) (kv[i].name.len >> 8);
+            *p++ = (u_char) (kv[i].name.len & 0xff);
+            p = ngx_cpymem(p, kv[i].name.data, kv[i].name.len);
+            *p++ = (u_char) (kv[i].value.len >> 8);
+            *p++ = (u_char) (kv[i].value.len & 0xff);
+            p = ngx_cpymem(p, kv[i].value.data, kv[i].value.len);
+        }
+    }
+
+    /* res-hdr-unset blob */
+    *p++ = (u_char) ((ctx->res_hdr_unset ? ctx->res_hdr_unset->nelts : 0)
+                     >> 8);
+    *p++ = (u_char) ((ctx->res_hdr_unset ? ctx->res_hdr_unset->nelts : 0)
+                     & 0xff);
+    if (ctx->res_hdr_unset) {
+        nm = ctx->res_hdr_unset->elts;
+        for (i = 0; i < ctx->res_hdr_unset->nelts; i++) {
+            *p++ = (u_char) (nm[i].len >> 8);
+            *p++ = (u_char) (nm[i].len & 0xff);
+            p = ngx_cpymem(p, nm[i].data, nm[i].len);
+        }
+    }
+
+    ngx_shmtx_unlock(&shpool->mutex);
+}
+
+
+/* CONTROL cache-drop: delete a verdict-cache entry by its raw key */
+void
+ngx_http_xngin_cache_drop(ngx_http_xngin_main_conf_t *mmcf, ngx_str_t *key)
+{
+    ngx_http_xngin_cache_shctx_t *sh;
+    ngx_http_xngin_cache_node_t  *n;
+    ngx_slab_pool_t              *shpool;
+    uint64_t                      key_h;
+
+    sh = ngx_http_xngin_cache_sh(mmcf);
+    if (sh == NULL || key == NULL || key->len == 0 || key->len > 1024) {
+        return;
+    }
+
+    key_h = ngx_crc32_long(key->data, key->len);
+    shpool = (ngx_slab_pool_t *) mmcf->cache_zone->shm.addr;
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
+                                  key->data, key->len);
+    if (n) {
+        ngx_http_xngin_cache_node_free(sh, shpool, n);
+    }
 
     ngx_shmtx_unlock(&shpool->mutex);
 }
@@ -312,6 +559,7 @@ ngx_http_xngin_cache_zone_init(ngx_shm_zone_t *shm_zone, void *data)
     ngx_queue_init(&sh->queue);
     sh->nhit = 0;
     sh->nmiss = 0;
+    sh->nentries = 0;
 
     shm_zone->data = sh;
 

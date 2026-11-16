@@ -151,3 +151,13 @@ python3 -m pytest test/cases -q
   freelist. `ngx_http_xngin_ctx_abort` (request cleanup, pool still
   valid) sweeps ALL group conns via `ngx_http_xngin_group_materialize`
   to convert still-queued borrowed pkts to owned copies.
+- macOS loopback TCP input delivery is kernel-coalesced under moderate
+  concurrent load: one-way send->recv latency inflates ~15us -> ~370us
+  even between two bare Python processes. Every XNAP round-trip pays it
+  twice, so `*-tcp` bench lanes cap ~27-38k rps vs ~46k UDS regardless
+  of agent (stub and mini_waf direct-drive to the same ~60-75k
+  ceiling; high in-flight escapes the coalescing entirely ~200k+).
+  Not fixable in userspace: nodelay, keepalive counts, max_streams and
+  runtime flavor all measured flat. Diagnose transport-vs-agent gaps
+  with `cargo test --test direct_bench -- --ignored` (XNAP_ADDR/CONNS/
+  INFLIGHT env) bypassing nginx.

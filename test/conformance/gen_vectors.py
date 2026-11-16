@@ -40,7 +40,7 @@ def expect_repr(v):
     if isinstance(v, bytes):
         return {"$bytes": v.hex()}
     if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
-        return str(v)
+        return {"$ip": str(v)}
     if isinstance(v, (list, tuple)):
         # decoded KVL arrives as list of (name, value) pairs; decoded
         # STRLIST as list of str — distinguish by element shape
@@ -164,6 +164,24 @@ frame("verdict-response", xnap.FT_VERDICT, xnap.FL_FIN, 21, 0,
        ("res-hdr-set", [("x-filtered", "yes")]),
        ("res-body", b"masked"),
        ("vars", [("res_rule", "pii-redact")])])
+
+frame("verdict-body-stream", xnap.FT_VERDICT, xnap.FL_FIN, 23, 0,
+      [("action", "allow"),
+       ("body-stream", xnap.Raw(xnap.VT_UINT32, xnap.enc_varint(1)))])
+
+frame("control-ban-ip", xnap.FT_CONTROL, 0, 2, 0,
+      [("op", "ban-ip"),
+       ("ip", "192.0.2.66"),
+       ("ttl", xnap.Raw(xnap.VT_UINT32, xnap.enc_varint(300)))])
+
+frame("control-ban-ja4", xnap.FT_CONTROL, 0, 2, 0,
+      [("op", "ban-ja4"),
+       ("ja4", "t13d1516h2_8daaf6152771_b186095e22b6"),
+       ("ttl", xnap.Raw(xnap.VT_UINT32, xnap.enc_varint(60)))])
+
+frame("control-cache-drop", xnap.FT_CONTROL, 0, 2, 0,
+      [("op", "cache-drop"),
+       ("key", "/cached-uri")])
 
 out = os.path.join(os.path.dirname(__file__), "vectors.json")
 with open(out, "w") as f:

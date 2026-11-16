@@ -52,9 +52,28 @@ class Stats:
         self.aborts = 0
         self.hello = None
         self.last_response = None
+        self.last_notify = None
+        self.controls = 0
+        self.engine_hello = None
+        self.last_body = None
 
 
 stats = Stats()
+
+
+def _j(v):
+    """JSON-safe rendering of a decoded XNAP value."""
+    if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return str(v)
+    if isinstance(v, bytes):
+        return {"bin": v.hex()}
+    if isinstance(v, (list, tuple)):
+        return [_j(i) for i in v]
+    return v
+
+
+def kvs_json(kvs):
+    return {k: _j(v) for k, v in kvs}
 
 
 def load_rules(path):
@@ -137,6 +156,9 @@ def build_verdict(v):
     if "cache_ttl" in v:
         payload += xnap.enc_kv("cache-ttl", xnap.Raw(
             xnap.VT_UINT32, xnap.enc_varint(v["cache_ttl"])))
+    if v.get("body_stream"):
+        payload += xnap.enc_kv("body-stream", xnap.Raw(
+            xnap.VT_UINT32, xnap.enc_varint(1)))
     if "reason" in v:
         payload += xnap.enc_kv("reason", v["reason"])
     if "score" in v:
@@ -179,6 +201,10 @@ class Conn:
 
     async def handle(self, fr):
         if fr.type == xnap.FT_ENGINE_HELLO:
+            try:
+                stats.engine_hello = kvs_json(fr.kvs())
+            except Exception:
+                stats.engine_hello = {}
             p = bytearray()
             p += xnap.enc_kv("version", xnap.Raw(
                 xnap.VT_UINT32, xnap.enc_varint(xnap.VERSION)))
@@ -189,7 +215,8 @@ class Conn:
             p += xnap.enc_kv("capabilities", xnap.Raw(
                 xnap.VT_UINT32,
                 xnap.enc_varint(xnap.CAP_BODY | xnap.CAP_ASYNC
-                                | xnap.CAP_VCACHE | xnap.CAP_RESP)))
+                                | xnap.CAP_VCACHE | xnap.CAP_RESP
+                                | xnap.CAP_PUSH)))
             p += xnap.enc_kv("agent-id", "xnap-stub/1")
             return xnap.enc_frame(xnap.FT_AGENT_HELLO, 0, 0, 0, bytes(p))
 
@@ -233,6 +260,7 @@ class Conn:
                     "ch_raw_len": len(ch_raw),
                     "ch_raw_hex": ch_raw.hex(),
                 }
+            stats.last_notify = kvs_json(kvs)
             if msg == "http-response":
                 stats.res_notifies += 1
                 stats.last_response = {
@@ -240,6 +268,7 @@ class Conn:
                     "uri": kd.get("uri"),
                     "headers": headers,
                     "request-id": kd.get("request-id"),
+                    "kvs": stats.last_notify,
                 }
             self.streams[fr.sid] = {
                 "msg": msg, "kvs": kvs, "headers": headers,
@@ -292,6 +321,38 @@ class Conn:
         return xnap.enc_frame(xnap.FT_VERDICT, xnap.FL_FIN, sid, 0,
                               payload)
 
+    def enc_controls(self, controls):
+        """Append agent-pushed CONTROL frames (even control sid 2)."""
+        out = b""
+        if isinstance(controls, dict):
+            controls = [controls]
+        for c in controls:
+            p = bytearray()
+            p += xnap.enc_kv("op", c.get("op", ""))
+            for k, v in c.items():
+                if k == "op":
+                    continue
+                if k == "ttl":
+                    p += xnap.enc_kv("ttl", xnap.Raw(
+                        xnap.VT_UINT32, xnap.enc_varint(v)))
+                    continue
+                if k == "ja4" and v == "$hello":
+                    v = (stats.hello or {}).get("ja4", "")
+                p += xnap.enc_kv(k, v)
+            stats.controls += 1
+            out += xnap.enc_frame(xnap.FT_CONTROL, 0, 2, 0, bytes(p))
+        return out
+
+    def enc_stream_body(self, sid, behavior):
+        """behavior.stream_body → streamed replacement BODY frames on
+        the decision stream (terminated by BODY_LAST)."""
+        sb = behavior.get("stream_body")
+        if sb is None:
+            return b""
+        if isinstance(sb, str):
+            sb = sb.encode()
+        return xnap.enc_frame(xnap.FT_BODY, xnap.FL_BODY_LAST, sid, 1, sb)
+
     async def decide(self, sid):
         st = self.streams.pop(sid, None)
         if st is None:
@@ -332,14 +393,17 @@ class Conn:
 
         stats.verdicts += 1
         payload = build_verdict(verdict)
-        return xnap.enc_frame(xnap.FT_VERDICT, xnap.FL_FIN, sid, 0,
-                              payload)
+        return (xnap.enc_frame(xnap.FT_VERDICT, xnap.FL_FIN, sid, 0,
+                               payload)
+                + self.enc_stream_body(sid, behavior)
+                + self.enc_controls(behavior.get("control", [])))
 
     async def decide_res(self, sid, st):
         """Verdict for an http-response stream: rules under "res_rules",
         fallback "res_default"."""
         kvs, headers = st["kvs"], st["headers"]
         body = b"".join(st["bodies"])
+        stats.last_body = body.decode(errors="replace")
         kd = dict(kvs)
 
         rule = None
@@ -374,8 +438,9 @@ class Conn:
 
         stats.verdicts += 1
         payload = build_verdict(verdict)
-        return xnap.enc_frame(xnap.FT_VERDICT, xnap.FL_FIN, sid, 0,
-                              payload)
+        return (xnap.enc_frame(xnap.FT_VERDICT, xnap.FL_FIN, sid, 0,
+                               payload)
+                + self.enc_stream_body(sid, behavior))
 
 
 async def stats_writer(path):

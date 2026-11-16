@@ -394,10 +394,24 @@ ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c, ngx_http_xngin_hello_t *h)
 static ngx_int_t
 ngx_http_xngin_denied(ngx_http_xngin_hello_t *h, ngx_array_t *deny)
 {
-    ngx_str_t   *d;
-    ngx_uint_t   i;
+    ngx_str_t                   *d;
+    ngx_uint_t                   i;
+    ngx_http_xngin_main_conf_t  *mmcf;
 
-    if (h == NULL || h->ja4.len == 0 || deny == NULL) {
+    if (h == NULL || h->ja4.len == 0) {
+        return 0;
+    }
+
+    /* agent-pushed JA4 bans are checked regardless of tls_deny config */
+    mmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
+                                               ngx_http_xngin_module);
+    if (mmcf
+        && ngx_http_xngin_ban_check(mmcf, XNAP_BAN_JA4, &h->ja4))
+    {
+        return 1;
+    }
+
+    if (deny == NULL) {
         return 0;
     }
 

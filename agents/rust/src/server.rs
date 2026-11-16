@@ -69,6 +69,9 @@ pub struct Verdict {
     pub res_body: Option<Vec<u8>>,
     pub vars: Vec<(String, String)>,
     pub cache_ttl: Option<u32>,
+    /// keep the decision stream open: the agent streams a replacement
+    /// body back via BODY frames on the same sid (ended by BODY_LAST)
+    pub body_stream: bool,
     pub reason: Option<String>,
     pub score: Option<i64>,
 }
@@ -143,6 +146,9 @@ impl Verdict {
         if let Some(t) = self.cache_ttl {
             enc_kv(&mut out, "cache-ttl", &Value::Uint(t as u64));
         }
+        if self.body_stream {
+            enc_kv(&mut out, "body-stream", &Value::Uint(1));
+        }
         if let Some(r) = &self.reason {
             enc_kv(&mut out, "reason", &Value::Str(r.clone()));
         }
@@ -168,6 +174,20 @@ pub trait AgentHandler: Send + Sync + 'static {
     async fn early_verdict(&self, _req: &Request) -> Option<Verdict> {
         None
     }
+}
+
+/// Build an agent-pushed CONTROL frame (SPEC §4.6): `op` is
+/// "ban-ip" / "ban-ja4" / "cache-drop", `fields` the op's KVs
+/// (e.g. `("ip", ip)` or `("ttl", secs)`). The frame goes out on
+/// agent-allocated even sid 2; the engine must have advertised
+/// [`CAP_PUSH`].
+pub fn control_frame(op: &str, fields: &[(&str, Value)]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    enc_kv(&mut payload, "op", &Value::Str(op.into()));
+    for (k, v) in fields {
+        enc_kv(&mut payload, k, v);
+    }
+    Frame::new(FT_CONTROL, 0, 2, 0, payload).marshal()
 }
 
 /// XNAP server.
@@ -402,7 +422,7 @@ where
                            &Value::Uint(max_streams as u64));
                     enc_kv(&mut p, "capabilities",
                            &Value::Uint((CAP_BODY | CAP_ASYNC | CAP_VCACHE
-                                         | CAP_RESP) as u64));
+                                         | CAP_RESP | CAP_PUSH) as u64));
                     enc_kv(&mut p, "agent-id",
                            &Value::Str(agent_id.as_str().to_string()));
                     send_frame(&wtx,

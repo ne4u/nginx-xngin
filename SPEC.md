@@ -101,10 +101,11 @@ Receivers MUST reject frames larger than the negotiated `max-frame-size`
 | 0x03 | DISCON      | both    | graceful disconnect                  |
 | 0x04 | NOTIFY      | engine  | request context (§4.1)               |
 | 0x05 | VERDICT     | agent   | decision (§4.2)                      |
-| 0x06 | BODY        | engine  | request-body chunk                   |
+| 0x06 | BODY        | both    | body chunk (§4.2)                    |
 | 0x07 | ABORT       | both    | cancel one stream                    |
 | 0x08 | PING        | both    | liveness + RTT probe                 |
 | 0x09 | PONG        | both    | echo reply                           |
+| 0x0A | CONTROL     | agent   | engine control op (§4.6)             |
 
 ### 3.2 KV payloads
 
@@ -138,9 +139,10 @@ Frame-specific flags (bits 8+):
 ### 3.4 Stream and frame ids
 
 `stream-id` is odd when allocated by the engine (engine sends on odd streams)
-and even when allocated by the agent (reserved for future agent-initiated
-streams). `frame-id` is a per-stream sequence number starting at 0, incremented
-per frame sent by that side; it enables pipelining and replay detection.
+and even when allocated by the agent. Agent-allocated even sids carry
+agent-initiated messages: CONTROL ops (§4.6) use sid 2. `frame-id` is a
+per-stream sequence number starting at 0, incremented per frame sent by that
+side; it enables pipelining and replay detection.
 
 ## 4. Message payloads
 
@@ -168,14 +170,23 @@ v1 is `http-request`:
 | `ja4`         | STR          | JA4 fingerprint of the ClientHello; present when `xngin_tls_inspect` captured it. Agents MAY ignore it and fingerprint `ch-raw` with any scheme |
 | `ch-raw`      | BIN          | raw ClientHello handshake message (incl. 4-byte handshake header); present when `xngin_tls_inspect` captured it — canonical material for arbitrary TLS fingerprinting |
 | `request-id`  | STR          | engine request id, for log correlation    |
+| `vars`        | KVL          | nginx variables captured via `xngin_var` (e.g. `$ssl_client_s_dn`, GeoIP, userid) |
 | `body-len`    | UINT32       | declared Content-Length when known        |
 | `body-truncated` | TRUE      | present when body exceeded capture cap    |
+
+`headers` is filtered by `xngin_header_include` / `xngin_header_exclude`
+when configured — sensitive values such as `cookie` and `authorization`
+only cross the wire when the operator allows them.
 
 ### 4.2 BODY
 
 Payload is raw body bytes. Chunks are arbitrary; `LAST` flag marks the end.
 An agent MAY return a VERDICT before `LAST` (headers-only decision), in which
 case the engine stops sending BODY frames for that stream.
+
+In the agent→engine direction, BODY frames carry a streamed replacement
+body after a `body-stream` VERDICT (§4.3): the stream stays open, the
+agent streams the new body, and `LAST` applies it.
 
 With `xngin_body_inspect on` the engine dispatches the `http-request`
 NOTIFY as soon as the request headers are parsed — while the client
@@ -204,6 +215,7 @@ KV payload:
 | `vars`      | KVL     | exposed to nginx as `$xngin_<name>`          |
 | `cache-key` | STR     | reserved (engine key is authoritative)       |
 | `cache-ttl` | UINT32  | seconds; >0 lets engine cache this verdict   |
+| `body-stream` | TRUE/UINT | on `allow`: keep the stream open; agent streams a replacement body back via BODY frames ending with LAST (§4.2) |
 | `reason`    | STR     | logged via `$xngin_reason`                   |
 | `score`     | INT32   | logged via `$xngin_score`                    |
 
@@ -220,7 +232,7 @@ in blocking mode (fail-closed semantics inside the agent decision itself).
 | `max-frame-size` | UINT32 | receiver cap, bytes                 |
 | `max-streams`    | UINT32 | max concurrent streams on this conn |
 | `engine-id`      | STR    | free-form, e.g. `nginx/1.27.2 w3`   |
-| `capabilities`   | UINT32 | bitmask: 1=BODY 2=ASYNC 4=VCACHE 8=RESP |
+| `capabilities`   | UINT32 | bitmask: 1=BODY 2=ASYNC 4=VCACHE 8=RESP 16=PUSH |
 
 `AGENT_HELLO`: same fields (`agent-id` instead of `engine-id`), plus the
 agent MAY set `capabilities` lower than offered — the engine must honour the
@@ -233,6 +245,35 @@ intersection. Version mismatch (agent cannot serve version 1) ⇒ DISCON.
 
 `ABORT` KV: `reason` STR (optional).
 
+### 4.6 CONTROL — agent-pushed ops
+
+When the engine advertises PUSH (capability bit 16), an agent MAY send
+CONTROL frames on its own even sid (sid 2). They take effect locally and
+immediately — no stream is opened and no reply is sent.
+
+KV payload:
+
+| name    | type   | notes                                       |
+|---------|--------|---------------------------------------------|
+| `op`    | STR    | `ban-ip` / `ban-ja4` / `cache-drop`         |
+| `ip`    | STR    | client address, for `ban-ip`                |
+| `ja4`   | STR    | JA4 fingerprint, for `ban-ja4`              |
+| `key`   | STR    | raw `xngin_cache_key` value, for `cache-drop` |
+| `ttl`   | UINT32 | ban lifetime seconds (default 300)          |
+
+Semantics:
+
+- `ban-ip`: subsequent requests from `ip` are refused (403) in the
+  POST_READ phase, before any other request processing.
+- `ban-ja4`: subsequent ClientHellos carrying `ja4` are aborted during
+  the handshake — the TLS equivalent of `xngin_tls_deny`, but dynamic.
+- `cache-drop`: evicts the verdict-cache entry whose key equals the
+  raw `xngin_cache_key` value.
+
+Bans live in the shared `xngin_ban_zone` when configured (visible to all
+workers) and otherwise in per-worker memory. Entries expire at `ttl`.
+Unknown `op` values are logged and ignored.
+
 ### 4.5 NOTIFY — `http-response`
 
 Second defined message (requires capability bit 8, `RESP`). When enabled
@@ -241,7 +282,13 @@ an `http-response` NOTIFY as soon as they are available — before
 anything reaches the client. Body bytes then stream to the agent as
 BODY frames while the upstream download continues (the engine keeps a
 buffered copy for release/deny). It is a separate stream and gets its
-own VERDICT.
+own VERDICT. Both upstream-proxied and nginx-generated (local) responses
+are inspected; only the module's own decision pages (deny, redirect,
+fail-close) are excluded. When the wire body is compressed
+(`Content-Encoding: gzip`, `deflate`, or `br`), the held copy is
+inflated and the agent receives plaintext BODY frames with a
+`decompressed` field naming the wire encoding; the client still gets
+the compressed bytes.
 
 | name          | type    | notes                                        |
 |---------------|---------|----------------------------------------------|
@@ -249,6 +296,10 @@ own VERDICT.
 | `method`      | STR     | original request method                      |
 | `status`      | INT32   | upstream response status                     |
 | `headers`     | KVL     | response headers, lower-cased names          |
+| `req-headers` | KVL     | request headers (filtered), for correlation  |
+| `ja4`         | STR     | client JA4, when `xngin_tls_inspect` ran     |
+| `vars`        | KVL     | the same `xngin_var` set as the request      |
+| `decompressed`| STR     | wire Content-Encoding when BODY frames carry the inflated body (`gzip`, `deflate`, `br`) |
 | `body-len`    | UINT32  | declared Content-Length when known           |
 | `request-id`  | STR     | same id as the matching `http-request`       |
 
@@ -269,6 +320,8 @@ The response VERDICT uses the same fields as §4.3 with these differences:
 - `action allow` (default): `res-hdr-set`/`res-hdr-unset`/`res-body`
   rewrite the held response; `vars` are recorded too late for headers
   already sent on the request pass but still reach the access log.
+  `body-stream` on `allow` keeps the stream open so the agent can
+  stream a replacement body back via BODY frames (§4.2).
 - `action deny`: the held response is discarded; the engine emits
   `status` (default 403) + `body`/`content-type` exactly like a request
   deny. `redirect` behaves likewise.
@@ -304,6 +357,13 @@ engine connect → ENGINE_HELLO → AGENT_HELLO → READY
   captured the request body (`xngin_body_inspect`); an unread body cannot be
   swapped and the field is ignored. Ignored in ASYNC mode — the request has
   already been proxied.
+- `body-stream`: on an `allow` verdict the engine keeps the stream
+  registered and the agent streams the replacement body back as BODY
+  frames on the same sid; the frame carrying `LAST` completes the
+  replacement. On the request stream it replaces the upstream-bound
+  body (like `req-body`); on an `http-response` stream it replaces the
+  held response (like `res-body`) — this is the path for payloads that
+  do not fit a single frame.
 - `res-hdr-set` / `res-hdr-unset`: applied to the downstream response headers
   before they reach the client (works in both blocking and ASYNC modes).
 - `res-body`: the upstream request still runs; the response body is replaced
@@ -314,12 +374,15 @@ engine connect → ENGINE_HELLO → AGENT_HELLO → READY
 - `redirect`: engine emits 3xx with `Location`.
 - `cache-ttl`: the engine looks up a per-request key computed by its own
   `xngin_cache_key` config directive *before* dispatch. When a verdict carries
-  `cache-ttl` > 0 (and no `hdr-set`, `hdr-unset`, `req-body`, `res-hdr-set`,
-  `res-hdr-unset`, `res-body`, `body`, `location`, `redirect` or `vars` —
-  those verdicts are not cacheable), the engine MAY
-  store the verdict in shared memory under that key. Verdict `cache-key` is
-  accepted but ignored; the engine key is authoritative so lookups stay
-  computable without an agent round-trip.
+  `cache-ttl` > 0 (and no `hdr-set`, `hdr-unset`, `req-body`, `res-body`,
+  `location`, `redirect` or `vars` — those verdicts are not cacheable),
+  the engine MAY store the verdict in shared memory under that key —
+  including the deny `status`, `body`/`content-type`, and
+  `res-hdr-set`/`res-hdr-unset` response mutations, which replay without
+  an agent round-trip. Verdict `cache-key` is accepted but ignored; the
+  engine key is authoritative so lookups stay computable without an agent
+  round-trip. A cached entry can be evicted with the `cache-drop` CONTROL
+  op (§4.6).
 
 ## 7. Failure handling (engine side)
 

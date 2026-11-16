@@ -851,3 +851,584 @@ def test_upload_drain_default(stack):
     resp2 = sock.recv(65536)
     assert b" 200 " in resp2.split(b"\r\n", 1)[0]
     sock.close()
+
+
+# ---- xngin_var / header filtering (NOTIFY enrichment) ----
+
+def test_xngin_var_forward(stack):
+    """xngin_var values land in the NOTIFY 'vars' KVL."""
+    s = stack(agents_rules=[ALLOW],
+              loc_extra="xngin_var tenant $http_x_tenant;"
+                        " xngin_var remote $remote_addr;").start()
+    st, _, _ = s.request("/", headers={"x-tenant": "acme"})
+    assert st == 200
+    ln = _wait_stats(s.agents[0], "last_notify")
+    assert ln, "no last_notify in stub stats"
+    v = dict(ln["vars"])
+    assert v.get("tenant") == "acme"
+    assert v.get("remote") == "127.0.0.1"
+
+
+def test_header_exclude(stack):
+    """xngin_header_exclude drops named headers from the NOTIFY."""
+    s = stack(agents_rules=[ALLOW],
+              loc_extra="xngin_header_exclude cookie;"
+                        " xngin_header_exclude authorization;").start()
+    s.request("/", headers={"cookie": "session=abc",
+                            "authorization": "Bearer tok",
+                            "x-ok": "1"})
+    ln = _wait_stats(s.agents[0], "last_notify")
+    hdrs = dict(ln["headers"])
+    names = [h[0] for h in ln["headers"]]
+    assert "x-ok" in names
+    assert "cookie" not in names
+    assert "authorization" not in names
+
+
+def test_header_include(stack):
+    """xngin_header_include allowlists the NOTIFY headers."""
+    s = stack(agents_rules=[ALLOW],
+              loc_extra="xngin_header_include host;"
+                        " xngin_header_include x-ok;").start()
+    s.request("/", headers={"cookie": "session=abc",
+                            "x-ok": "1",
+                            "user-agent": "pytest"})
+    ln = _wait_stats(s.agents[0], "last_notify")
+    names = sorted(h[0] for h in ln["headers"])
+    assert names == ["host", "x-ok"]
+
+
+def test_response_notify_context(stack):
+    """http-response NOTIFY carries req-headers + vars (filtered)."""
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "allow"},
+             "rules": []}
+    s = stack(agents_rules=[rules],
+              loc_extra=RESPOND +
+                        " xngin_var tenant $http_x_tenant;"
+                        " xngin_header_exclude cookie;").start()
+    st, _, _ = s.request("/", headers={"x-tenant": "acme",
+                                       "cookie": "session=abc"})
+    assert st == 200
+    lr = _wait_stats(s.agents[0], "last_response")
+    assert lr, "no http-response notify"
+    kvs = lr["kvs"]
+    req_hdrs = [h[0] for h in kvs["req-headers"]]
+    assert "x-tenant" in req_hdrs
+    assert "cookie" not in req_hdrs        # exclude applies here too
+    assert "set-cookie" not in [h[0] for h in kvs["headers"]]
+    assert dict(kvs["vars"]).get("tenant") == "acme"
+
+
+# ---- operational edges: rich cache, $xngin_agent, status, internal ----
+
+def test_cache_deny_body_replay(stack):
+    """cached deny carries its body + extra headers — no round trip."""
+    rules = {"default": {"action": "deny", "status": 451,
+                         "reason": "branded",
+                         "body": "BRANDED-BLOCK",
+                         "content_type": "text/plain",
+                         "res_hdr_set": {"x-block-ref": "r-1"},
+                         "cache_ttl": 60},
+             "rules": []}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_cache_key $binary_remote_addr;",
+              main_extra="xngin_cache_zone vcache:1m;").start()
+    st, hdrs, body = s.request("/")
+    assert st == 451 and body == b"BRANDED-BLOCK"
+    assert hdrs.get("x-block-ref") == "r-1"
+    time.sleep(0.7)
+    n1 = s.agents[0].stats().get("notifies", 0)
+    st, hdrs, body = s.request("/")
+    assert st == 451 and body == b"BRANDED-BLOCK"
+    assert hdrs.get("x-block-ref") == "r-1"
+    assert "cache=hit" in s.access_log()
+    assert s.agents[0].stats().get("notifies", 0) == n1
+
+
+def test_xngin_agent_var(stack):
+    """$xngin_agent names the conn that served the decision."""
+    s = stack(agents_rules=[ALLOW]).start()
+    s.request("/")
+    time.sleep(0.3)
+    log = s.access_log()
+    assert "agent=unix:" in log
+
+
+def test_xngin_status_endpoint(stack):
+    """xngin_status location emits pool health + cache counters."""
+    blocks = "location = /status { xngin_status; }"
+    s = stack(agents_rules=[ALLOW], loc_blocks=blocks,
+              main_extra="xngin_cache_zone vcache:1m;").start()
+    st, _, body = s.request("/status")
+    assert st == 200
+    j = json.loads(body)
+    g = j["groups"][0]
+    assert g["name"] == "waf"
+    conns = g["agents"][0]["conns"]
+    assert conns and conns[0]["ready"] is True
+    assert j["cache"]["enabled"] is True
+
+
+def test_xngin_internal_off(stack):
+    """xngin_internal off: internal redirects skip the agent."""
+    blocks = ("error_page 404 = @nf;\n"
+              "location = /gone { try_files /none =404; }\n"
+              "location @nf { xngin_enable on; xngin_group waf;"
+              " xngin_internal off; empty_gif; }")
+    s = stack(agents_rules=[ALLOW], loc_blocks=blocks).start()
+    time.sleep(0.7)
+    n1 = s.agents[0].stats().get("notifies", 0)
+    st, _, _ = s.request("/gone")
+    assert st == 200
+    time.sleep(0.7)
+    # /gone has no xngin; @nf declined internally -> agent untouched
+    assert s.agents[0].stats().get("notifies", 0) == n1
+
+
+def test_xngin_internal_default(stack):
+    """default (on): the internal-redirected location is consulted."""
+    blocks = ("error_page 404 = @nf;\n"
+              "location = /gone { try_files /none =404; }\n"
+              "location @nf { xngin_enable on; xngin_group waf;"
+              " xngin_timeout 300ms; empty_gif; }")
+    s = stack(agents_rules=[ALLOW], loc_blocks=blocks).start()
+    time.sleep(0.7)
+    n1 = s.agents[0].stats().get("notifies", 0)
+    st, _, _ = s.request("/gone")
+    assert st == 200
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) > n1
+
+
+# ---- group balancing: backup, hash pick, DNS re-resolution ----
+
+def test_backup_failover(stack):
+    """backup servers take traffic only once all primaries are out."""
+    rules_b = {"default": {"action": "deny", "status": 403,
+                           "reason": "backup"}, "rules": []}
+    s = stack(agents_rules=[ALLOW, rules_b],
+              server_suffix=["", " backup"]).start()
+    st, _, _ = s.request("/")
+    assert st == 200
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) >= 1
+    assert s.agents[1].stats().get("notifies", 0) == 0
+
+    s.agents[0].kill()
+
+    denied = False
+    for _ in range(40):
+        st, _, _ = s.request("/")
+        if st == 403:
+            denied = True
+            break
+        time.sleep(0.25)
+    assert denied, "backup agent never picked up traffic"
+    time.sleep(0.7)
+    assert s.agents[1].stats().get("notifies", 0) >= 1
+
+
+def test_balance_hash(stack):
+    """balance hash $arg_k: same key -> same agent conn."""
+    ra = {"default": {"action": "deny", "status": 418, "reason": "A"},
+          "rules": []}
+    rb = {"default": {"action": "deny", "status": 419, "reason": "B"},
+          "rules": []}
+    s = stack(agents_rules=[ra, rb],
+              group_extra="balance hash $arg_k;").start()
+    st1, _, _ = s.request("/?k=x")
+    for _ in range(5):
+        st, _, _ = s.request("/?k=x")
+        assert st == st1
+    assert st1 in (418, 419)
+
+
+def _dns_reply(q, ip):
+    """minimal answer echoing the question section; A queries get an A
+    record, anything else (e.g. AAAA) gets an empty NOERROR."""
+    import struct
+    if len(q) < 12:
+        return None
+    i = 12
+    while i < len(q) and q[i]:
+        i += q[i] + 1
+    i += 1                      # root label
+    qtype = struct.unpack(">H", q[i:i + 2])[0] if i + 2 <= len(q) else 0
+    i += 4                      # qtype + qclass
+    if i > len(q):
+        return None
+    hdr = bytearray(q[:12])
+    hdr[2] = 0x81
+    hdr[3] = 0x80
+    hdr[8] = hdr[9] = hdr[10] = hdr[11] = 0
+    if qtype == 1:              # A
+        hdr[6] = 0
+        hdr[7] = 1
+        ans = (b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 1, 4)
+               + socket.inet_aton(ip))
+        return bytes(hdr) + q[12:i] + ans
+    hdr[6] = hdr[7] = 0         # no records for other qtypes
+    return bytes(hdr) + q[12:i]
+
+
+class _DnsStub:
+    """one-question DNS responder; answer_ip() decides per query."""
+
+    def __init__(self, answer_ip):
+        from stacklib import free_port
+        self.answer_ip = answer_ip
+        self.port = free_port()
+        self.queries = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", self.port))
+        import threading
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self):
+        while True:
+            try:
+                data, peer = self.sock.recvfrom(512)
+            except OSError:
+                return
+            self.queries += 1
+            resp = _dns_reply(data, self.answer_ip())
+            if resp:
+                self.sock.sendto(resp, peer)
+
+
+def test_resolve_rediscovery(stack):
+    """server ... resolve: unresolvable at config load, then DNS brings
+    up the right address after a refresh."""
+    state = {"n": 0}
+
+    def answer():
+        state["n"] += 1
+        # unroutable for the first answers, then the real address —
+        # the conn bound to the stale IP must be recycled
+        return "10.255.255.1" if state["n"] <= 2 else "127.0.0.1"
+
+    dns = _DnsStub(answer)
+    s = stack(agents_rules=[ALLOW], tcp_agents=True,
+              server_hosts=["agent.test"],
+              server_suffix=[" resolve"],
+              group_extra="resolve_interval 5s;",
+              main_extra=f"resolver 127.0.0.1:{dns.port} valid=1s;"
+              ).start()
+
+    # before the good answer lands the agent is unreachable -> 503
+    st, _, _ = s.request("/")
+    assert st == 503
+
+    for _ in range(60):
+        st, _, _ = s.request("/")
+        if st == 200:
+            break
+        time.sleep(0.5)
+    assert st == 200, "agent never came up after DNS change"
+
+
+# ---- sequential groups ----
+
+DENY403 = {"default": {"action": "deny", "status": 403,
+                       "reason": "step1-deny"}, "rules": []}
+DENY451 = {"default": {"action": "deny", "status": 451,
+                       "reason": "step2-deny"}, "rules": []}
+CHAIN2 = "xngin_group auth;\n            xngin_group waf2;"
+
+
+def test_chain_two_groups(stack):
+    """allow at step 1 advances to step 2; step 2's verdict wins."""
+    s = stack(agents_rules=[ALLOW, DENY451],
+              extra_groups={"auth": [0], "waf2": [1]},
+              loc_group=CHAIN2).start()
+    st, _, _ = s.request("/")
+    assert st == 451
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) >= 1
+    assert s.agents[1].stats().get("notifies", 0) >= 1
+
+
+def test_chain_first_denies(stack):
+    """a deny at step 1 short-circuits: step 2 never sees the request."""
+    s = stack(agents_rules=[DENY403, ALLOW],
+              extra_groups={"auth": [0], "waf2": [1]},
+              loc_group=CHAIN2).start()
+    st, _, _ = s.request("/")
+    assert st == 403
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) >= 1
+    assert s.agents[1].stats().get("notifies", 0) == 0
+
+
+def test_chain_all_allow(stack):
+    """all steps allow -> request proceeds."""
+    s = stack(agents_rules=[ALLOW, ALLOW],
+              extra_groups={"auth": [0], "waf2": [1]},
+              loc_group=CHAIN2).start()
+    st, _, _ = s.request("/")
+    assert st == 200
+    time.sleep(0.7)
+    assert s.agents[1].stats().get("notifies", 0) >= 1
+
+
+def test_chain_step_fail_open(stack):
+    """fail=open on a dead step skips to the next step."""
+    s = stack(agents_rules=[ALLOW],
+              extra_groups={"dead": ["unix:/tmp/xngin-dead-ng.sock"],
+                            "waf2": [0]},
+              loc_group="xngin_group dead fail=open timeout=100ms;\n"
+                        "            xngin_group waf2;").start()
+    st, _, _ = s.request("/")
+    assert st == 200
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) >= 1
+
+
+def test_chain_step_fail_close(stack):
+    """fail=close on a dead step 503s before reaching step 2."""
+    s = stack(agents_rules=[ALLOW, ALLOW],
+              extra_groups={"dead": ["unix:/tmp/xngin-dead-ng.sock"],
+                            "waf2": [1]},
+              loc_group="xngin_group dead fail=close timeout=100ms;\n"
+                        "            xngin_group waf2;").start()
+    st, _, _ = s.request("/")
+    assert st == 503
+    time.sleep(0.7)
+    assert s.agents[1].stats().get("notifies", 0) == 0
+
+
+def test_chain_step_timeout(stack):
+    """per-step timeout: slow step 1 fails open, step 2 still serves —
+    and the late step-1 verdict is ignored (stale stream)."""
+    slow = {"default": {"action": "deny", "status": 403},
+            "rules": [{"match": {"header": {"x-any": "1"}},
+                       "behavior": {"delay_ms": 900},
+                       "verdict": {"action": "deny", "status": 403}}]}
+    s = stack(agents_rules=[slow, ALLOW],
+              extra_groups={"auth": [0], "waf2": [1]},
+              loc_group="xngin_group auth fail=open timeout=50ms;\n"
+                        "            xngin_group waf2 timeout=500ms;"
+              ).start()
+    st, _, _ = s.request("/", headers={"x-any": "1"})
+    # step 1 times out at 50ms -> fail open -> step 2 allows (200);
+    # the deny verdict landing ~900ms later must not corrupt state
+    assert st == 200
+    time.sleep(1.0)
+    st, _, _ = s.request("/", headers={"x-any": "1"})
+    assert st == 200
+
+
+# ---- Phase 5: CONTROL push ops (ban-ip / ban-ja4 / cache-drop) ----
+
+def test_control_caps(stack):
+    """ENGINE_HELLO advertises CAP_PUSH so agents may send CONTROL."""
+    s = stack(agents_rules=[ALLOW]).start()
+    s.request("/")
+    time.sleep(0.6)
+    eh = (s.agents[0].stats() or {}).get("engine_hello") or {}
+    assert eh.get("capabilities", 0) & 0x10
+
+
+def test_control_ban_ip(stack):
+    """ban-ip pushed by the agent denies the client in POST_READ."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/ban"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "ban-ip", "ip": "127.0.0.1",
+                                  "ttl": 60}}}]}
+    s = stack(agents_rules=[rules]).start()
+    assert s.request("/")[0] == 200
+    assert s.request("/ban")[0] == 200
+    time.sleep(0.3)
+    assert s.request("/")[0] == 403
+
+
+def test_control_ban_ip_zone(stack):
+    """bans survive in the shared xngin_ban_zone."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/ban"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "ban-ip", "ip": "127.0.0.1",
+                                  "ttl": 60}}}]}
+    s = stack(agents_rules=[rules],
+              main_extra="xngin_ban_zone bans:1m;").start()
+    assert s.request("/ban")[0] == 200
+    time.sleep(0.3)
+    assert s.request("/")[0] == 403
+
+
+def test_control_ban_ip_ttl(stack):
+    """ban entries expire after their ttl."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/ban"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "ban-ip", "ip": "127.0.0.1",
+                                  "ttl": 2}}}]}
+    s = stack(agents_rules=[rules]).start()
+    assert s.request("/ban")[0] == 200
+    time.sleep(0.3)
+    assert s.request("/")[0] == 403
+    time.sleep(2.6)
+    assert s.request("/")[0] == 200
+
+
+def test_control_ban_ja4(stack):
+    """ban-ja4 aborts the next ClientHello carrying that JA4."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/banja4"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "ban-ja4", "ja4": "$hello",
+                                  "ttl": 60}}}]}
+    s = stack(agents_rules=[rules], ssl=True,
+              srv_extra="xngin_tls_inspect on;").start()
+    assert s.request("/")[0] == 200
+    hello = _wait_hello(s.agents[0])
+    assert hello and hello["ja4"]
+    assert s.request("/banja4")[0] == 200
+    time.sleep(0.3)
+    with pytest.raises(OSError):
+        s.request("/")
+
+
+def test_control_cache_drop(stack):
+    """cache-drop evicts a cached verdict so the next request re-decides."""
+    rules = {"default": {"action": "allow", "cache_ttl": 60}, "rules": [
+        {"match": {"uri_contains": "/drop"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "cache-drop",
+                                  "key": "/cache-me"}}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_cache_key $uri;",
+              main_extra="xngin_cache_zone vcache:1m;").start()
+    s.request("/cache-me")
+    s.request("/cache-me")            # replayed from cache
+    time.sleep(0.6)
+    n0 = (s.agents[0].stats() or {}).get("notifies", 0)
+    s.request("/drop")                # pushes cache-drop "/cache-me"
+    time.sleep(0.3)
+    s.request("/cache-me")            # back to the agent
+    s.request("/cache-me")            # cached again
+    time.sleep(0.6)
+    n1 = (s.agents[0].stats() or {}).get("notifies", 0)
+    assert n1 - n0 == 2               # drop + re-decide, then hit
+
+
+def test_control_unknown_op(stack):
+    """an unknown CONTROL op is logged and ignored, not fatal."""
+    rules = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/x"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "bogus-op", "ttl": 1}}}]}
+    s = stack(agents_rules=[rules]).start()
+    assert s.request("/x")[0] == 200
+    time.sleep(0.3)
+    assert s.request("/")[0] == 200
+
+
+# ---- Phase 4: decompression, local responses, streamed replacement ----
+
+def test_resp_gzip_inspect(stack):
+    """gzip wire body: agent inspects the inflated plaintext."""
+    import gzip as _gz
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "deny", "status": 500},
+             "rules": [], "res_rules": [
+                 {"match": {"body_contains": '"path": "/gzip"'},
+                  "verdict": {"action": "allow"}}]}
+    s = stack(agents_rules=[rules], loc_extra=RESPOND).start()
+    st, hdrs, body = s.request("/gzip")
+    assert st == 200                       # agent matched on plaintext
+    hdrs = {k.lower(): v for k, v in hdrs.items()}
+    assert hdrs.get("content-encoding") == "gzip"
+    assert json.loads(_gz.decompress(body))["path"] == "/gzip"
+    time.sleep(0.6)
+    ln = (s.agents[0].stats() or {}).get("last_body") or ""
+    assert '"path": "/gzip"' in ln         # BODY frames were inflated
+
+
+def test_resp_brotli_inspect(stack):
+    """brotli wire body: agent inspects the inflated plaintext."""
+    import brotli as _br
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "deny", "status": 500},
+             "rules": [], "res_rules": [
+                 {"match": {"body_contains": '"path": "/br"'},
+                  "verdict": {"action": "allow"}}]}
+    s = stack(agents_rules=[rules], loc_extra=RESPOND).start()
+    st, hdrs, body = s.request("/br")
+    assert st == 200
+    hdrs = {k.lower(): v for k, v in hdrs.items()}
+    assert hdrs.get("content-encoding") == "br"
+    assert json.loads(_br.decompress(body))["path"] == "/br"
+
+
+def test_resp_local_inspect(stack):
+    """nginx-generated (local) responses reach the agent too."""
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "deny", "status": 451,
+                             "body": "local blocked",
+                             "content_type": "text/plain"},
+             "rules": []}
+    s = stack(agents_rules=[rules],
+              loc_extra=RESPOND, loc_blocks='''
+        location /gif {
+            empty_gif;
+            xngin_enable on;
+            xngin_group waf;
+            xngin_response on;
+            xngin_res_body_max 64k;
+        }
+''').start()
+    st, _, body = s.request("/gif")        # local empty_gif response
+    assert st == 451                       # denied by res_default
+    assert body == b"local blocked"
+
+
+def test_resp_own_deny_not_inspected(stack):
+    """the module's own deny page must not trigger response inspection."""
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "allow"},
+             "rules": [
+                 {"match": {"uri_contains": "/no"},
+                  "verdict": {"action": "deny", "status": 403}}]}
+    s = stack(agents_rules=[rules], loc_extra=RESPOND).start()
+    s.request("/")                         # upstream resp → inspected
+    time.sleep(0.6)
+    n0 = (s.agents[0].stats() or {}).get("res_notifies", 0)
+    st, _, _ = s.request("/no")
+    assert st == 403
+    time.sleep(0.6)
+    n1 = (s.agents[0].stats() or {}).get("res_notifies", 0)
+    assert n1 == n0                        # deny page not re-inspected
+
+
+def test_streamed_res_replace(stack):
+    """body-stream verdict + BODY frames replace the response body."""
+    rules = {"default": {"action": "allow"},
+             "res_default": {"action": "allow", "body_stream": True},
+             "rules": [], "res_rules": [
+                 {"match": {"body_contains": '"path": "/"'},
+                  "verdict": {"action": "allow", "body_stream": True},
+                  "behavior": {"stream_body": "STREAMED-REPLACEMENT"}}]}
+    s = stack(agents_rules=[rules], loc_extra=RESPOND).start()
+    st, _, body = s.request("/")
+    assert st == 200
+    assert body == b"STREAMED-REPLACEMENT"
+
+
+def test_streamed_req_replace(stack):
+    """body-stream verdict + BODY frames replace the request body."""
+    rules = {"default": {"action": "allow", "body_stream": True},
+             "rules": [
+                 {"match": {"uri_contains": "/p"},
+                  "verdict": {"action": "allow", "body_stream": True},
+                  "behavior": {"stream_body": "REPLACED-REQ-BODY"}}]}
+    s = stack(agents_rules=[rules],
+              loc_extra="xngin_body_inspect on; "
+                        "xngin_body_replace on;").start()
+    st, _, body = s.request("/p", method="POST", data=b"original",
+                            headers={"content-type": "text/plain"})
+    assert st == 200
+    assert json.loads(body)["body"] == "REPLACED-REQ-BODY"

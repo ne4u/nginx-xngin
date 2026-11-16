@@ -33,8 +33,14 @@ to a no-offload baseline on the same nginx instance.
 - Agents: Python stub (`allow-all`) on UDS; second stub on loopback TCP;
   Go `edge-guard` (`-rate 0`) on UDS; `test/bench/echo_agent.c` — a
   ~1µs-CPU C agent answering a fixed allow verdict — on UDS for the
-  `c-echo` lane; Rust `mini_waf` example (regex rules over URI/headers)
-  on UDS for `rust-block`; Python stub behind `ssl on` for `mtls-block`;
+  `c-echo` lane; Rust `mini_waf` example (regex rules over URI/headers,
+  body rules under `xngin_body_inspect`) — one UDS instance serves the
+  `rust-block`/`rust-async`/`rust-cache`/`rust-body-*`/`rust-resp`
+  lanes, a second with `--threshold 80` denies on `/rustdeny`
+  (path-embedded `/etc/passwd` trips the proto-environ rule), a third
+  on loopback TCP for `rust-tcp`, a fourth with
+  `--tls-cert/--tls-key/--tls-client-ca` behind `ssl on` for
+  `rust-mtls`; Python stub behind `ssl on` for `mtls-block`;
   a second `edge-guard` with `-tls-cert/-tls-key/-tls-client-ca` behind
   `ssl on` for `go-mtls`. c-echo also self-reports service time as
   `$xngin_agentus` (verdict `vars`).
@@ -131,6 +137,21 @@ send→verdict window.
 ## Caveats
 
 - Loopback only — a remote agent adds real network RTT on top.
+- **macOS loopback TCP throughput is kernel-bounded, not agent-bounded.**
+  The `*-tcp` lanes cap well below their UDS twins (rust-tcp ≈ 27k vs
+  rust-block ≈ 46k) because macOS coalesces loopback TCP delivery:
+  measured one-way socket latency goes ~15µs idle → ~370µs under
+  moderate concurrent TCP traffic — even between two plain processes
+  with no agent involved. Two deliveries per XNAP round-trip put a
+  ~750µs floor on each stream, and the penalty deepens with queue
+  depth, so extra agent conns don't help (keepalive 1 → 16 is flat).
+  Verified not to be Nagle (TCP_NODELAY set on both ends), conn churn
+  (stable keepalives), agent pipelining (`max_streams 1` unchanged), or
+  the Rust SDK (direct-driven, no nginx, it sustains ~200k verdicts/s
+  at high in-flight — packet chains flush on depth and delivery is
+  immediate; the Python stub direct-drives to the same ceiling).
+  Prefer `unix:` agent sockets for co-located agents on macOS; remote
+  TCP agents and Linux loopback don't share this pathology.
 - `enc`/`sys`/`agent` are engine-side timers; `agent` bundles agent CPU
   with transport wakeup (cross-checked on c-echo by `agentus`).
 - `sys` recv attribution is per read-event: a single `recv` delivering

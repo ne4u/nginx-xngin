@@ -11,8 +11,10 @@ static void ngx_http_xngin_conn_close(ngx_http_xngin_conn_t *c);
 static void ngx_http_xngin_conn_connect(ngx_http_xngin_conn_t *c);
 static void ngx_http_xngin_conn_fail_streams(ngx_http_xngin_conn_t *c);
 static ngx_int_t ngx_http_xngin_conn_flush(ngx_http_xngin_conn_t *c);
+static void ngx_http_xngin_resolve_timer(ngx_event_t *ev);
 
-void ngx_http_xngin_ctx_conn_failed(ngx_http_xngin_ctx_t *ctx);
+void ngx_http_xngin_ctx_conn_failed(ngx_http_xngin_ctx_t *ctx,
+    uint64_t sid);
 
 
 /* ---------- raw stack encoders (handshake path) ---------- */
@@ -164,11 +166,25 @@ ngx_http_xngin_stream_del(ngx_http_xngin_conn_t *c, uint64_t sid)
 
 /* ---------- worker lifecycle ---------- */
 
+static ngx_addr_t *
+ngx_http_xngin_agent_addr(ngx_http_xngin_agent_t *a)
+{
+    if (a->naddrs) {
+        return &a->addrs[a->rr++ % a->naddrs];
+    }
+    if (a->resolve) {
+        return NULL;   /* DNS pending — stays down until first refresh */
+    }
+    return &a->addr;
+}
+
+
 ngx_int_t
 ngx_http_xngin_conn_init_worker(ngx_http_xngin_main_conf_t *mmcf,
     ngx_cycle_t *cycle)
 {
     ngx_uint_t               i, j, k;
+    ngx_event_t             *rev;
     ngx_http_xngin_group_t  *g;
     ngx_http_xngin_agent_t  *a;
     ngx_http_xngin_conn_t   *c;
@@ -180,6 +196,26 @@ ngx_http_xngin_conn_init_worker(ngx_http_xngin_main_conf_t *mmcf,
     g = mmcf->groups->elts;
 
     for (i = 0; i < mmcf->groups->nelts; i++) {
+
+        if (g[i].has_resolve) {
+            if (g[i].resolver) {
+                rev = ngx_pcalloc(cycle->pool, sizeof(ngx_event_t));
+                if (rev == NULL) {
+                    return NGX_ERROR;
+                }
+                rev->handler = ngx_http_xngin_resolve_timer;
+                rev->data = &g[i];
+                rev->log = cycle->log;
+                g[i].resolve_timer = rev;
+                ngx_add_timer(rev, 1000);
+            } else {
+                ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                              "xngin: group \"%V\" has resolve servers "
+                              "but no resolver is configured",
+                              &g[i].name);
+            }
+        }
+
         a = g[i].agents.elts;
 
         for (j = 0; j < g[i].agents.nelts; j++) {
@@ -237,7 +273,13 @@ ngx_http_xngin_conn_connect(ngx_http_xngin_conn_t *c)
 {
     ngx_int_t            rc;
     ngx_peer_connection_t *pc;
-    ngx_addr_t           *addr = &c->agent->addr;
+    ngx_addr_t           *addr = ngx_http_xngin_agent_addr(c->agent);
+
+    if (addr == NULL) {
+        c->down = 1;
+        ngx_add_timer(c->timer, XNAP_RECONNECT_DELAY);
+        return;
+    }
 
     c->down = 0;   /* attempting connect */
 
@@ -247,6 +289,13 @@ ngx_http_xngin_conn_connect(ngx_http_xngin_conn_t *c)
     pc->sockaddr = addr->sockaddr;
     pc->socklen = addr->socklen;
     pc->name = &c->agent->url_text;
+
+    if (addr->socklen <= sizeof(c->bound)) {
+        ngx_memcpy(&c->bound, addr->sockaddr, addr->socklen);
+        c->bound_len = addr->socklen;
+    } else {
+        c->bound_len = 0;
+    }
     pc->get = ngx_event_get_peer;
     pc->log = ngx_cycle->log;
     pc->log_error = NGX_ERROR_ERR;
@@ -943,7 +992,7 @@ ngx_http_xngin_conn_write(ngx_event_t *ev)
         p = xnap_enc_kv_uint(p, "max-streams", XNAP_DEFAULT_MAX_STREAM);
         p = xnap_enc_kv_uint(p, "capabilities",
                              XNAP_CAP_BODY | XNAP_CAP_ASYNC | XNAP_CAP_VCACHE
-                             | XNAP_CAP_RESP);
+                             | XNAP_CAP_RESP | XNAP_CAP_PUSH);
         p = xnap_enc_kv_str(p, "engine-id", e.data, e.len);
 
         c->hello_sent = 1;
@@ -1037,9 +1086,9 @@ ngx_http_xngin_conn_frame(ngx_http_xngin_conn_t *c, u_char type,
         }
         ctx->rx_us = c->rx_us;  /* recv time of the delivering read event */
         if (ctx->is_resp) {
-            return ngx_http_xngin_resp_verdict(c, ctx, payload, len);
+            return ngx_http_xngin_resp_verdict(c, ctx, sid, payload, len);
         }
-        return ngx_http_xngin_verdict(c, ctx, payload, len);
+        return ngx_http_xngin_verdict(c, ctx, sid, payload, len);
 
     case XNAP_FRAME_PING:
         return ngx_http_xngin_conn_send(c, XNAP_FRAME_PONG, 0, 0, fid,
@@ -1050,11 +1099,22 @@ ngx_http_xngin_conn_frame(ngx_http_xngin_conn_t *c, u_char type,
         c->last_rtt = ngx_current_msec - c->ping_sent_at;
         return NGX_OK;
 
+    case XNAP_FRAME_CONTROL:
+        return ngx_http_xngin_control(c, payload, len);
+
+    case XNAP_FRAME_BODY:
+        /* agent-pushed replacement body on a body-stream stream */
+        ctx = ngx_http_xngin_stream_find(c, sid);
+        if (ctx == NULL || !ctx->repl_wait) {
+            return NGX_OK;
+        }
+        return ngx_http_xngin_repl_body(c, ctx, flags, payload, len);
+
     case XNAP_FRAME_ABORT:
         ctx = ngx_http_xngin_stream_find(c, sid);
         if (ctx) {
             ngx_http_xngin_stream_del(c, sid);
-            ngx_http_xngin_ctx_conn_failed(ctx);
+            ngx_http_xngin_ctx_conn_failed(ctx, sid);
         }
         return NGX_OK;
 
@@ -1312,13 +1372,13 @@ ngx_http_xngin_conn_fail_streams(ngx_http_xngin_conn_t *c)
 
     for (i = 0; i < c->streams_cap; i++) {
         if (c->streams[i].id) {
+            uint64_t id = c->streams[i].id;
             ctx = c->streams[i].ctx;
             c->streams[i].id = 0;
             c->streams[i].ctx = NULL;
-            c->nstreams = 0;
 
             if (ctx) {
-                ngx_http_xngin_ctx_conn_failed(ctx);
+                ngx_http_xngin_ctx_conn_failed(ctx, id);
             }
         }
     }
@@ -1374,14 +1434,21 @@ ngx_http_xngin_conn_timer(ngx_event_t *ev)
 
 /* ---------- pick a connection ---------- */
 
-ngx_http_xngin_conn_t *
-ngx_http_xngin_conn_pick_caps(ngx_http_xngin_group_t *g, uint32_t caps)
+/* two tiers: primary servers first, "backup" servers only when no
+   primary conn can serve */
+static ngx_http_xngin_conn_t *
+ngx_http_xngin_pick_tier(ngx_http_xngin_group_t *g, uint32_t caps,
+    ngx_str_t *key, ngx_uint_t backup)
 {
-    ngx_uint_t              i;
+    ngx_uint_t              i, n = 0;
     ngx_http_xngin_agent_t *a = g->agents.elts;
     ngx_http_xngin_conn_t  *c, *best = NULL;
+    ngx_http_xngin_conn_t  *list[128];
 
     for (i = 0; i < g->agents.nelts; i++) {
+        if (!!a[i].backup != backup) {
+            continue;
+        }
         for (c = a[i].conns; c; c = c->next) {
             if (!c->ready || c->down) {
                 continue;
@@ -1390,6 +1457,12 @@ ngx_http_xngin_conn_pick_caps(ngx_http_xngin_group_t *g, uint32_t caps)
                 continue;
             }
             if ((c->agent_caps & caps) != caps) {
+                continue;
+            }
+            if (key) {
+                if (n < 128) {
+                    list[n++] = c;
+                }
                 continue;
             }
             if (best == NULL
@@ -1401,12 +1474,194 @@ ngx_http_xngin_conn_pick_caps(ngx_http_xngin_group_t *g, uint32_t caps)
         }
     }
 
+    if (key) {
+        if (n == 0) {
+            return NULL;
+        }
+        return list[ngx_crc32_long(key->data, key->len) % n];
+    }
+
     return best;
+}
+
+
+static ngx_http_xngin_conn_t *
+ngx_http_xngin_pick_key(ngx_http_xngin_group_t *g, uint32_t caps,
+    ngx_str_t *key)
+{
+    ngx_http_xngin_conn_t *c;
+
+    c = ngx_http_xngin_pick_tier(g, caps, key, 0);
+    if (c) {
+        return c;
+    }
+    return ngx_http_xngin_pick_tier(g, caps, key, 1);
+}
+
+
+ngx_http_xngin_conn_t *
+ngx_http_xngin_conn_pick_caps(ngx_http_xngin_group_t *g, uint32_t caps)
+{
+    return ngx_http_xngin_pick_key(g, caps, NULL);
+}
+
+
+ngx_http_xngin_conn_t *
+ngx_http_xngin_pick(ngx_http_xngin_group_t *g, uint32_t caps,
+    ngx_http_request_t *r)
+{
+    ngx_str_t key;
+
+    if (g->balance_cv && r
+        && ngx_http_complex_value(r, g->balance_cv, &key) == NGX_OK
+        && key.len)
+    {
+        return ngx_http_xngin_pick_key(g, caps, &key);
+    }
+
+    return ngx_http_xngin_pick_key(g, caps, NULL);
 }
 
 
 ngx_http_xngin_conn_t *
 ngx_http_xngin_conn_pick(ngx_http_xngin_group_t *g)
 {
-    return ngx_http_xngin_conn_pick_caps(g, 0);
+    return ngx_http_xngin_pick_key(g, 0, NULL);
+}
+
+
+/* ---------- DNS re-resolution (server ... resolve) ---------- */
+
+static void
+ngx_http_xngin_resolve_done(ngx_resolver_ctx_t *rctx)
+{
+    ngx_http_xngin_agent_t *a = rctx->data;
+    ngx_http_xngin_conn_t  *c;
+    ngx_uint_t              i, j, n = 0, changed, found;
+    struct sockaddr        *sa;
+    struct sockaddr_storage newss[XNAP_MAX_ADDRS];
+    socklen_t               newlen[XNAP_MAX_ADDRS];
+
+    a->resolving = 0;
+    a->rctx = NULL;
+
+    if (rctx->state == NGX_OK && rctx->naddrs) {
+        for (i = 0; i < rctx->naddrs && n < XNAP_MAX_ADDRS; i++) {
+            sa = rctx->addrs[i].sockaddr;
+            if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6) {
+                continue;
+            }
+            if (rctx->addrs[i].socklen > sizeof(struct sockaddr_storage)) {
+                continue;
+            }
+            ngx_memcpy(&newss[n], sa, rctx->addrs[i].socklen);
+            ngx_inet_set_port((struct sockaddr *) &newss[n], a->port);
+            newlen[n] = rctx->addrs[i].socklen;
+            n++;
+        }
+    }
+
+    if (n == 0) {
+        if (rctx->state != NGX_OK) {
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                          "xngin: resolve of agent %V failed: %s",
+                          &a->url_text, ngx_resolver_strerror(rctx->state));
+        }
+        ngx_resolve_name_done(rctx);
+        return;
+    }
+
+    changed = (n != a->naddrs);
+    if (!changed) {
+        for (i = 0; i < n && !changed; i++) {
+            found = 0;
+            for (j = 0; j < a->naddrs; j++) {
+                if (ngx_cmp_sockaddr((struct sockaddr *) &newss[i],
+                                     newlen[i], a->addrs[j].sockaddr,
+                                     a->addrs[j].socklen, 1) == NGX_OK)
+                {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                changed = 1;
+            }
+        }
+    }
+
+    if (changed) {
+        ngx_memcpy(a->ss, newss, n * sizeof(struct sockaddr_storage));
+        for (i = 0; i < n; i++) {
+            a->addrs[i].sockaddr = (struct sockaddr *) &a->ss[i];
+            a->addrs[i].socklen = newlen[i];
+            a->addrs[i].name = a->url_text;
+        }
+        a->naddrs = n;
+        a->rr = 0;
+
+        ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
+                      "xngin: agent %V re-resolved to %ui address(es)",
+                      &a->url_text, n);
+
+        /* conns bound to an address that left the set reconnect */
+        for (c = a->conns; c; c = c->next) {
+            if (c->bound_len == 0) {
+                continue;
+            }
+            for (i = 0; i < n; i++) {
+                if (ngx_cmp_sockaddr((struct sockaddr *) &c->bound,
+                                     c->bound_len, a->addrs[i].sockaddr,
+                                     a->addrs[i].socklen, 1) == NGX_OK)
+                {
+                    break;
+                }
+            }
+            if (i == n) {
+                ngx_http_xngin_conn_close(c);
+            }
+        }
+    }
+
+    ngx_resolve_name_done(rctx);
+}
+
+
+static void
+ngx_http_xngin_resolve_timer(ngx_event_t *ev)
+{
+    ngx_http_xngin_group_t *g = ev->data;
+    ngx_http_xngin_agent_t *a = g->agents.elts;
+    ngx_resolver_ctx_t     *rctx;
+    ngx_uint_t              i;
+
+    if (ngx_quit || ngx_exiting) {
+        return;
+    }
+
+    for (i = 0; i < g->agents.nelts; i++) {
+        if (!a[i].resolve || a[i].resolving) {
+            continue;
+        }
+
+        rctx = ngx_resolve_start(g->resolver, NULL);
+        if (rctx == NULL || rctx == NGX_NO_RESOLVER) {
+            break;
+        }
+
+        rctx->name = a[i].host;
+        rctx->handler = ngx_http_xngin_resolve_done;
+        rctx->data = &a[i];
+        rctx->timeout = g->resolve_interval;
+
+        a[i].resolving = 1;
+        a[i].rctx = rctx;
+
+        if (ngx_resolve_name(rctx) != NGX_OK) {
+            a[i].resolving = 0;
+            a[i].rctx = NULL;
+        }
+    }
+
+    ngx_add_timer(ev, g->resolve_interval);
 }
