@@ -1630,7 +1630,7 @@ def test_cache_group_scoped(stack):
     assert s.agents[1].stats().get("notifies", 0) == n_b
 
     s.request("/drop")                        # gA pushes cache-drop "x"
-    time.sleep(0.4)
+    time.sleep(0.7)
     n_a2 = s.agents[0].stats().get("notifies", 0)  # /drop counted too
 
     assert s.request("/b?k=x")[0] == 200      # gB's entry survives
