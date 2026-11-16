@@ -19,14 +19,18 @@ still runs):
 
 Measures:
   * serial keep-alive prober -> per-request p50/p95/p99 (us)
-  * ab -k -c 50 -n 5000    -> throughput + mean latency
+  * k6 constant-VUS probes -> max RPS per lane (concurrency doubles
+    until the achieved rate plateaus; falls back to `ab -k -c N -n M`
+    when k6 is not installed)
   * $xngin_agent_rtt_us    -> engine-side agent RTT (access log)
   * $xngin_encode_us / $xngin_syscall_us / $xngin_agent_us
     -> engine CPU vs socket I/O vs agent-side time (access log)
   * $xngin_agentus         -> c-echo agent's self-reported svc time
 
 Usage:
-  python3 test/bench/bench.py [--serial-n 300] [--ab-n 5000] [--ab-c 50]
+  python3 test/bench/bench.py [--serial-n 300] [--k6-dur 4s]
+                              [--k6-cap 4096] [--lanes a,b,c]
+                              [--ab-n 5000] [--ab-c 50]
 
 Env: XNGIN_NGINX_BIN, XNGIN_MODULE_SO (defaults per stacklib).
 """
@@ -35,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import statistics
 import subprocess
@@ -296,6 +301,68 @@ def serial_bench(port, path, method, body, want, n):
         ka.close()
 
 
+K6_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "k6_probe.js")
+
+
+def k6_probe(port, path, method, body, want, vus, dur, tmpdir, tag):
+    """One constant-VUS probe. Returns a metrics dict; `clean` is set
+    when no requests failed the expected status."""
+    export = os.path.join(tmpdir, f"k6-{tag}-v{vus}.json")
+    env = dict(os.environ)
+    env.update({
+        "K6_URL": f"http://127.0.0.1:{port}{path}",
+        "K6_METHOD": method,
+        "K6_WANT": str(want),
+    })
+    if body:
+        env["K6_BODY_LEN"] = str(len(body))
+    subprocess.run(
+        ["k6", "run", "--quiet", "--vus", str(vus), "--duration", dur,
+         "--summary-export", export,
+         "--summary-trend-stats=min,avg,med,p(90),p(95),p(99),max",
+         K6_SCRIPT],
+        env=env, capture_output=True, timeout=300)
+    try:
+        met = json.load(open(export))["metrics"]
+    except (OSError, json.JSONDecodeError, KeyError):
+        return {"rate": 0.0, "vus": vus, "clean": False}
+
+    def vals(k):
+        v = met.get(k) or {}
+        return v.get("values", v)
+
+    # k6 rate metrics export `value` (fraction of true samples); for
+    # http_req_failed a true sample = a failed request.
+    return {
+        "rate": vals("http_reqs").get("rate", 0.0),
+        "count": vals("http_reqs").get("count", 0),
+        "vus": vus,
+        "failed_rate": vals("http_req_failed").get(
+            "value", vals("http_req_failed").get("rate", 1.0)),
+        "lat_p99_us": vals("http_req_duration").get("p(99)", 0) * 1e3,
+        "clean": vals("http_req_failed").get(
+            "value", vals("http_req_failed").get("rate", 1.0)) == 0,
+    }
+
+
+def k6_max_rps(port, path, method, body, want, dur, cap, tmpdir, tag):
+    """Scale VU concurrency until the achieved rate plateaus (<5% gain)
+    or requests start failing — the closed-loop throughput ceiling."""
+    best = {"rate": 0.0, "vus": 0, "lat_p99_us": 0, "clean": True}
+    vus = 64
+    for i in range(7):
+        res = k6_probe(port, path, method, body, want, vus, dur,
+                       tmpdir, f"{tag}-p{i}")
+        if not res["clean"] or res["rate"] <= best["rate"] * 1.05:
+            if not best["vus"]:
+                best = res          # report even a failing first probe
+            break
+        best = res
+        vus = min(vus * 2, cap)
+    return best["rate"], best
+
+
 def ab_bench(port, path, method, body, n, c, tmpdir):
     argv = ["ab", "-k", "-c", str(c), "-n", str(n), "-q"]
     if body:
@@ -351,6 +418,12 @@ def main():
     ap.add_argument("--serial-n", type=int, default=300)
     ap.add_argument("--ab-n", type=int, default=5000)
     ap.add_argument("--ab-c", type=int, default=50)
+    ap.add_argument("--k6-dur", default="4s",
+                    help="duration of each k6 arrival-rate probe")
+    ap.add_argument("--k6-cap", type=int, default=4096,
+                    help="max VU concurrency for the max-rps search")
+    ap.add_argument("--lanes", default=None,
+                    help="comma-separated lane filter")
     args = ap.parse_args()
 
     root = subprocess.run(["mktemp", "-d", "/tmp/xngin-bench-XXXX"],
@@ -375,6 +448,13 @@ def main():
         lanes = [l for l in lanes if l[0] not in ("go-block", "go-mtls")]
     if not c_bin:
         lanes = [l for l in lanes if l[0] != "c-echo"]
+    if args.lanes:
+        want = set(args.lanes.split(","))
+        lanes = [l for l in lanes if l[0] in want]
+    have_k6 = shutil.which("k6") is not None
+    if not have_k6:
+        print("note: k6 not found, falling back to ab for throughput",
+              flush=True)
 
     conf = CONF.format(
         module_so=stacklib.MODULE_SO, root=root,
@@ -458,14 +538,27 @@ def main():
             ts, bad = serial_bench(port, path, method, body, want,
                                    args.serial_n)
             log_end = os.path.getsize(log_path)
-            rps, lat_us, fails = ab_bench(port, path, method, body,
-                                          args.ab_n, args.ab_c, root)
+            if have_k6:
+                rps, kres = k6_max_rps(port, path, method, body, want,
+                                       args.k6_dur, args.k6_cap, root,
+                                       name)
+                lat_us, fails = kres.get("lat_p99_us"), 0
+            else:
+                rps, lat_us, fails = ab_bench(port, path, method, body,
+                                              args.ab_n, args.ab_c,
+                                              root)
+                kres = {}
             met = log_metrics(log_path, path, log_off, log_end)
             rows.append({
                 "lane": name, "n": len(ts), "bad_status": bad,
                 "p50": pct(ts, 50), "p95": pct(ts, 95), "p99": pct(ts, 99),
                 "mean": statistics.fmean(ts),
-                "ab_rps": rps, "ab_lat_us": lat_us, "ab_fails": fails,
+                "k6_max_rps": rps if have_k6 else None,
+                "k6_lat_p99_us": lat_us if have_k6 else None,
+                "k6_probe": kres,
+                "ab_rps": rps if not have_k6 else None,
+                "ab_lat_us": lat_us if not have_k6 else None,
+                "ab_fails": fails,
                 "rtt_p50": pct(met["rtt"], 50) if met["rtt"] else None,
                 "rtt_p99": pct(met["rtt"], 99) if met["rtt"] else None,
                 "enc_p50": pct(met["enc"], 50) if met["enc"] else None,
@@ -474,9 +567,10 @@ def main():
                 "aus_p50": pct(met["aus"], 50) if met["aus"] else None,
             })
             r = rows[-1]
+            tool = "k6max" if have_k6 else "ab   "
             print(f"{name:10s} p50={r['p50']:7.0f}us "
                   f"p99={r['p99']:7.0f}us "
-                  f"ab={rps:8.0f}rps rtt_p50={r['rtt_p50']} "
+                  f"{tool}={rps:8.0f}rps rtt_p50={r['rtt_p50']} "
                   f"enc={r['enc_p50']} sys={r['sys_p50']} "
                   f"agt={r['agt_p50']}"
                   + (f"  !! {bad} bad-status" if bad else ""),
@@ -488,10 +582,11 @@ def main():
         print(f"\nresults: {out}")
 
         base = rows[0]["mean"]
+        thr = "k6_max_rps" if have_k6 else "ab_rps"
         print("\n=== summary (mean serial latency delta vs baseline) ===")
         for r in rows:
             print(f"{r['lane']:10s} +{r['mean'] - base:7.0f}us  "
-                  f"(mean {r['mean']:.0f}us, ab {r['ab_rps']:.0f} rps)")
+                  f"(mean {r['mean']:.0f}us, {r[thr]:.0f} rps max)")
 
         print("\n=== offload breakdown (log p50, us) ===")
         print(f"{'lane':10s} {'enc':>6s} {'sys':>6s} {'agent':>6s} "

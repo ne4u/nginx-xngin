@@ -13,7 +13,14 @@ to a no-offload baseline on the same nginx instance.
   runs.)
 - **Serial latency**: single keep-alive connection, 20 warmup + 300
   timed requests per lane.
-- **Throughput**: `ab -k -c 50 -n 5000` per lane.
+- **Throughput**: k6 `constant-vus` probes per lane; concurrency
+  doubles (64 → … → cap) until the achieved request rate plateaus
+  (<5% gain) or requests fail — the plateau is reported as the lane's
+  max RPS. Requires `k6` on PATH; falls back to `ab -k -c 50 -n 5000`.
+  (The rps column in the recorded runs below was measured with `ab`;
+  k6 numbers run ~20–30% lower for the fastest lanes — k6's own
+  per-request cost becomes the ceiling — while matching `ab` on the
+  slower ones.)
 - **Breakdown**: each request logs `$xngin_agent_rtt_us` split as
   `$xngin_encode_us` (engine CPU: NOTIFY/BODY encode + queue),
   `$xngin_syscall_us` (time inside agent-conn send/recv — on TLS conns
@@ -21,7 +28,8 @@ to a no-offload baseline on the same nginx instance.
   `$xngin_agent_us` (rtt minus attributed recv time = agent-side wait:
   agent CPU + loopback propagation + wakeup latency). Values are parsed
   from the access-log slice written during the *serial* run only — under
-  `ab -c 50` shared conns add queue-wait, which is not per-request cost.
+  concurrent load shared conns add queue-wait, which is not per-request
+  cost.
 - Agents: Python stub (`allow-all`) on UDS; second stub on loopback TCP;
   Go `edge-guard` (`-rate 0`) on UDS; `test/bench/echo_agent.c` — a
   ~1µs-CPU C agent answering a fixed allow verdict — on UDS for the
