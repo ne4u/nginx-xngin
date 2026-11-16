@@ -551,7 +551,7 @@ ngx_http_xngin_hello_t *ngx_http_xngin_tls_hello(ngx_connection_t *c);
 
 ngx_int_t   ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_str_t *key,
-                ngx_int_t *out_status);
+                ngx_str_t *group, ngx_int_t *out_status);
 void        ngx_http_xngin_cache_store(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, uint32_t ttl,
                 ngx_str_t *group);

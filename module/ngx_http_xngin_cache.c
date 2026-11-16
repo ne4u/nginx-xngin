@@ -71,13 +71,16 @@ ngx_http_xngin_cache_sh(ngx_http_xngin_main_conf_t *mmcf)
 }
 
 
-/* find the node whose stored key byte-matches `key` among the nodes
-   sharing tree key `key_h` (crc32 collisions insert equal tree keys;
+/* find the node whose stored (group, key) pair byte-matches among the
+   nodes sharing tree key `key_h` — the node identity is the group name
+   PLUS the key bytes, so different groups can hold entries for the
+   same key side by side (crc32 collisions also insert equal tree keys;
    rbtree rotations can park them in either subtree, so an equal-key
    node requires walking both children).  Caller holds the slab mutex. */
 static ngx_http_xngin_cache_node_t *
 ngx_http_xngin_cache_find(ngx_http_xngin_cache_shctx_t *sh,
-    ngx_rbtree_node_t *node, uint64_t key_h, u_char *kdata, size_t klen)
+    ngx_rbtree_node_t *node, uint64_t key_h, u_char *kdata, size_t klen,
+    u_char *gdata, size_t glen)
 {
     ngx_http_xngin_cache_node_t *n, *f;
 
@@ -87,28 +90,31 @@ ngx_http_xngin_cache_find(ngx_http_xngin_cache_shctx_t *sh,
 
     if ((ngx_rbtree_key_t) key_h < node->key) {
         return ngx_http_xngin_cache_find(sh, node->left, key_h,
-                                         kdata, klen);
+                                         kdata, klen, gdata, glen);
     }
 
     if ((ngx_rbtree_key_t) key_h > node->key) {
         return ngx_http_xngin_cache_find(sh, node->right, key_h,
-                                         kdata, klen);
+                                         kdata, klen, gdata, glen);
     }
 
     n = (ngx_http_xngin_cache_node_t *) node;
 
-    if (n->key_len == klen
-        && ngx_memcmp(n->data, kdata, klen) == 0)
+    if (n->key_len == klen && n->group_len == glen
+        && ngx_memcmp(n->data, kdata, klen) == 0
+        && ngx_memcmp(n->data + n->key_len, gdata, glen) == 0)
     {
         return n;
     }
 
-    f = ngx_http_xngin_cache_find(sh, node->left, key_h, kdata, klen);
+    f = ngx_http_xngin_cache_find(sh, node->left, key_h, kdata, klen,
+                                  gdata, glen);
     if (f) {
         return f;
     }
 
-    return ngx_http_xngin_cache_find(sh, node->right, key_h, kdata, klen);
+    return ngx_http_xngin_cache_find(sh, node->right, key_h, kdata, klen,
+                                     gdata, glen);
 }
 
 
@@ -242,7 +248,8 @@ ngx_http_xngin_cache_unpack(ngx_http_request_t *r,
 
 ngx_int_t
 ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
-    ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, ngx_int_t *out_status)
+    ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, ngx_str_t *group,
+    ngx_int_t *out_status)
 {
     ngx_http_xngin_main_conf_t   *mmcf;
     ngx_http_xngin_cache_shctx_t *sh;
@@ -250,7 +257,8 @@ ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
     ngx_slab_pool_t              *shpool;
     uint64_t                      key_h;
     size_t                        tail_len, tail_cap;
-    u_char                       *tail;
+    u_char                       *tail, *gdata;
+    size_t                        glen;
     ngx_uint_t                    tries;
 
     mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
@@ -264,6 +272,9 @@ ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
     key_h = ngx_crc32_long(key->data, key->len);
     shpool = (ngx_slab_pool_t *) mmcf->cache_zone->shm.addr;
 
+    gdata = (group != NULL) ? group->data : (u_char *) "";
+    glen = (group != NULL) ? group->len : 0;
+
     tail = NULL;
     tail_cap = 0;
 
@@ -272,9 +283,10 @@ ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
         ngx_shmtx_lock(&shpool->mutex);
 
         /* re-find each round: the node may have been evicted or
-           refreshed by another worker while the lock was dropped */
+           refreshed by another worker while the lock was dropped;
+           an entry owned by another group stays a miss */
         n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
-                                      key->data, key->len);
+                                      key->data, key->len, gdata, glen);
 
         if (n && n->expire <= ngx_time()) {
             ngx_http_xngin_cache_node_free(sh, shpool, n);
@@ -434,15 +446,17 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
 
     ngx_http_xngin_cache_expire_locked(sh, shpool);
 
-    /* replace a byte-equal key in place — never park a dead duplicate
-       behind it (a same-key second verdict arrives e.g. when requests
-       for the key interleave across the agent round-trip) */
+    /* replace this group's byte-equal key in place — never park a dead
+       duplicate behind it (a same-key second verdict arrives e.g. when
+       requests for the key interleave across the agent round-trip).
+       A same-key node owned by another group is simply not found and
+       stays in the tree untouched. */
     n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
-                                  key->data, key->len);
+                                  key->data, key->len,
+                                  group ? group->data : (u_char *) "",
+                                  group ? group->len : 0);
 
-    if (n && tail_len <= n->tail_cap
-        && n->group_len == (group ? group->len : 0))
-    {
+    if (n && tail_len <= n->tail_cap) {
         n->expire = ngx_time() + ttl;
         n->action = action;
         n->score = ctx->score;
@@ -454,9 +468,7 @@ ngx_http_xngin_cache_store(ngx_http_request_t *r,
     }
 
     if (n) {
-        /* same key, bigger tail (or new group owner — the group name
-           sits between key and tail, so its length can't change in
-           place): out with the old node */
+        /* same (group, key), bigger tail: out with the old node */
         ngx_http_xngin_cache_node_free(sh, shpool, n);
     }
 
@@ -574,11 +586,9 @@ ngx_http_xngin_cache_drop(ngx_http_xngin_main_conf_t *mmcf, ngx_str_t *key,
     ngx_shmtx_lock(&shpool->mutex);
 
     n = ngx_http_xngin_cache_find(sh, sh->rbtree.root, key_h,
-                                  key->data, key->len);
-    if (n && n->group_len == group->len
-        && ngx_memcmp(n->data + n->key_len, group->data, group->len)
-           == 0)
-    {
+                                  key->data, key->len,
+                                  group->data, group->len);
+    if (n) {
         ngx_http_xngin_cache_node_free(sh, shpool, n);
     }
 

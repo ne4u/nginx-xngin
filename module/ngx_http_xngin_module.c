@@ -1456,7 +1456,10 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
         {
             ctx->cache_key_val = key;
 
-            rc = ngx_http_xngin_cache_lookup(r, ctx, &key, &cstatus);
+            /* the node identity is (group, key): only a verdict the
+               location's own step group stored may replay here */
+            rc = ngx_http_xngin_cache_lookup(r, ctx, &key,
+                                             &lcf->group->name, &cstatus);
             if (rc == NGX_OK) {
                 if (cstatus == NGX_DECLINED) {
                     ngx_str_set(&ctx->action, "allow");

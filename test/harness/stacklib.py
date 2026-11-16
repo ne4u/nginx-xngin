@@ -58,6 +58,7 @@ http {{
         }}
         {loc_blocks}
     }}
+    {server_blocks}
 }}
 """
 
@@ -194,7 +195,7 @@ class Stack:
                  agent_tls=True, client_cert=True, wrong_ca=False,
                  loc_blocks="", server_hosts=None, server_suffix=None,
                  group_extra="", extra_groups=None,
-                 loc_group="xngin_group waf;"):
+                 loc_group="xngin_group waf;", server_blocks=None):
         if sub:
             root = os.path.join(root, sub)
         self.root = root
@@ -252,6 +253,11 @@ class Stack:
             tls_conf = "\n        ".join(lines)
 
         self.conf = os.path.join(root, "nginx.conf")
+        # extra server{} blocks (e.g. SNI vhosts on the same listen):
+        # a callable receives this half-built Stack (ports and cert/key
+        # paths are already set) and returns raw nginx config
+        sblocks = server_blocks(self) if callable(server_blocks) \
+            else (server_blocks or "")
         groups = ""
         for gname, addrs in (extra_groups or {}).items():
             srvs = "\n        ".join(
@@ -278,7 +284,7 @@ class Stack:
                 srv_extra=srv_extra,
                 timeout=timeout, fail=fail,
                 loc_extra=loc_extra, loc_blocks=loc_blocks,
-                loc_group=loc_group,
+                loc_group=loc_group, server_blocks=sblocks,
                 main_extra=main))
         self.procs = []
 

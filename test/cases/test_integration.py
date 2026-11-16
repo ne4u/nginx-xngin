@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import time
 
@@ -1292,6 +1293,99 @@ def test_control_ban_ja4(stack):
         s.request("/")
 
 
+def _tls_request(s, sni, path="/", host=None):
+    """HTTPS GET with an explicit SNI name (None sends none at all);
+    Host defaults to the SNI so request routing matches."""
+    ctx = ssl._create_unverified_context()
+    sock = socket.create_connection(("127.0.0.1", s.listen_port), 5)
+    conn = ctx.wrap_socket(sock, server_hostname=sni)
+    try:
+        conn.sendall(f"GET {path} HTTP/1.1\r\n"
+                     f"Host: {host or sni or '127.0.0.1'}\r\n"
+                     "Connection: close\r\n\r\n".encode())
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        conn.close()
+    return int(data.split(b" ", 2)[1]), data
+
+
+def _vhost_b(default_inspect):
+    """second server{} on the same listen: b.example, group gB; takes
+    default_server + tls_inspect when *default_inspect*."""
+    def blocks(s):
+        return f"""
+    server {{
+        listen {s.listen_port} ssl{" default_server" if default_inspect else ""};
+        server_name b.example;
+        ssl_certificate {s.cert};
+        ssl_certificate_key {s.key};
+        {"xngin_tls_inspect on;" if default_inspect else ""}
+        location / {{
+            xngin_enable on;
+            xngin_group gB;
+            proxy_pass http://backend;
+        }}
+    }}"""
+    return blocks
+
+
+def test_control_ban_ja4_sni_scoped(stack):
+    """a ban-ja4 binds only the server whose locations use the pushing
+    group — other vhosts on the same listen keep completing their
+    handshakes; no SNI follows the default server."""
+    # JA4's d/i flag differs between SNI and no-SNI hellos, so both
+    # variants are pushed separately: /banja4-sni over an SNI conn,
+    # /banja4-nosni over a no-SNI conn whose Host header still routes
+    # to a.example (and therefore to group gA)
+    rules_a = {"default": {"action": "allow"}, "rules": [
+        {"match": {"uri_contains": "/banja4"},
+         "verdict": {"action": "allow"},
+         "behavior": {"control": {"op": "ban-ja4", "ja4": "$hello",
+                                  "ttl": 60}}}]}
+    extra = {"gA": [0], "gB": [1]}
+
+    # default server a.example uses gA; vhost b.example uses gB
+    sa = stack(agents_rules=[rules_a, ALLOW], ssl=True, sub="sni-a",
+               extra_groups=extra, loc_group="xngin_group gA;",
+               srv_extra="server_name a.example;\n"
+                         "        xngin_tls_inspect on;",
+               server_blocks=_vhost_b(False)).start()
+
+    assert _tls_request(sa, "a.example", "/banja4-sni")[0] == 200
+    assert _tls_request(sa, None, "/banja4-nosni",
+                        host="a.example")[0] == 200
+    time.sleep(0.3)
+
+    with pytest.raises(OSError):                 # SNI=a -> gA ban
+        _tls_request(sa, "a.example")
+    with pytest.raises(OSError):                 # no SNI -> default a
+        _tls_request(sa, None)
+    assert _tls_request(sa, "b.example")[0] == 200   # gB untouched
+
+    # default server b.example uses gB; vhost a.example uses gA
+    sb = stack(agents_rules=[rules_a, ALLOW], ssl=True, sub="sni-b",
+               extra_groups=extra, loc_group="xngin_group gA;",
+               srv_extra="server_name a.example;",
+               server_blocks=_vhost_b(True)).start()
+
+    assert _tls_request(sb, "a.example", "/banja4-sni")[0] == 200
+    assert _tls_request(sb, None, "/banja4-nosni",
+                        host="a.example")[0] == 200
+    time.sleep(0.3)
+
+    with pytest.raises(OSError):                 # SNI=a -> gA ban
+        _tls_request(sb, "a.example")
+    assert _tls_request(sb, "b.example")[0] == 200   # gB untouched
+    # default b is out of the ban's group scope — even though a ban
+    # for this client's no-SNI JA4 exists (bound to gA)
+    assert _tls_request(sb, None)[0] == 200
+
+
 def test_control_cache_drop(stack):
     """cache-drop evicts a cached verdict so the next request re-decides."""
     rules = {"default": {"action": "allow", "cache_ttl": 60}, "rules": [
@@ -1488,6 +1582,64 @@ def test_control_cache_drop_scoped(stack):
     s.request("/cb")                     # entry survives: no re-decide
     time.sleep(0.7)
     assert s.agents[1].stats().get("notifies", 0) == n0
+
+
+def test_cache_group_scoped(stack):
+    """the verdict-cache node identity is (group, key): two groups with
+    equal-length names and the same xngin_cache_key neither see nor
+    overwrite each other's entries, and cache-drop removes only the
+    pushing group's node."""
+    rules_a = {"default": {"action": "deny", "status": 403,
+                           "reason": "ga-deny", "cache_ttl": 60},
+               "rules": [
+                   {"match": {"uri_contains": "/drop"},
+                    "verdict": {"action": "allow"},
+                    "behavior": {"control": {"op": "cache-drop",
+                                             "key": "x"}}}]}
+    rules_b = {"default": {"action": "allow", "cache_ttl": 60},
+               "rules": []}
+    s = stack(agents_rules=[rules_a, rules_b],
+              extra_groups={"gA": [0], "gB": [1]},
+              loc_group="xngin_group gA;",
+              loc_extra="xngin_cache_key $arg_k;",
+              main_extra="xngin_cache_zone vcache:1m;",
+              loc_blocks='''
+        location /b {
+            xngin_enable on;
+            xngin_group gB;
+            xngin_cache_key $arg_k;
+            proxy_pass http://backend;
+        }
+        location /drop {
+            xngin_enable on;
+            xngin_group gA;
+            proxy_pass http://backend;
+        }''').start()
+
+    assert s.request("/?k=x")[0] == 403       # gA stores a deny
+    assert s.request("/b?k=x")[0] == 200      # gB: gA's deny is invisible
+    assert s.request("/?k=x")[0] == 403       # gB's allow did not replace it
+    time.sleep(0.7)
+    n_a = s.agents[0].stats().get("notifies", 0)
+    n_b = s.agents[1].stats().get("notifies", 0)
+
+    assert s.request("/?k=x")[0] == 403       # replayed from gA's entry
+    assert s.request("/b?k=x")[0] == 200      # replayed from gB's entry
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) == n_a
+    assert s.agents[1].stats().get("notifies", 0) == n_b
+
+    s.request("/drop")                        # gA pushes cache-drop "x"
+    time.sleep(0.4)
+    n_a2 = s.agents[0].stats().get("notifies", 0)  # /drop counted too
+
+    assert s.request("/b?k=x")[0] == 200      # gB's entry survives
+    time.sleep(0.7)
+    assert s.agents[1].stats().get("notifies", 0) == n_b
+
+    assert s.request("/?k=x")[0] == 403       # gA's node gone: re-decide
+    time.sleep(0.7)
+    assert s.agents[0].stats().get("notifies", 0) == n_a2 + 1
 
 
 def test_control_before_hello_ignored(stack):

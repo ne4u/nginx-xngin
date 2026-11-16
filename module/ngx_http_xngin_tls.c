@@ -26,11 +26,21 @@
 #endif
 
 
+/* one entry per server block on the ctx owner's listen addrs: the
+   ClientHello cb resolves the SNI to an entry, so a JA4 ban only
+   binds the groups (and static deny list) of the server the client
+   actually asked for */
 typedef struct {
-    ngx_array_t *deny;          /* ngx_str_t, JA4 fingerprints */
-    ngx_array_t *groups;        /* ngx_http_xngin_group_t* reachable
-                                   from any server on this ctx's listen
-                                   addrs: scopes pushed JA4 bans */
+    ngx_http_core_srv_conf_t  *cscf;
+    ngx_array_t               *deny;    /* ngx_str_t, JA4 fingerprints */
+    ngx_array_t               *groups;  /* ngx_http_xngin_group_t* this
+                                           server's locations can reach:
+                                           scopes pushed JA4 bans */
+} ngx_http_xngin_tls_srv_t;
+
+typedef struct {
+    ngx_array_t *servers;       /* ngx_http_xngin_tls_srv_t; elts[0] is
+                                   the ctx owner's own (default) entry */
 } ngx_http_xngin_tls_ctx_t;
 
 #if (NGX_XNGIN_TLS_ARG)
@@ -38,8 +48,8 @@ typedef struct {
 typedef struct {
     ngx_ssl_servername_pt        servername;   /* MUST be first member */
     ngx_ssl_client_hello_arg    *saved;        /* previous arg to chain */
-    ngx_array_t                 *deny;
-    ngx_array_t                 *groups;   /* same scope as tctx->groups */
+    ngx_array_t                 *servers;  /* same scope as
+                                              tctx->servers */
 } ngx_http_xngin_tls_arg_t;
 
 #endif
@@ -60,6 +70,9 @@ static void ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c,
     ngx_http_xngin_hello_t *h);
 static ngx_int_t ngx_http_xngin_denied(ngx_http_xngin_hello_t *h,
     ngx_array_t *deny, ngx_array_t *groups);
+static ngx_int_t ngx_http_xngin_hello_sni(SSL *s, ngx_str_t *host);
+static ngx_http_xngin_tls_srv_t *ngx_http_xngin_tls_pick(
+    ngx_connection_t *c, ngx_array_t *servers, ngx_str_t *sni);
 
 
 ngx_http_xngin_hello_t *
@@ -395,6 +408,128 @@ ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c, ngx_http_xngin_hello_t *h)
 }
 
 
+/* pull the SNI hostname out of the ClientHello — same wire decode as
+   ngx_ssl_client_hello_callback() */
+static ngx_int_t
+ngx_http_xngin_hello_sni(SSL *s, ngx_str_t *host)
+{
+    const unsigned char *p = NULL;
+    size_t               len = 0;
+
+    if (SSL_client_hello_get0_ext(s, TLSEXT_TYPE_server_name, &p, &len)
+            != 1
+        || len < 5
+        || (size_t) (p[0] << 8) + p[1] + 2 != len
+        || p[2] != TLSEXT_NAMETYPE_host_name
+        || (size_t) (p[3] << 8) + p[4] + 2 + 3 != len)
+    {
+        return NGX_DECLINED;
+    }
+
+    host->len = len - 5;
+    host->data = (u_char *) p + 5;
+
+    if (host->len == 0 || host->len > TLSEXT_MAXLEN_host_name
+        || ngx_strlchr(host->data, host->data + host->len, '\0'))
+    {
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
+
+/* the ClientHello cb runs on the default server's ctx pre-SNI: resolve
+   the name to a server ourselves so a ban only binds that server's
+   groups.  This mirrors ngx_http_find_virtual_server() — static inside
+   ngx_http_request.c, so not linkable — walking the same virtual_names
+   in the same order: combined hash (exact + wildcard), then regexes. */
+static ngx_http_core_srv_conf_t *
+ngx_http_xngin_find_vserver(ngx_connection_t *c, ngx_str_t *host)
+{
+    ngx_http_connection_t     *hc;
+    ngx_http_virtual_names_t  *vn;
+    ngx_http_core_srv_conf_t  *cscf;
+#if (NGX_PCRE)
+    ngx_http_server_name_t    *sn;
+    ngx_int_t                  n;
+    ngx_uint_t                 i;
+#endif
+
+    hc = c->data;
+    if (hc == NULL || hc->addr_conf == NULL) {
+        return NULL;
+    }
+
+    vn = hc->addr_conf->virtual_names;
+    if (vn == NULL) {
+        return NULL;
+    }
+
+    cscf = ngx_hash_find_combined(&vn->names,
+                                  ngx_hash_key(host->data, host->len),
+                                  host->data, host->len);
+    if (cscf) {
+        return cscf;
+    }
+
+#if (NGX_PCRE)
+    if (host->len && vn->nregex) {
+        sn = vn->regex;
+        for (i = 0; i < vn->nregex; i++) {
+            n = ngx_regex_exec(sn[i].regex->regex, host, NULL, 0);
+            if (n == NGX_REGEX_NO_MATCHED) {
+                continue;
+            }
+            if (n >= 0) {
+                return sn[i].server;
+            }
+            /* regex exec error: nginx's own servername pass will fail
+               the handshake — fall through to the default server */
+            return NULL;
+        }
+    }
+#endif
+
+    return NULL;
+}
+
+
+/* map the hello's SNI to the per-server entry collected at config
+   time; no SNI, an unusable name, or no match selects the default
+   server — elts[0] */
+static ngx_http_xngin_tls_srv_t *
+ngx_http_xngin_tls_pick(ngx_connection_t *c, ngx_array_t *servers,
+    ngx_str_t *sni)
+{
+    ngx_http_xngin_tls_srv_t  *ts = servers->elts;
+    ngx_http_core_srv_conf_t  *cscf;
+    ngx_str_t                  host;
+    ngx_uint_t                 i;
+
+    if (sni != NULL && sni->len != 0 && sni->data != NULL) {
+        host = *sni;
+
+        /* validate + lowercase exactly like ngx_http_ssl_servername
+           does before its own virtual-server match */
+        if (ngx_http_validate_host(&host, NULL, c->pool, 1) == NGX_OK
+            && host.len != 0)
+        {
+            cscf = ngx_http_xngin_find_vserver(c, &host);
+            if (cscf) {
+                for (i = 0; i < servers->nelts; i++) {
+                    if (ts[i].cscf == cscf) {
+                        return &ts[i];
+                    }
+                }
+            }
+        }
+    }
+
+    return &ts[0];
+}
+
+
 static ngx_int_t
 ngx_http_xngin_denied(ngx_http_xngin_hello_t *h, ngx_array_t *deny,
     ngx_array_t *groups)
@@ -447,7 +582,9 @@ ngx_http_xngin_ssl_servername(ngx_ssl_conn_t *s, int *ad, void *arg)
 {
     ngx_connection_t          *c;
     ngx_http_xngin_tls_arg_t  *targ = NULL;
+    ngx_http_xngin_tls_srv_t  *ts;
     ngx_http_xngin_hello_t    *h = NULL;
+    ngx_str_t                 sni, *sp;
 
     c = ngx_ssl_get_connection(s);
     if (c != NULL && c->pool != NULL) {
@@ -460,9 +597,22 @@ ngx_http_xngin_ssl_servername(ngx_ssl_conn_t *s, int *ad, void *arg)
         }
     }
 
-    if (targ && ngx_http_xngin_denied(h, targ->deny, targ->groups)) {
-        *ad = SSL_AD_ILLEGAL_PARAMETER;
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    if (targ && c != NULL && c->pool != NULL) {
+        /* arg is the ngx_str_t host nginx already parsed out of the
+           hello (NULL on BoringSSL's select-certificate path — decode
+           the extension ourselves there) */
+        sp = arg;
+        if (sp == NULL
+            && ngx_http_xngin_hello_sni(s, &sni) == NGX_OK)
+        {
+            sp = &sni;
+        }
+
+        ts = ngx_http_xngin_tls_pick(c, targ->servers, sp);
+        if (ngx_http_xngin_denied(h, ts->deny, ts->groups)) {
+            *ad = SSL_AD_ILLEGAL_PARAMETER;
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
     }
 
     if (targ && targ->saved && targ->saved->servername) {
@@ -480,8 +630,10 @@ static int
 ngx_http_xngin_ch_cb(SSL *s, int *al, void *arg)
 {
     ngx_http_xngin_tls_ctx_t *tctx = arg;
+    ngx_http_xngin_tls_srv_t *ts;
     ngx_connection_t         *c;
     ngx_http_xngin_hello_t   *h = NULL;
+    ngx_str_t                 sni, *sp = NULL;
 
     c = ngx_ssl_get_connection(s);
 
@@ -491,11 +643,16 @@ ngx_http_xngin_ch_cb(SSL *s, int *al, void *arg)
         if (h != NULL && h->ja4.data == NULL) {
             ngx_http_xngin_ja4(s, c, h);
         }
-    }
 
-    if (ngx_http_xngin_denied(h, tctx->deny, tctx->groups)) {
-        *al = SSL_AD_ILLEGAL_PARAMETER;
-        return SSL_CLIENT_HELLO_ERROR;
+        if (ngx_http_xngin_hello_sni(s, &sni) == NGX_OK) {
+            sp = &sni;
+        }
+
+        ts = ngx_http_xngin_tls_pick(c, tctx->servers, sp);
+        if (ngx_http_xngin_denied(h, ts->deny, ts->groups)) {
+            *al = SSL_AD_ILLEGAL_PARAMETER;
+            return SSL_CLIENT_HELLO_ERROR;
+        }
     }
 
 #if (NGX_XNGIN_TLS_ARG)
@@ -620,24 +777,67 @@ ngx_http_xngin_tls_collect_server(ngx_conf_t *cf, ngx_array_t *groups,
 }
 
 
+/* one entry per server block (deduped by cscf): own tls_deny list +
+   own group reach — the hello-time ban check binds only the server
+   the client's SNI resolves to */
+static ngx_int_t
+ngx_http_xngin_tls_server_add(ngx_conf_t *cf, ngx_array_t *servers,
+    ngx_http_core_srv_conf_t *cscf)
+{
+    ngx_http_xngin_tls_srv_t   *ts, *elts;
+    ngx_http_xngin_srv_conf_t  *xscf;
+    ngx_uint_t                  i;
+
+    elts = servers->elts;
+    for (i = 0; i < servers->nelts; i++) {
+        if (elts[i].cscf == cscf) {
+            return NGX_OK;
+        }
+    }
+
+    ts = ngx_array_push(servers);
+    if (ts == NULL) {
+        return NGX_ERROR;
+    }
+
+    ts->cscf = cscf;
+
+    xscf = cscf->ctx->srv_conf[ngx_http_xngin_module.ctx_index];
+    ts->deny = (xscf != NULL) ? xscf->tls_deny : NULL;
+
+    ts->groups = ngx_array_create(cf->pool, 4,
+                                  sizeof(ngx_http_xngin_group_t *));
+    if (ts->groups == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_http_xngin_tls_collect_server(cf, ts->groups, cscf);
+
+    return NGX_OK;
+}
+
+
 /* the ClientHello cb runs on the default server's ctx per listen addr,
-   pre-SNI — collect the union of groups reachable from ANY server on
-   the addrs where this server is default, so a ban pushed by a group
-   used only in a vhost still binds that socket */
+   pre-SNI — collect one entry for every server on the addrs where this
+   server is default, so the cb can scope a ban to the server the SNI
+   resolves to.  elts[0] is the owner's own entry: the no-SNI fallback */
 static ngx_array_t *
-ngx_http_xngin_tls_server_groups(ngx_conf_t *cf,
+ngx_http_xngin_tls_server_list(ngx_conf_t *cf,
     ngx_http_core_main_conf_t *cmcf, ngx_http_core_srv_conf_t *cscf)
 {
-    ngx_array_t                 *groups;
+    ngx_array_t                 *servers;
     ngx_http_conf_port_t        *port;
     ngx_http_conf_addr_t        *addr;
     ngx_http_core_srv_conf_t   **srv;
     ngx_uint_t                   p, a, i;
-    ngx_uint_t                   found = 0;
 
-    groups = ngx_array_create(cf->pool, 4,
-                            sizeof(ngx_http_xngin_group_t *));
-    if (groups == NULL) {
+    servers = ngx_array_create(cf->pool, 4,
+                               sizeof(ngx_http_xngin_tls_srv_t));
+    if (servers == NULL) {
+        return NULL;
+    }
+
+    if (ngx_http_xngin_tls_server_add(cf, servers, cscf) != NGX_OK) {
         return NULL;
     }
 
@@ -649,21 +849,20 @@ ngx_http_xngin_tls_server_groups(ngx_conf_t *cf,
                 if (addr[a].default_server != cscf) {
                     continue;
                 }
-                found = 1;
                 srv = addr[a].servers.elts;
                 for (i = 0; i < addr[a].servers.nelts; i++) {
-                    ngx_http_xngin_tls_collect_server(cf, groups,
-                                                      srv[i]);
+                    if (ngx_http_xngin_tls_server_add(cf, servers,
+                                                      srv[i])
+                        != NGX_OK)
+                    {
+                        return NULL;
+                    }
                 }
             }
         }
     }
 
-    if (!found) {
-        ngx_http_xngin_tls_collect_server(cf, groups, cscf);
-    }
-
-    return groups;
+    return servers;
 }
 
 
@@ -722,10 +921,9 @@ ngx_http_xngin_tls_init(ngx_conf_t *cf)
 
         targ->servername = ngx_http_xngin_ssl_servername;
         targ->saved = saved;
-        targ->deny = xscf->tls_deny;
-        targ->groups = ngx_http_xngin_tls_server_groups(cf, cmcf,
-                                                        cscfp[s]);
-        if (targ->groups == NULL) {
+        targ->servers = ngx_http_xngin_tls_server_list(cf, cmcf,
+                                                       cscfp[s]);
+        if (targ->servers == NULL) {
             return NGX_ERROR;
         }
 
@@ -747,10 +945,9 @@ raw_cb:
                 return NGX_ERROR;
             }
 
-            tctx->deny = xscf->tls_deny;
-            tctx->groups = ngx_http_xngin_tls_server_groups(cf, cmcf,
-                                                            cscfp[s]);
-            if (tctx->groups == NULL) {
+            tctx->servers = ngx_http_xngin_tls_server_list(cf, cmcf,
+                                                           cscfp[s]);
+            if (tctx->servers == NULL) {
                 return NGX_ERROR;
             }
 
