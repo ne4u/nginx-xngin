@@ -33,9 +33,10 @@ to a no-offload baseline on the same nginx instance.
 - Agents: Python stub (`allow-all`) on UDS; second stub on loopback TCP;
   Go `edge-guard` (`-rate 0`) on UDS; `test/bench/echo_agent.c` — a
   ~1µs-CPU C agent answering a fixed allow verdict — on UDS for the
-  `c-echo` lane; Python stub behind `ssl on` for `mtls-block`; a second
-  `edge-guard` with `-tls-cert/-tls-key/-tls-client-ca` behind `ssl on`
-  for `go-mtls`. c-echo also self-reports service time as
+  `c-echo` lane; Rust `mini_waf` example (regex rules over URI/headers)
+  on UDS for `rust-block`; Python stub behind `ssl on` for `mtls-block`;
+  a second `edge-guard` with `-tls-cert/-tls-key/-tls-client-ca` behind
+  `ssl on` for `go-mtls`. c-echo also self-reports service time as
   `$xngin_agentus` (verdict `vars`).
 - Environment: localhost loopback, macOS arm64, nginx 1.31.8,
   `xngin_timeout 200ms`, `xngin_fail close`.

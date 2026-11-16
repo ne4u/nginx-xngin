@@ -14,6 +14,7 @@ still runs):
   /tcpblock  blocking verdict, loopback-TCP agent
   /goblock   blocking verdict, Go edge-guard agent (rate=0, UDS)
   /cecho     blocking verdict, C echo agent (fixed allow, UDS)
+  /rustblock blocking verdict, Rust mini_waf agent (UDS)
   /mtlsblock blocking verdict, Python stub agent over mTLS (agent-bound)
   /gomtls    blocking verdict, Go edge-guard agent over mTLS
 
@@ -90,6 +91,11 @@ http {{
         keepalive 2;
         ping_interval 60s;
     }}
+    xngin_agent_group rust {{
+        server unix:{rust_sock};
+        keepalive 2;
+        ping_interval 60s;
+    }}
     xngin_agent_group mtls {{
         server unix:{mtls_sock};
         ssl on;
@@ -156,6 +162,10 @@ http {{
             xngin_enable on; xngin_group cecho;
             empty_gif;
         }}
+        location /rustblock {{
+            xngin_enable on; xngin_group rust;
+            empty_gif;
+        }}
         location /mtlsblock {{
             xngin_enable on; xngin_group mtls;
             empty_gif;
@@ -190,6 +200,7 @@ LANES = [
     ("tcp-block", "/tcpblock/x",  "GET",  None,          200),
     ("go-block",  "/goblock/x",   "GET",  None,          200),
     ("c-echo",    "/cecho/x",     "GET",  None,          200),
+    ("rust-block", "/rustblock/x", "GET", None,          200),
     ("mtls-block", "/mtlsblock/x", "GET", None,          200),
     ("go-mtls",   "/gomtls/x",    "GET",  None,          200),
 ]
@@ -222,6 +233,22 @@ def build_c_agent(root):
     if r.returncode != 0:
         print(f"note: cc failed, skipping c-echo lane\n{r.stderr}",
               flush=True)
+        return None
+    return dst
+
+
+def build_rust_agent():
+    """Build mini_waf (release) for the rust-block lane; None on
+    failure. The binary stays under target/ — no copy needed."""
+    r = subprocess.run(
+        ["cargo", "build", "--release", "--example", "mini_waf"],
+        cwd=os.path.join(REPO, "agents", "rust"),
+        capture_output=True, text=True)
+    dst = os.path.join(REPO, "agents", "rust", "target", "release",
+                       "examples", "mini_waf")
+    if r.returncode != 0 or not os.path.exists(dst):
+        print(f"note: cargo build failed, skipping rust-block lane\n"
+              f"{r.stderr}", flush=True)
         return None
     return dst
 
@@ -441,13 +468,17 @@ def main():
     go_sock = os.path.join(root, "edge-guard.sock")
     go_mtls_sock = os.path.join(root, "edge-guard-mtls.sock")
     c_sock = os.path.join(root, "xnap-echo.sock")
+    rust_sock = os.path.join(root, "mini-waf.sock")
     go_bin = build_go_agent(root)
     c_bin = build_c_agent(root)
+    rust_bin = build_rust_agent()
     lanes = LANES
     if not go_bin:
         lanes = [l for l in lanes if l[0] not in ("go-block", "go-mtls")]
     if not c_bin:
         lanes = [l for l in lanes if l[0] != "c-echo"]
+    if not rust_bin:
+        lanes = [l for l in lanes if l[0] != "rust-block"]
     if args.lanes:
         want = set(args.lanes.split(","))
         lanes = [l for l in lanes if l[0] in want]
@@ -460,7 +491,7 @@ def main():
         module_so=stacklib.MODULE_SO, root=root,
         uds_sock=uds_agent.sock, tcp_port=tcp_agent.port,
         go_sock=go_sock, go_mtls_sock=go_mtls_sock,
-        c_sock=c_sock,
+        c_sock=c_sock, rust_sock=rust_sock,
         mtls_sock=mtls_agent.sock, mtls_ca=certs["ca"],
         mtls_eng_crt=certs["engine_cert"],
         mtls_eng_key=certs["engine_key"],
@@ -474,6 +505,7 @@ def main():
     go_proc = None
     go_mtls_proc = None
     c_proc = None
+    rust_proc = None
     try:
         uds_agent.start(root)
         tcp_agent.start(root)
@@ -492,6 +524,10 @@ def main():
             c_proc = subprocess.Popen(
                 [c_bin, "-listen", f"unix:{c_sock}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if rust_bin:
+            rust_proc = subprocess.Popen(
+                [rust_bin, "--listen", f"unix:{rust_sock}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(subprocess.Popen(
             [stacklib.NGINX_BIN, "-c", conf_path, "-p", root],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -508,7 +544,8 @@ def main():
         for ready_path in ("/x", "/mtlsblock/x",
                            "/goblock/x" if go_bin else None,
                            "/gomtls/x" if go_bin else None,
-                           "/cecho/x" if c_bin else None):
+                           "/cecho/x" if c_bin else None,
+                           "/rustblock/x" if rust_bin else None):
             if ready_path is None:
                 continue
             for _ in range(100):
@@ -601,7 +638,7 @@ def main():
     finally:
         for p in procs:
             p.terminate()
-        for p in (go_proc, go_mtls_proc, c_proc):
+        for p in (go_proc, go_mtls_proc, c_proc, rust_proc):
             if p:
                 p.terminate()
         for a in (uds_agent, tcp_agent, mtls_agent):
