@@ -4,7 +4,9 @@
 - `SPEC.md` — XNAP wire protocol spec (normative, read first)
 - `module/` — ngx_http_xngin_module (C, no external deps)
 - `agents/go/` — xngin-go SDK + `cmd/edge-guard` (ACL + rate-limit agent)
-- `agents/rust/` — xngin-rs SDK + `examples/mini_waf.rs` (regex WAF agent)
+- `agents/rust/` — xngin-rs SDK + `examples/mini_waf.rs` (regex WAF
+  agent) + `examples/crs_waf/` (OWASP CRS agent via zentinel-modsec;
+  per-vhost rulesets selected by `xngin_var waf_profile`)
 - `test/harness/` — Python ref codec (`xnap.py`), scriptable `stub_agent.py`,
   `stacklib.py` test stack, codec unit tests
 - `test/conformance/` — shared `vectors.json` consumed by all three codecs;
@@ -43,6 +45,7 @@ python3 -m pytest test/cases -q
 ```sh
 (cd agents/go && go run ./cmd/edge-guard -listen unix:/tmp/eg.sock -rate 50)
 (cd agents/rust && cargo run --example mini_waf -- --listen unix:/tmp/waf.sock)
+(cd agents/rust && cargo run --example crs_waf -- --profile default=/path/rules.conf)
 ```
 
 ## Gotchas learned

@@ -75,7 +75,7 @@ TLS ClientHello/JA4 visibility — on a ~400-line zero-dependency codec.
 | `SPEC.md` | XNAP wire protocol (v1) |
 | `module/` | the nginx module (C) |
 | `agents/go/` | `xngin-go` SDK + **edge-guard** (IP ACL + rate limit) and **ja4-fp** (JA4 fingerprint → headers + vars) agents |
-| `agents/rust/` | `xngin-rs` SDK + **mini-waf** agent (regex rules + anomaly score) |
+| `agents/rust/` | `xngin-rs` SDK + **mini-waf** (regex rules + anomaly score) and **crs-waf** (OWASP CRS via `zentinel-modsec`, per-vhost rulesets) agents |
 | `test/` | pytest harness, scriptable stub agent (3rd impl), conformance vectors, benches, fuzz targets |
 | `docs/` | architecture, latency analysis, benchmarks, config reference, examples, multi-vhost policies |
 

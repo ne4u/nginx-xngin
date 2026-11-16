@@ -218,3 +218,83 @@ certless engine or a wrong-CA agent is rejected and the conn drops to
 `xngin_fail` handling (503 with `fail close`). Omit
 `ssl_certificate`/`ssl_certificate_key` for server-auth-only TLS and
 drop `--tls-client-ca` on the agent.
+
+## 9. OWASP CRS WAF (crs_waf example)
+
+`agents/rust/examples/crs_waf` runs real ModSecurity/CRS rule files via
+[`zentinel-modsec`](https://docs.rs/zentinel-modsec) — a pure-Rust
+SecLang engine (no C++ FFI, no libmodsecurity). It loads the stock CRS
+tree (`Include`, `SecRuleRemoveById`, `@pmFromFile`, `@detectSQLi`,
+anomaly scoring), so each vhost can run a full CRS install or a tuned
+subset.
+
+**Different rules per nginx block.** The agent maps *profiles* to
+engines; each `server{}`/`location{}` picks a profile by shipping
+`xngin_var waf_profile "<name>"`. The var arrives in the NOTIFY `vars`
+KVL — config-bound, so the client cannot spoof it (see
+`docs/multi-vhost.md`).
+
+```sh
+git clone https://github.com/coreruleset/coreruleset /etc/crs/coreruleset
+cp /etc/crs/coreruleset/crs-setup.conf.example /etc/crs/coreruleset/crs-setup.conf
+
+cat > /etc/crs/storefront.conf <<'EOF'
+SecRuleEngine On
+SecRequestBodyAccess On
+Include /etc/crs/coreruleset/crs-setup.conf
+Include /etc/crs/coreruleset/rules/*.conf
+SecRuleRemoveById 942100                        # tuned out for this vhost
+EOF
+
+cat > /etc/crs/api-strict.conf <<'EOF'
+SecRuleEngine On
+SecRequestBodyAccess On
+Include /etc/crs/coreruleset/crs-setup.conf
+Include /etc/crs/coreruleset/rules/*.conf
+# strict-sibling rules + per-tenant exclusions go here
+EOF
+
+(cd agents/rust && cargo run --example crs_waf -- \
+    --listen unix:/run/xngin/crs-waf.sock \
+    --profile storefront=/etc/crs/storefront.conf \
+    --profile api-strict=/etc/crs/api-strict.conf \
+    --default-profile storefront)
+```
+
+```nginx
+xngin_agent_group waf { server unix:/run/xngin/crs-waf.sock; }
+
+server {
+    server_name shop.example;
+    xngin_enable on; xngin_group waf;
+    xngin_var waf_profile "storefront";
+    xngin_body_inspect on;            # CRS request-body rules (phase 2)
+    proxy_pass http://shop_backend;
+}
+server {
+    server_name api.example;
+    xngin_enable on; xngin_group waf;
+    xngin_var waf_profile "api-strict";
+    xngin_body_inspect on;
+    xngin_response on;                # CRS RESPONSE-9xx data-leak rules
+    proxy_pass http://api_backend;
+}
+```
+
+Notes:
+
+- `xngin_var` is location-conf, so the same mechanism works inside a
+  `location{}` — e.g. `xngin_var waf_profile "uploads-strict";` on
+  `location /upload`.
+- Phase-1 rules (protocol enforcement, request-header rules) can deny
+  at NOTIFY time — before the client body finishes uploading.
+- `--default-profile` picks the ruleset when no `waf_profile` var
+  arrives; without one an untagged request is denied 500 (fail-closed).
+  A var naming an unloaded profile is denied 500 likewise.
+- The verdict carries `vars` `waf_profile` + `waf_rules` (matched rule
+  ids) and `score` (accumulated anomaly score) — under
+  `SecRuleEngine DetectionOnly` requests are allowed but `waf_rules`
+  still lists what would have fired.
+- `zentinel-modsec` is young; its measured CRS gaps (a handful of inert
+  operators, `XML:` targets flattened) are documented in its README —
+  read them before relying on it for a boundary that matters.

@@ -132,6 +132,11 @@ Because it's a complex value, `xngin_var` also forwards anything nginx
 knows that the wire doesn't show — `$ssl_client_s_dn`, GeoIP results,
 `$server_name`, map-derived tenant ids.
 
+A working example: `agents/rust/examples/crs_waf` maps a `waf_profile`
+var to separate OWASP CRS rulesets — one ModSecurity engine per
+`--profile name=conf` — so each vhost gets genuinely different WAF
+rules (see `examples.md` §9).
+
 ## Isolation boundaries
 
 | shared thing | scope |

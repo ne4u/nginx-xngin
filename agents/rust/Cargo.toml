@@ -16,3 +16,4 @@ rustls-pemfile = "2"
 [dev-dependencies]
 serde_json = "1"
 rcgen = "0.13"
+zentinel-modsec = "0.5"
