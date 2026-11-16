@@ -15,6 +15,8 @@
 - `test/fuzz/`, `docker-compose.yml`, `test/Dockerfile`
 
 ## Build the module (macOS/Linux)
+Module links `-lz -lbrotlidec` — needs zlib + brotli dev packages
+(macOS: `brew install brotli`; Debian/Ubuntu: `apt-get install zlib1g-dev libbrotli-dev`).
 ```sh
 curl -sO https://nginx.org/download/nginx-<VER>.tar.gz && tar xzf nginx-<VER>.tar.gz
 cd nginx-<VER>
