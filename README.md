@@ -77,7 +77,7 @@ TLS ClientHello/JA4 visibility — on a ~400-line zero-dependency codec.
 | `agents/go/` | `xngin-go` SDK + **edge-guard** (IP ACL + rate limit) and **ja4-fp** (JA4 fingerprint → headers + vars) agents |
 | `agents/rust/` | `xngin-rs` SDK + **mini-waf** agent (regex rules + anomaly score) |
 | `test/` | pytest harness, scriptable stub agent (3rd impl), conformance vectors, benches, fuzz targets |
-| `docs/` | architecture, latency analysis, benchmarks, config reference, examples |
+| `docs/` | architecture, latency analysis, benchmarks, config reference, examples, multi-vhost policies |
 
 ## Quick start
 

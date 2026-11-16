@@ -319,10 +319,34 @@ class Stack:
             stdout=blog, stderr=blog))
         for a in self.agents:
             a.start(self.root)
-        self.procs.append(subprocess.Popen(
-            [NGINX_BIN, "-c", self.conf, "-p", self.root],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        self.wait_ready()
+        for _ in range(3):
+            self.procs.append(subprocess.Popen(
+                [NGINX_BIN, "-c", self.conf, "-p", self.root],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            try:
+                self.wait_ready()
+                return self
+            except RuntimeError:
+                # free_port() race: the probe socket is closed before
+                # nginx binds, so another process can grab the port —
+                # retry on a fresh one when bind() was the failure
+                try:
+                    bind_failed = "could not bind" in self.error_log()
+                except OSError:
+                    bind_failed = False
+                if not bind_failed:
+                    raise
+                old, self.listen_port = self.listen_port, free_port()
+                with open(self.conf) as f:
+                    conf = f.read()
+                # port is always followed by ';' or ' ' (listen opts) —
+                # the terminator keeps prefix ports safe
+                conf = conf.replace(f"listen {old};",
+                                    f"listen {self.listen_port};")
+                conf = conf.replace(f"listen {old} ",
+                                    f"listen {self.listen_port} ")
+                with open(self.conf, "w") as f:
+                    f.write(conf)
         return self
 
     def wait_ready(self):
