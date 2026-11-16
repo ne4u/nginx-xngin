@@ -28,6 +28,9 @@
 
 typedef struct {
     ngx_array_t *deny;          /* ngx_str_t, JA4 fingerprints */
+    ngx_array_t *groups;        /* ngx_http_xngin_group_t* reachable
+                                   from any server on this ctx's listen
+                                   addrs: scopes pushed JA4 bans */
 } ngx_http_xngin_tls_ctx_t;
 
 #if (NGX_XNGIN_TLS_ARG)
@@ -36,6 +39,7 @@ typedef struct {
     ngx_ssl_servername_pt        servername;   /* MUST be first member */
     ngx_ssl_client_hello_arg    *saved;        /* previous arg to chain */
     ngx_array_t                 *deny;
+    ngx_array_t                 *groups;   /* same scope as tctx->groups */
 } ngx_http_xngin_tls_arg_t;
 
 #endif
@@ -55,7 +59,7 @@ static ngx_http_xngin_hello_t *ngx_http_xngin_hello_new(ngx_connection_t *c,
 static void ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c,
     ngx_http_xngin_hello_t *h);
 static ngx_int_t ngx_http_xngin_denied(ngx_http_xngin_hello_t *h,
-    ngx_array_t *deny);
+    ngx_array_t *deny, ngx_array_t *groups);
 
 
 ngx_http_xngin_hello_t *
@@ -392,7 +396,8 @@ ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c, ngx_http_xngin_hello_t *h)
 
 
 static ngx_int_t
-ngx_http_xngin_denied(ngx_http_xngin_hello_t *h, ngx_array_t *deny)
+ngx_http_xngin_denied(ngx_http_xngin_hello_t *h, ngx_array_t *deny,
+    ngx_array_t *groups)
 {
     ngx_str_t                   *d;
     ngx_uint_t                   i;
@@ -402,11 +407,13 @@ ngx_http_xngin_denied(ngx_http_xngin_hello_t *h, ngx_array_t *deny)
         return 0;
     }
 
-    /* agent-pushed JA4 bans are checked regardless of tls_deny config */
+    /* agent-pushed JA4 bans bind the groups this server's locations
+       actually use — a foreign group's push must not abort unrelated
+       handshakes; the check stays local + synchronous */
     mmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
                                                ngx_http_xngin_module);
-    if (mmcf
-        && ngx_http_xngin_ban_check(mmcf, XNAP_BAN_JA4, &h->ja4))
+    if (mmcf && groups && groups->nelts
+        && ngx_http_xngin_ban_check(mmcf, XNAP_BAN_JA4, &h->ja4, groups))
     {
         return 1;
     }
@@ -453,7 +460,7 @@ ngx_http_xngin_ssl_servername(ngx_ssl_conn_t *s, int *ad, void *arg)
         }
     }
 
-    if (targ && ngx_http_xngin_denied(h, targ->deny)) {
+    if (targ && ngx_http_xngin_denied(h, targ->deny, targ->groups)) {
         *ad = SSL_AD_ILLEGAL_PARAMETER;
         return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
@@ -486,7 +493,7 @@ ngx_http_xngin_ch_cb(SSL *s, int *al, void *arg)
         }
     }
 
-    if (ngx_http_xngin_denied(h, tctx->deny)) {
+    if (ngx_http_xngin_denied(h, tctx->deny, tctx->groups)) {
         *al = SSL_AD_ILLEGAL_PARAMETER;
         return SSL_CLIENT_HELLO_ERROR;
     }
@@ -498,6 +505,165 @@ ngx_http_xngin_ch_cb(SSL *s, int *al, void *arg)
 #else
     return SSL_CLIENT_HELLO_SUCCESS;
 #endif
+}
+
+
+/* every group this location's step chain can reach → server's ban scope;
+   recurses into the location sets it owns (runs in postconfiguration,
+   after ngx_http_init_locations split the sets) */
+static void
+ngx_http_xngin_tls_collect_one(ngx_conf_t *cf, ngx_array_t *groups,
+    ngx_http_core_loc_conf_t *clcf);
+
+static void
+ngx_http_xngin_tls_collect_tree(ngx_conf_t *cf, ngx_array_t *groups,
+    ngx_http_location_tree_node_t *node)
+{
+    if (node == NULL) {
+        return;
+    }
+
+    ngx_http_xngin_tls_collect_one(cf, groups, node->exact);
+    ngx_http_xngin_tls_collect_one(cf, groups, node->inclusive);
+
+    ngx_http_xngin_tls_collect_tree(cf, groups, node->left);
+    ngx_http_xngin_tls_collect_tree(cf, groups, node->right);
+    ngx_http_xngin_tls_collect_tree(cf, groups, node->tree);
+}
+
+
+static void
+ngx_http_xngin_tls_collect_lcf(ngx_array_t *groups,
+    ngx_http_xngin_loc_conf_t *lcf)
+{
+    ngx_http_xngin_group_t  **gp, **np, **elts;
+    ngx_uint_t                i, j;
+
+    if (lcf == NULL || lcf->groups == NULL) {
+        return;
+    }
+
+    gp = lcf->groups->elts;
+    elts = groups->elts;
+    for (i = 0; i < lcf->groups->nelts; i++) {
+        for (j = 0; j < groups->nelts; j++) {
+            if (elts[j] == gp[i]) {
+                break;
+            }
+        }
+        if (j == groups->nelts) {
+            np = ngx_array_push(groups);
+            if (np) {
+                *np = gp[i];
+                elts = groups->elts;
+            }
+        }
+    }
+}
+
+
+static void
+ngx_http_xngin_tls_collect_one(ngx_conf_t *cf, ngx_array_t *groups,
+    ngx_http_core_loc_conf_t *clcf)
+{
+    ngx_http_core_loc_conf_t  **clcfp;
+
+    /* the server-level core loc conf has loc_conf == NULL — nginx sets
+       the back-pointer only for location{} blocks */
+    if (clcf == NULL || clcf->loc_conf == NULL) {
+        return;
+    }
+
+    ngx_http_xngin_tls_collect_lcf(groups,
+        clcf->loc_conf[ngx_http_xngin_module.ctx_index]);
+
+    /* nested locations reachable through this one */
+    ngx_http_xngin_tls_collect_tree(cf, groups, clcf->static_locations);
+
+#if (NGX_PCRE)
+    for (clcfp = clcf->regex_locations; clcfp && *clcfp; clcfp++) {
+        ngx_http_xngin_tls_collect_one(cf, groups, *clcfp);
+    }
+#endif
+    for (clcfp = clcf->predicate_locations; clcfp && *clcfp; clcfp++) {
+        ngx_http_xngin_tls_collect_one(cf, groups, *clcfp);
+    }
+}
+
+
+static void
+ngx_http_xngin_tls_collect_server(ngx_conf_t *cf, ngx_array_t *groups,
+    ngx_http_core_srv_conf_t *cscf)
+{
+    ngx_http_core_loc_conf_t  *pclcf, **clcfp;
+
+    pclcf = cscf->ctx->loc_conf[ngx_http_core_module.ctx_index];
+
+    /* server-level xngin loc conf (xngin_group written in server{}) —
+       pclcf->loc_conf is NULL so index the ctx array directly */
+    ngx_http_xngin_tls_collect_lcf(groups,
+        cscf->ctx->loc_conf[ngx_http_xngin_module.ctx_index]);
+
+    ngx_http_xngin_tls_collect_tree(cf, groups, pclcf->static_locations);
+
+#if (NGX_PCRE)
+    for (clcfp = pclcf->regex_locations; clcfp && *clcfp; clcfp++) {
+        ngx_http_xngin_tls_collect_one(cf, groups, *clcfp);
+    }
+#endif
+    for (clcfp = pclcf->predicate_locations; clcfp && *clcfp; clcfp++) {
+        ngx_http_xngin_tls_collect_one(cf, groups, *clcfp);
+    }
+    for (clcfp = cscf->named_locations; clcfp && *clcfp; clcfp++) {
+        ngx_http_xngin_tls_collect_one(cf, groups, *clcfp);
+    }
+}
+
+
+/* the ClientHello cb runs on the default server's ctx per listen addr,
+   pre-SNI — collect the union of groups reachable from ANY server on
+   the addrs where this server is default, so a ban pushed by a group
+   used only in a vhost still binds that socket */
+static ngx_array_t *
+ngx_http_xngin_tls_server_groups(ngx_conf_t *cf,
+    ngx_http_core_main_conf_t *cmcf, ngx_http_core_srv_conf_t *cscf)
+{
+    ngx_array_t                 *groups;
+    ngx_http_conf_port_t        *port;
+    ngx_http_conf_addr_t        *addr;
+    ngx_http_core_srv_conf_t   **srv;
+    ngx_uint_t                   p, a, i;
+    ngx_uint_t                   found = 0;
+
+    groups = ngx_array_create(cf->pool, 4,
+                            sizeof(ngx_http_xngin_group_t *));
+    if (groups == NULL) {
+        return NULL;
+    }
+
+    if (cmcf->ports) {
+        port = cmcf->ports->elts;
+        for (p = 0; p < cmcf->ports->nelts; p++) {
+            addr = port[p].addrs.elts;
+            for (a = 0; a < port[p].addrs.nelts; a++) {
+                if (addr[a].default_server != cscf) {
+                    continue;
+                }
+                found = 1;
+                srv = addr[a].servers.elts;
+                for (i = 0; i < addr[a].servers.nelts; i++) {
+                    ngx_http_xngin_tls_collect_server(cf, groups,
+                                                      srv[i]);
+                }
+            }
+        }
+    }
+
+    if (!found) {
+        ngx_http_xngin_tls_collect_server(cf, groups, cscf);
+    }
+
+    return groups;
 }
 
 
@@ -557,6 +723,11 @@ ngx_http_xngin_tls_init(ngx_conf_t *cf)
         targ->servername = ngx_http_xngin_ssl_servername;
         targ->saved = saved;
         targ->deny = xscf->tls_deny;
+        targ->groups = ngx_http_xngin_tls_server_groups(cf, cmcf,
+                                                        cscfp[s]);
+        if (targ->groups == NULL) {
+            return NGX_ERROR;
+        }
 
         if (SSL_CTX_set_ex_data(sscf->ssl.ctx,
                                 ngx_ssl_client_hello_arg_index, targ) == 0)
@@ -577,6 +748,11 @@ raw_cb:
             }
 
             tctx->deny = xscf->tls_deny;
+            tctx->groups = ngx_http_xngin_tls_server_groups(cf, cmcf,
+                                                            cscfp[s]);
+            if (tctx->groups == NULL) {
+                return NGX_ERROR;
+            }
 
             SSL_CTX_set_client_hello_cb(sscf->ssl.ctx,
                                         ngx_http_xngin_ch_cb, tctx);

@@ -46,14 +46,14 @@ xngin_ban_zone bans:1m;         # shm zone for CONTROL-pushed bans;
 | `xngin_header_include <name> …` | — | header allowlist for NOTIFY `headers`/`req-headers` KVLs (repeatable; when set, only listed names are sent) |
 | `xngin_header_exclude <name> …` | — | header blocklist (repeatable); use to strip `cookie`, `authorization`, etc. before they cross to remote agents |
 | `xngin_internal on\|off` | on | `off` skips xngin on subrequests and internal redirects (`r->internal`) — prevents double-counting rate-limit decisions on `error_page`/`try_files` hops |
-| `xngin_status on\|off` | off | location emits JSON: pool health, in-flight streams, cache counters, ban store sizes |
+| `xngin_status` | — | takes no arguments — installs a JSON status content handler on its location (worker, group, conn, and verdict-cache counters). Usage: `location = /xngin-status { xngin_status; }` |
 
 ## Agent group directives
 
 | directive | default | notes |
 |---|---|---|
 | `server <addr>` | — | `unix:/path` or `host:port`; `weight=`, `max_streams=`, `backup`, `resolve` params. `backup` conns are only used when no primary agent is ready. `resolve` re-resolves the hostname on `resolve_interval` via the nginx `resolver` |
-| `balance hash <complex>` | — | pick the conn by hashing a per-request key (e.g. `balance hash $binary_remote_addr;`) — agents that keep per-client state see a client on the same replica |
+| `balance hash <complex>` | — | sticky pick by a per-request key (e.g. `balance hash $binary_remote_addr;`): the key maps to an **agent**, then a live conn on it — `keepalive` conns of one agent share its bucket and a downed agent only remaps its own keys |
 | `resolve_interval <t>` | 30s | re-resolution period for `resolve` servers |
 | `keepalive n` | 2 | conns per worker per weight unit |
 | `ping_interval t` | 10s | health/RTT probe (min 1s) |
@@ -124,12 +124,14 @@ CONTROL frames on even sid 2 — no stream, no reply, local enforcement:
 
 | op | fields | effect |
 |---|---|---|
-| `ban-ip` | `ip`, `ttl` (s, default 300) | POST_READ rejects the client with 403 |
-| `ban-ja4` | `ja4`, `ttl` | TLS ClientHello carrying the JA4 is aborted |
-| `cache-drop` | `key` | evicts the verdict-cache entry for the raw `xngin_cache_key` value |
+| `ban-ip` | `ip`, `ttl` (s, default 300, max 86400) | requests are rejected with 403 — but only in locations whose `xngin_group` chain includes the pushing group |
+| `ban-ja4` | `ja4`, `ttl` | TLS ClientHello carrying the JA4 is aborted — only on servers whose locations use the pushing group (requires `xngin_tls_inspect` there) |
+| `cache-drop` | `key` | evicts the verdict-cache entry for the raw `xngin_cache_key` value — only when the entry was stored by the pushing group |
+
+CONTROL frames are ignored until the conn's AGENT_HELLO completes.
 
 Bans live in `xngin_ban_zone` when configured (cross-worker) or
-per-worker otherwise; they expire at `ttl`.
+per-worker otherwise; they expire at `ttl` (capped at one day).
 
 ## Example
 

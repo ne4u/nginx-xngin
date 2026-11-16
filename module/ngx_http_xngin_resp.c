@@ -715,12 +715,8 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
     if (rctx != NULL && rctx->body_stream && rctx->conn != NULL
         && ctx->decompress != XNAP_DEC_NONE)
     {
-        /*
-         * compressed body: inflate the held copy once and stream the
-         * plaintext to the agent; the wire bytes stay compressed.
-         * Failure is treated like a mid-download conn loss — the body
-         * is fully held so the fail policy can resolve it.
-         */
+        /* compressed body: the agent's BODY frames carry inflated
+           plaintext; the wire bytes stay compressed */
         ngx_str_t   dec = ngx_null_string;
         ngx_int_t   irc;
 
@@ -736,7 +732,28 @@ ngx_http_xngin_resp_collect(ngx_http_request_t *r,
             rctx->sys_us += ngx_http_xngin_now_us() - t0;
             rctx->body_stream = 0;
             send_last = 0;
+        } else if (irc == NGX_BUSY) {
+            /* decoded plaintext exceeds res_body_max: same bypass as
+               the undeclared-length over-cap path, not a failure —
+               release the original compressed bytes untouched */
+            if (rctx->conn != NULL) {
+                ngx_http_xngin_conn_send(rctx->conn, XNAP_FRAME_ABORT, 0,
+                                         rctx->stream_id,
+                                         rctx->frame_id++, NULL, 0);
+                ngx_http_xngin_stream_del(rctx->conn, rctx->stream_id);
+                rctx->conn = NULL;
+            }
+            rctx->body_stream = 0;
+            rctx->state = XNAP_ST_DONE;
+            if (rctx->timer && rctx->timer->timer_set) {
+                ngx_del_timer(rctx->timer);
+            }
+            ctx->resp_pass = 1;
+            ngx_http_xngin_resp_release(ctx, ctx->resp_held);
+            ngx_http_xngin_resp_finish(ctx);
+            return NGX_OK;
         } else {
+            /* NGX_ERROR = corrupt compressed input: fail policy */
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                           "xngin: response inflate failed (rc=%i)", irc);
             rctx->body_stream = 0;
@@ -1226,7 +1243,8 @@ ngx_http_xngin_resp_verdict(ngx_http_xngin_conn_t *c,
         else if (name.len == 11
                  && ngx_memcmp(name.data, "body-stream", 11) == 0)
         {
-            bstream = (unsigned) v.u;
+            /* TRUE or any nonzero uint opts in; FALSE/0 opts out */
+            bstream = (v.type == XNAP_VT_TRUE || v.u != 0);
         }
     }
 

@@ -43,7 +43,6 @@ static char *ngx_http_xngin_group_arg(ngx_conf_t *cf, ngx_str_t *field,
 
 
 static ngx_int_t ngx_http_xngin_handler(ngx_http_request_t *r);
-static ngx_int_t ngx_http_xngin_postread(ngx_http_request_t *r);
 static void ngx_http_xngin_body_post(ngx_http_request_t *r);
 static void ngx_http_xngin_req_cleanup(void *data);
 static void ngx_http_xngin_launch(ngx_http_request_t *r,
@@ -466,6 +465,33 @@ ngx_http_xngin_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                                    &st[s].group_name);
                 return NGX_CONF_ERROR;
             }
+
+            /* "server ... resolve" uses the resolver effective where
+               the group is referenced — a resolver in server{} or
+               location{} lands on this loc conf via merge, not on the
+               http-level conf ngx_http_xngin_init can see */
+            clcf = ngx_http_conf_get_module_loc_conf(cf,
+                                                     ngx_http_core_module);
+            if (clcf->resolver && clcf->resolver->connections.nelts
+                && (st[s].group->resolver == NULL
+                    || st[s].group->resolver->connections.nelts == 0))
+            {
+                st[s].group->resolver = clcf->resolver;
+            }
+        }
+
+        /* groups the CONTROL bans of these steps can affect */
+        conf->groups = ngx_array_create(cf->pool, conf->steps->nelts,
+                                        sizeof(ngx_http_xngin_group_t *));
+        if (conf->groups == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        for (s = 0; s < conf->steps->nelts; s++) {
+            ngx_http_xngin_group_t **gp = ngx_array_push(conf->groups);
+            if (gp == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            *gp = st[s].group;
         }
 
         conf->group = st[0].group;
@@ -1269,23 +1295,9 @@ ngx_http_xngin_init(ngx_conf_t *cf)
 {
     ngx_http_handler_pt       *h;
     ngx_http_core_main_conf_t *cmcf;
-    ngx_http_core_loc_conf_t  *clcf;
-    ngx_http_xngin_main_conf_t *mmcf;
-    ngx_http_xngin_group_t    *g;
-    ngx_uint_t                 i;
     ngx_http_variable_t       *v, *nv;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
-    /* http-level "resolver" for "server ... resolve" groups */
-    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-    mmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_xngin_module);
-    if (mmcf->groups) {
-        g = mmcf->groups->elts;
-        for (i = 0; i < mmcf->groups->nelts; i++) {
-            g[i].resolver = clcf->resolver;
-        }
-    }
 
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
     if (h == NULL) {
@@ -1293,13 +1305,6 @@ ngx_http_xngin_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_xngin_handler;
-
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-
-    *h = ngx_http_xngin_postread;
 
     ngx_http_xngin_filters_init();
     ngx_http_xngin_stream_filter_init();
@@ -1368,32 +1373,11 @@ ngx_http_xngin_req_cleanup(void *data)
 
 /* ---------- phase handler ---------- */
 
-/* POSTREAD: enforce agent-pushed IP bans before any request work */
-static ngx_int_t
-ngx_http_xngin_postread(ngx_http_request_t *r)
-{
-    ngx_http_xngin_main_conf_t *mmcf;
-
-    mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
-
-    if (mmcf == NULL) {
-        return NGX_DECLINED;
-    }
-
-    if (ngx_http_xngin_ban_check(mmcf, XNAP_BAN_IP,
-                                 &r->connection->addr_text))
-    {
-        return NGX_HTTP_FORBIDDEN;
-    }
-
-    return NGX_DECLINED;
-}
-
-
 static ngx_int_t
 ngx_http_xngin_handler(ngx_http_request_t *r)
 {
     ngx_http_xngin_loc_conf_t  *lcf;
+    ngx_http_xngin_main_conf_t *mmcf;
     ngx_http_xngin_ctx_t       *ctx;
     ngx_http_cleanup_t         *cln;
     ngx_int_t                   rc;
@@ -1410,6 +1394,16 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
        (auth_request double-counting a rate limiter, e.g.) */
     if (!lcf->internal_req && (r->internal || r != r->main)) {
         return NGX_DECLINED;
+    }
+
+    /* agent-pushed IP bans only bind groups this location consults */
+    mmcf = ngx_http_get_module_main_conf(r, ngx_http_xngin_module);
+    if (mmcf && lcf->groups
+        && ngx_http_xngin_ban_check(mmcf, XNAP_BAN_IP,
+                                    &r->connection->addr_text,
+                                    lcf->groups))
+    {
+        return NGX_HTTP_FORBIDDEN;
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_xngin_module);
@@ -1449,8 +1443,14 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
         return ctx->async ? NGX_DECLINED : NGX_DONE;
     }
 
-    /* engine-side verdict cache */
-    if (lcf->cache_key && lcf->cache_key != NGX_CONF_UNSET_PTR) {
+    /*
+     * Engine-side verdict cache.  Only consulted for single-step
+     * locations: the entry replays one step's verdict, so on a chain it
+     * would let a trailing group's cache-ttl skip every earlier group.
+     */
+    if (lcf->steps->nelts == 1
+        && lcf->cache_key && lcf->cache_key != NGX_CONF_UNSET_PTR)
+    {
         if (ngx_http_complex_value(r, lcf->cache_key, &key) == NGX_OK
             && key.len)
         {
@@ -1464,11 +1464,17 @@ ngx_http_xngin_handler(ngx_http_request_t *r)
                 }
                 ngx_str_set(&ctx->action, "deny");
                 ctx->deny_status = cstatus;
+                ctx->own_resp = 1;
                 if (ctx->deny_body.len) {
                     /* cached deny carries its own body: proceed to the
                        content phase so deny_content can emit it */
                     r->content_handler = ngx_http_xngin_deny_content;
                     return NGX_DECLINED;
+                }
+                /* the unread client body must still be consumed or the
+                   next keep-alive request desynchronizes */
+                if (ngx_http_discard_request_body(r) != NGX_OK) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
                 return cstatus;
             }

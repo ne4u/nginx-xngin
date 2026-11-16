@@ -400,6 +400,9 @@ typedef struct {
     ngx_str_t                 group_name;
     ngx_http_xngin_group_t   *group;
     ngx_array_t              *steps;       /* ngx_http_xngin_step_t */
+    ngx_array_t              *groups;      /* ngx_http_xngin_group_t* —
+                                              every group the steps can
+                                              reach; scopes CONTROL bans */
     ngx_str_t                 response_group_name;
     ngx_http_xngin_group_t   *response_group;
     ngx_uint_t                mode;
@@ -550,18 +553,20 @@ ngx_int_t   ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
                 ngx_http_xngin_ctx_t *ctx, ngx_str_t *key,
                 ngx_int_t *out_status);
 void        ngx_http_xngin_cache_store(ngx_http_request_t *r,
-                ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, uint32_t ttl);
+                ngx_http_xngin_ctx_t *ctx, ngx_str_t *key, uint32_t ttl,
+                ngx_str_t *group);
 void        ngx_http_xngin_cache_drop(ngx_http_xngin_main_conf_t *mmcf,
-                ngx_str_t *key);
+                ngx_str_t *key, ngx_str_t *group);
 
 /* ---------- ban store + CONTROL ---------- */
 
 ngx_int_t   ngx_http_xngin_ban_zone_init(ngx_shm_zone_t *shm_zone,
                 void *data);
 void        ngx_http_xngin_ban_add(ngx_http_xngin_main_conf_t *mmcf,
-                ngx_uint_t kind, ngx_str_t *key, uint32_t ttl);
+                ngx_uint_t kind, ngx_str_t *key, uint32_t ttl,
+                ngx_http_xngin_group_t *group);
 ngx_int_t   ngx_http_xngin_ban_check(ngx_http_xngin_main_conf_t *mmcf,
-                ngx_uint_t kind, ngx_str_t *key);
+                ngx_uint_t kind, ngx_str_t *key, ngx_array_t *groups);
 ngx_int_t   ngx_http_xngin_control(ngx_http_xngin_conn_t *c,
                 u_char *payload, size_t len);
 
