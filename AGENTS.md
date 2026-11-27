@@ -218,3 +218,10 @@ python3 -m pytest test/cases -q
   (uni after `seen_settings`, bidi after `seen_headers`) and every
   stream restores `c->recv` on `XFPS_DONE`/`XFPS_BAD` — keep both or
   warm h3 requests regain a per-request buffer + tee.
+- CI builds nginx with `--with-http_ssl_module --with-http_v2_module`
+  only (ubuntu OpenSSL 3.0 has no QUIC API, so no v3). Any static
+  function whose call sites are all `#if (NGX_QUIC)`-guarded MUST have
+  its decl + definition guarded too — unused-function trips -Werror
+  on the no-QUIC build (this broke CI on the h2fp PR). fp tests gate
+  on `stacklib.HAVE_H2` / `HAVE_H3` / `HAVE_CURL_H3` (nginx -V +
+  curl --version detection at harness import).

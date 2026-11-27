@@ -21,6 +21,27 @@ NGINX_BIN = os.environ.get("XNGIN_NGINX_BIN",
 MODULE_SO = os.environ.get("XNGIN_MODULE_SO",
                            "/tmp/nginx-1.31.8/objs/ngx_http_xngin_module.so")
 
+
+def _nginx_v():
+    try:
+        out = subprocess.run([NGINX_BIN, "-V"], capture_output=True,
+                             text=True, timeout=10)
+        return out.stdout + out.stderr
+    except OSError:
+        return ""
+
+
+_v = _nginx_v()
+HAVE_H2 = "http_v2_module" in _v      # http2 on / h2c listeners
+HAVE_H3 = "http_v3_module" in _v      # listen quic / HTTP-3
+
+try:
+    _cv = subprocess.run(["curl", "--version"], capture_output=True,
+                         text=True, timeout=10).stdout
+    HAVE_CURL_H3 = "HTTP3" in _cv
+except OSError:
+    HAVE_CURL_H3 = False
+
 NGINX_CONF = """\
 load_module {module_so};
 error_log {root}/logs/error.log {loglevel};

@@ -305,6 +305,11 @@ def main():
     args = ap.parse_args()
     only = set(filter(None, args.only.split(",")))
 
+    if not stacklib.HAVE_H2:
+        sys.exit("nginx built without http_v2 — bench_fp needs "
+                 "`http2 on`; see stacklib.HAVE_H2")
+    have_h3 = HAVE_AIOQUIC and stacklib.HAVE_H3
+
     root = subprocess.run(["mktemp", "-d", "/tmp/xngin-fpbench-XXXX"],
                           capture_output=True, text=True).stdout.strip()
     os.makedirs(os.path.join(root, "logs"), exist_ok=True)
@@ -338,7 +343,7 @@ def main():
                 time.sleep(0.05)
         # functional check: h2s + h3 must actually work before timing
         c, f, w = h2_once(ports["ps_on"], True, 2)
-        if HAVE_AIOQUIC:
+        if have_h3:
             h3_sample(ports["ps_on"], 1)
 
         lanes = [
@@ -369,7 +374,7 @@ def main():
 
         if only and "h3" not in only:
             pass
-        elif HAVE_AIOQUIC:
+        elif have_h3:
             # A/A: off vs off — the noise floor for the h3 deltas
             off, on = run_pair(lambda p: h3_sample(p, args.reqs),
                                (ports["ps_off"], ports["ps_off"]),
@@ -380,8 +385,8 @@ def main():
                                args.conns)
             report("h3", off, on)
         else:
-            print("note: aioquic not installed, skipping h3 lane",
-                  flush=True)
+            print("note: no aioquic or no http_v3 in nginx, "
+                  "skipping h3 lane", flush=True)
 
         print("\n=== added fingerprint cost (inspect on - off) ===")
         for name, off, on in rows:

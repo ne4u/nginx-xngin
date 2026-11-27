@@ -30,8 +30,12 @@ jobs:
         run: |
           curl -fsSL https://nginx.org/download/nginx-1.31.8.tar.gz | tar xz
           cd nginx-1.31.8
+          # v3/QUIC intentionally absent: ubuntu-latest's OpenSSL 3.0
+          # has no QUIC TLS API, so --with-http_v3_module won't
+          # configure. h3 tests skip themselves (stacklib.HAVE_H3).
           ./configure --add-dynamic-module=$GITHUB_WORKSPACE/module \
-                      --with-http_ssl_module --prefix=$PWD/../install
+                      --with-http_ssl_module --with-http_v2_module \
+                      --prefix=$PWD/../install
           make -j"$(nproc)" && make install
       - run: pip install pytest brotli
       - env:

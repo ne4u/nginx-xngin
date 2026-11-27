@@ -1726,6 +1726,13 @@ def test_resp_gzip_over_cap_bypasses(stack):
 # ---- HTTP/2 connection fingerprint (Akamai format) ----
 
 import h2fp as h2
+import stacklib
+
+requires_h2 = pytest.mark.skipif(
+    not stacklib.HAVE_H2, reason="nginx built without http_v2")
+requires_h3 = pytest.mark.skipif(
+    not (stacklib.HAVE_H3 and stacklib.HAVE_CURL_H3),
+    reason="needs nginx http_v3/QUIC + curl --http3")
 
 H2_SETTINGS = [(h2.S_TABLE, 8192), (h2.S_STREAMS, 100),
                (h2.S_WINDOW, 6291456), (h2.S_FRAME, 16384),
@@ -1758,6 +1765,7 @@ def _last_notify(agent, timeout=2.0):
     return (agent.stats() or {}).get("last_notify") or {}
 
 
+@requires_h2
 def test_h2fp_tls(stack):
     """Akamai h2 fingerprint over TLS matches the frames we sent."""
     s = stack(agents_rules=[ALLOW], ssl=True,
@@ -1768,6 +1776,7 @@ def test_h2fp_tls(stack):
     assert n.get("h2-fp") == want
 
 
+@requires_h2
 def test_h2fp_cleartext(stack):
     """h2c prior-knowledge conns get fingerprinted via the listen tee."""
     s = stack(agents_rules=[ALLOW],
@@ -1778,6 +1787,7 @@ def test_h2fp_cleartext(stack):
     assert n.get("h2-fp") == want
 
 
+@requires_h2
 def test_h2fp_http1_none(stack):
     """an http/1.1 request on an h2-enabled server carries no h2-fp."""
     s = stack(agents_rules=[ALLOW], ssl=True,
@@ -1788,6 +1798,7 @@ def test_h2fp_http1_none(stack):
     assert n and "h2-fp" not in n
 
 
+@requires_h2
 def test_h2fp_without_tls_inspect(stack):
     """xngin_h2_inspect alone emits h2-fp but no ja4/ch-raw."""
     s = stack(agents_rules=[ALLOW], ssl=True,
@@ -1798,6 +1809,7 @@ def test_h2fp_without_tls_inspect(stack):
     assert "ja4" not in n and "ch-raw" not in n
 
 
+@requires_h2
 def test_tls_inspect_without_h2(stack):
     """xngin_tls_inspect alone emits ja4 but no h2-fp on an h2 conn."""
     s = stack(agents_rules=[ALLOW], ssl=True,
@@ -1808,6 +1820,7 @@ def test_tls_inspect_without_h2(stack):
     assert "h2-fp" not in n
 
 
+@requires_h3
 def test_h3fp_quic(stack):
     """QUIC listener: h3 stream tee yields h3-fp; the hello carries a
     q-prefixed JA4 plus the raw transport params."""
@@ -1842,6 +1855,7 @@ def test_h3fp_quic(stack):
     assert not hello["h2-fp"]
 
 
+@requires_h3
 def test_h3fp_big_headers_and_reuse(stack):
     """A first HEADERS frame larger than the per-stream fp buffer still
     yields the pseudo-header order (buffered prefix), and later

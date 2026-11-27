@@ -75,8 +75,10 @@ static void ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c,
 static ngx_int_t ngx_http_xngin_denied(ngx_http_xngin_hello_t *h,
     ngx_array_t *deny, ngx_array_t *groups);
 static ngx_int_t ngx_http_xngin_hello_sni(SSL *s, ngx_str_t *host);
+#if (NGX_QUIC)
 static void ngx_http_xngin_quic_tp(ngx_connection_t *c,
     ngx_http_xngin_hello_t *h);
+#endif
 static ngx_http_xngin_tls_srv_t *ngx_http_xngin_tls_pick(
     ngx_connection_t *c, ngx_array_t *servers, ngx_str_t *sni);
 
@@ -441,6 +443,7 @@ ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c, ngx_http_xngin_hello_t *h)
 }
 
 
+#if (NGX_QUIC)
 /* QUIC transport parameters live in TLS extension 0x0039 inside the
    captured ClientHello: extract the raw ext body + ordered param-id
    list.  Wire params are {varint id, varint len, value} tuples */
@@ -521,6 +524,7 @@ found:
                                        "%uL", id) - h->quic_tps.data;
     }
 }
+#endif /* NGX_QUIC */
 
 
 /* pull the SNI hostname out of the ClientHello — same wire decode as
