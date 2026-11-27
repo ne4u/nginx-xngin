@@ -1788,6 +1788,31 @@ def test_h2fp_cleartext(stack):
 
 
 @requires_h2
+def test_h2fp_priority_cap(stack):
+    """PRIORITY text is bound-checked per entry: 22 short + 1 longer
+    entry fill pri[] to exactly 232 bytes; a following max-size entry
+    (sid=dep=2147483647 -> 27 chars + comma) must be dropped, not
+    written 4 bytes past pri[256] into pri_len."""
+    prios = [(5, True, 0, 200)] * 22 + [(5555, True, 0, 200)]
+    big = (2147483647, True, 2147483647, 256)
+    s = stack(agents_rules=[ALLOW],
+              srv_extra="xngin_h2_inspect on; http2 on;").start()
+    sock = h2.connect("127.0.0.1", s.listen_port, use_ssl=False)
+    try:
+        h2.h2_handshake(sock, H2_SETTINGS, H2_WINDOW, prios + [big],
+                        order=H2_ORDER, scheme="http",
+                        authority="127.0.0.1")
+    finally:
+        sock.close()
+    n = _last_notify(s.agents[0])
+    want = h2.akamai_fp(H2_SETTINGS, H2_WINDOW, prios, H2_ORDER)
+    assert len(want.split("|")[2]) == 232
+    assert n.get("h2-fp") == want
+    st, _, _ = s.request("/")          # worker survived
+    assert st == 200
+
+
+@requires_h2
 def test_h2fp_http1_none(stack):
     """an http/1.1 request on an h2-enabled server carries no h2-fp."""
     s = stack(agents_rules=[ALLOW], ssl=True,

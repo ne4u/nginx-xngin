@@ -650,7 +650,7 @@ ngx_http_xngin_h2fp_frame(ngx_connection_t *c, ngx_http_xngin_h2fp_t *f,
         break;
 
     case 0x2:                                    /* PRIORITY */
-        if (n >= 5 && f->pri_len + 24 <= XNAP_FP_PRI_CAP) {
+        if (n >= 5) {
             u_char    tmp[32];
             size_t    tl;
             uint32_t  dep;
@@ -660,11 +660,15 @@ ngx_http_xngin_h2fp_frame(ngx_connection_t *c, ngx_http_xngin_h2fp_t *f,
             tl = ngx_snprintf(tmp, sizeof(tmp), "%uD:%d:%uD:%d",
                               (uint32_t) sid, (dep & 0x80000000) ? 1 : 0,
                               dep & 0x7fffffff, p[4] + 1) - tmp;
-            if (f->pri_len) {
-                f->pri[f->pri_len++] = ',';
+            if (f->pri_len + (f->pri_len ? 1 : 0) + tl
+                <= XNAP_FP_PRI_CAP)
+            {
+                if (f->pri_len) {
+                    f->pri[f->pri_len++] = ',';
+                }
+                ngx_memcpy(f->pri + f->pri_len, tmp, tl);
+                f->pri_len += tl;
             }
-            ngx_memcpy(f->pri + f->pri_len, tmp, tl);
-            f->pri_len += tl;
         }
         break;
 
