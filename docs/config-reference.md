@@ -76,6 +76,7 @@ Requires nginx built `--with-http_ssl_module` and OpenSSL >= 1.1.1.
 | directive | default | notes |
 |---|---|---|
 | `xngin_tls_inspect on\|off` | off | capture the ClientHello on this server's SSL_CTX: raw bytes and a computed JA4 are stored per connection and forwarded in the NOTIFY (`ch-raw`, `ja4`). Set on the **default server** of each `listen` — the callback runs before SNI switching |
+| `xngin_h2_inspect on\|off` | off | capture the HTTP/2 connection fingerprint (`h2-fp`, Akamai format: SETTINGS pairs, connection WINDOW_UPDATE, PRIORITY frames, pseudo-header order) and the HTTP/3 fingerprint (`h3-fp`: control-stream SETTINGS + pseudo-header order) by teeing connection bytes. Independent of `xngin_tls_inspect`; covers TLS (h2 via ALPN), cleartext h2c prior-knowledge, and QUIC listeners. Set on the **default server** of each `listen` |
 | `xngin_tls_deny <ja4>` | — | repeatable; aborts the TLS handshake (`illegal_parameter` alert) when the computed JA4 matches. Local/synchronous — no agent round-trip |
 
 ## Variables
@@ -92,6 +93,8 @@ Requires nginx built `--with-http_ssl_module` and OpenSSL >= 1.1.1.
 | `$xngin_agent_us` | rtt minus attributed recv time ≈ agent-side wait (agent CPU + propagation + wakeup), microseconds |
 | `$xngin_cache` | hit / miss / bypass / disabled |
 | `$xngin_ja4` | JA4 fingerprint of the ClientHello, when `xngin_tls_inspect` is on |
+| `$xngin_h2fp` | HTTP/2 connection fingerprint (Akamai format), when `xngin_h2_inspect` captured it |
+| `$xngin_h3fp` | HTTP/3 fingerprint, when `xngin_h2_inspect` captured it |
 | `$xngin_agent` | agent URL that served the last decision (failover-visible in access log) |
 | `$xngin_<name>` | any key from verdict `vars` (e.g. vars `rule` → `$xngin_rule`); response-stream vars also land here |
 

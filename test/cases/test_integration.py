@@ -1721,3 +1721,155 @@ def test_resp_gzip_over_cap_bypasses(stack):
     assert hdrs.get("content-encoding") == "gzip"
     import gzip as _gz
     assert _gz.decompress(body) == b"P" * (200 * 1024)
+
+
+# ---- HTTP/2 connection fingerprint (Akamai format) ----
+
+import h2fp as h2
+
+H2_SETTINGS = [(h2.S_TABLE, 8192), (h2.S_STREAMS, 100),
+               (h2.S_WINDOW, 6291456), (h2.S_FRAME, 16384),
+               (h2.S_PUSH, 0)]
+H2_WINDOW = 15663105
+H2_PRIOS = [(5, True, 0, 200), (3, False, 0, 150)]
+H2_ORDER = "p,s,a,m"                     # exercise order tracking
+
+
+def _h2_request(s, use_ssl, settings=H2_SETTINGS, window=H2_WINDOW,
+                prios=H2_PRIOS, order=H2_ORDER):
+    scheme = "https" if use_ssl else "http"
+    sock = h2.connect("127.0.0.1", s.listen_port, use_ssl=use_ssl)
+    try:
+        h2.h2_handshake(sock, settings, window, prios,
+                        order=order, scheme=scheme,
+                        authority="127.0.0.1")
+    finally:
+        sock.close()
+
+
+def _last_notify(agent, timeout=2.0):
+    """poll agent stats until a notify has landed."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        n = (agent.stats() or {}).get("last_notify")
+        if n:
+            return n
+        time.sleep(0.1)
+    return (agent.stats() or {}).get("last_notify") or {}
+
+
+def test_h2fp_tls(stack):
+    """Akamai h2 fingerprint over TLS matches the frames we sent."""
+    s = stack(agents_rules=[ALLOW], ssl=True,
+              srv_extra="xngin_h2_inspect on; http2 on;").start()
+    _h2_request(s, use_ssl=True)
+    n = _last_notify(s.agents[0])
+    want = h2.akamai_fp(H2_SETTINGS, H2_WINDOW, H2_PRIOS, H2_ORDER)
+    assert n.get("h2-fp") == want
+
+
+def test_h2fp_cleartext(stack):
+    """h2c prior-knowledge conns get fingerprinted via the listen tee."""
+    s = stack(agents_rules=[ALLOW],
+              srv_extra="xngin_h2_inspect on; http2 on;").start()
+    _h2_request(s, use_ssl=False)
+    n = _last_notify(s.agents[0])
+    want = h2.akamai_fp(H2_SETTINGS, H2_WINDOW, H2_PRIOS, H2_ORDER)
+    assert n.get("h2-fp") == want
+
+
+def test_h2fp_http1_none(stack):
+    """an http/1.1 request on an h2-enabled server carries no h2-fp."""
+    s = stack(agents_rules=[ALLOW], ssl=True,
+              srv_extra="xngin_h2_inspect on; http2 on;").start()
+    st, _, _ = s.request("/")            # http.client -> h1
+    assert st == 200
+    n = _last_notify(s.agents[0])
+    assert n and "h2-fp" not in n
+
+
+def test_h2fp_without_tls_inspect(stack):
+    """xngin_h2_inspect alone emits h2-fp but no ja4/ch-raw."""
+    s = stack(agents_rules=[ALLOW], ssl=True,
+              srv_extra="xngin_h2_inspect on; http2 on;").start()
+    _h2_request(s, use_ssl=True)
+    n = _last_notify(s.agents[0])
+    assert n.get("h2-fp")
+    assert "ja4" not in n and "ch-raw" not in n
+
+
+def test_tls_inspect_without_h2(stack):
+    """xngin_tls_inspect alone emits ja4 but no h2-fp on an h2 conn."""
+    s = stack(agents_rules=[ALLOW], ssl=True,
+              srv_extra="xngin_tls_inspect on; http2 on;").start()
+    _h2_request(s, use_ssl=True)
+    n = _last_notify(s.agents[0])
+    assert n.get("ja4")
+    assert "h2-fp" not in n
+
+
+def test_h3fp_quic(stack):
+    """QUIC listener: h3 stream tee yields h3-fp; the hello carries a
+    q-prefixed JA4 plus the raw transport params."""
+    s = stack(agents_rules=[ALLOW], ssl=True, quic=True,
+              srv_extra="xngin_tls_inspect on; xngin_h2_inspect on;"
+              ).start()
+
+    rc = subprocess.run(
+        ["curl", "--http3-only", "-k", "-s", "-o", "/dev/null",
+         "-w", "%{http_code}",
+         f"https://127.0.0.1:{s.listen_port}/"],
+        capture_output=True, text=True, timeout=15)
+    assert rc.stdout == "200", f"curl h3 failed: {rc.stderr}"
+
+    hello = _wait_hello(s.agents[0])
+    assert hello, "agent saw no hello fields"
+
+    # JA4 transport char is 'q' on QUIC
+    assert hello["ja4"].startswith("q"), hello["ja4"]
+
+    # transport params: raw ext + ordered id list
+    assert hello["quic-tp"]
+    assert re.match(r"^[0-9]+(,[0-9]+)*$", hello["quic-tps"])
+
+    # h3-fp: settings|order — nghttp3 sends >=1 setting and pseudo
+    # headers for a GET
+    fp = hello["h3-fp"]
+    assert fp, "no h3-fp captured"
+    settings, _, order = fp.rpartition("|")
+    assert re.match(r"^[0-9]+:[0-9]+(,[0-9]+:[0-9]+)*$", settings), fp
+    assert re.match(r"^[msap](,[msap])*$", order), fp
+    assert not hello["h2-fp"]
+
+
+def test_h3fp_big_headers_and_reuse(stack):
+    """A first HEADERS frame larger than the per-stream fp buffer still
+    yields the pseudo-header order (buffered prefix), and later
+    requests on the same QUIC conn — whose streams skip the tee —
+    still carry the session's h3-fp."""
+    s = stack(agents_rules=[ALLOW], ssl=True, quic=True,
+              srv_extra="xngin_h2_inspect on;"
+                        " large_client_header_buffers 4 16k;").start()
+
+    url = f"https://127.0.0.1:{s.listen_port}/"
+    rc = subprocess.run(
+        ["curl", "--http3-only", "-k", "-s", "-o", "/dev/null",
+         "-o", "/dev/null", "-w", "%{http_code}\n",
+         "-H", "X-Big: " + "z" * 6000, url, url],
+        capture_output=True, text=True, timeout=15)
+    assert rc.stdout.split() == ["200", "200"], \
+        f"curl h3 failed: {rc.stdout!r} {rc.stderr}"
+
+    deadline = time.time() + 5
+    while time.time() < deadline \
+            and (s.agents[0].stats() or {}).get("notifies", 0) < 2:
+        time.sleep(0.1)
+    st = s.agents[0].stats() or {}
+    assert st.get("notifies", 0) >= 2
+
+    # stats.hello tracks the latest notify: request 2's stream
+    fp = (st.get("hello") or {}).get("h3-fp")
+    assert fp, "second request lost h3-fp"
+    settings, _, order = fp.rpartition("|")
+    assert settings, fp
+    assert sorted(order.split(",")) == ["a", "m", "p", "s"], fp

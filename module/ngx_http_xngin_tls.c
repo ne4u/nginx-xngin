@@ -41,6 +41,8 @@ typedef struct {
 typedef struct {
     ngx_array_t *servers;       /* ngx_http_xngin_tls_srv_t; elts[0] is
                                    the ctx owner's own (default) entry */
+    unsigned     tls:1;         /* ctx owner asked xngin_tls_inspect */
+    unsigned     h2:1;          /* ctx owner asked xngin_h2_inspect */
 } ngx_http_xngin_tls_ctx_t;
 
 #if (NGX_XNGIN_TLS_ARG)
@@ -50,6 +52,8 @@ typedef struct {
     ngx_ssl_client_hello_arg    *saved;        /* previous arg to chain */
     ngx_array_t                 *servers;  /* same scope as
                                               tctx->servers */
+    unsigned                     tls:1;    /* ctx owner's inspect flags */
+    unsigned                     h2:1;
 } ngx_http_xngin_tls_arg_t;
 
 #endif
@@ -71,6 +75,8 @@ static void ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c,
 static ngx_int_t ngx_http_xngin_denied(ngx_http_xngin_hello_t *h,
     ngx_array_t *deny, ngx_array_t *groups);
 static ngx_int_t ngx_http_xngin_hello_sni(SSL *s, ngx_str_t *host);
+static void ngx_http_xngin_quic_tp(ngx_connection_t *c,
+    ngx_http_xngin_hello_t *h);
 static ngx_http_xngin_tls_srv_t *ngx_http_xngin_tls_pick(
     ngx_connection_t *c, ngx_array_t *servers, ngx_str_t *sni);
 
@@ -113,7 +119,9 @@ ngx_http_xngin_hello_new(ngx_connection_t *c, SSL *s)
 
 
 /* raw ClientHello capture: msg_callback sees full handshake messages
-   (4-byte header included) before the state machine consumes them */
+   (4-byte header included) before the state machine consumes them.
+   The client's Finished is the earliest point where nginx has already
+   assigned c->ssl->handler — swap it there to install the h2 recv tee */
 static void
 ngx_http_xngin_msg_cb(int write_p, int version, int content_type,
     const void *buf, size_t len, SSL *ssl, void *arg)
@@ -122,9 +130,23 @@ ngx_http_xngin_msg_cb(int write_p, int version, int content_type,
     ngx_connection_t       *c;
     ngx_http_xngin_hello_t *h;
 
-    if (write_p || content_type != SSL3_RT_HANDSHAKE || len == 0
-        || p[0] != SSL3_MT_CLIENT_HELLO || len > XNAP_CH_CAP)
-    {
+    if (write_p || content_type != SSL3_RT_HANDSHAKE || len == 0) {
+        return;
+    }
+
+    if (p[0] == SSL3_MT_FINISHED) {
+        c = ngx_ssl_get_connection(ssl);
+        if (c == NULL) {
+            return;
+        }
+        h = ngx_http_xngin_tls_hello(c);
+        if (h != NULL && h->h2fp) {
+            ngx_http_xngin_h2fp_ssl_hook(c);
+        }
+        return;
+    }
+
+    if (p[0] != SSL3_MT_CLIENT_HELLO || len > XNAP_CH_CAP) {
         return;
     }
 
@@ -347,12 +369,23 @@ ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c, ngx_http_xngin_hello_t *h)
 
     ngx_http_xngin_map_version(highest_ver, ver_chars);
 
-    ngx_snprintf(ja4_a, sizeof(ja4_a) - 1, "t%c%c%c%02ui%02ui%c%c",
-                 ver_chars[0], ver_chars[1], sni_char,
-                 (ngx_uint_t) (cipher_count > 99 ? 99 : cipher_count),
-                 (ngx_uint_t) (ext_total > 99 ? 99 : ext_total),
-                 alpn_chars[0], alpn_chars[1]);
-    ja4_a[10] = '\0';
+    {
+        u_char tchar = 't';
+
+#if (NGX_QUIC)
+        if (c->listening != NULL && c->listening->quic) {
+            tchar = 'q';
+        }
+#endif
+
+        ngx_snprintf(ja4_a, sizeof(ja4_a) - 1, "%c%c%c%c%02ui%02ui%c%c",
+                     tchar,
+                     ver_chars[0], ver_chars[1], sni_char,
+                     (ngx_uint_t) (cipher_count > 99 ? 99 : cipher_count),
+                     (ngx_uint_t) (ext_total > 99 ? 99 : ext_total),
+                     alpn_chars[0], alpn_chars[1]);
+        ja4_a[10] = '\0';
+    }
 
     p = ja4_b_raw;
     for (i = 0; i < cipher_count; i++) {
@@ -404,6 +437,88 @@ ngx_http_xngin_ja4(SSL *s, ngx_connection_t *c, ngx_http_xngin_hello_t *h)
         p = ngx_cpymem(p, ja4_c_raw, c_len);
         *p = '\0';
         h->ja4_raw.len = raw_len;
+    }
+}
+
+
+/* QUIC transport parameters live in TLS extension 0x0039 inside the
+   captured ClientHello: extract the raw ext body + ordered param-id
+   list.  Wire params are {varint id, varint len, value} tuples */
+static void
+ngx_http_xngin_quic_tp(ngx_connection_t *c, ngx_http_xngin_hello_t *h)
+{
+    u_char   *p, *end, *e;
+    size_t    n, cap;
+    uint64_t  v;
+
+    if (h->quic_tp.data || h->ch_raw.len < 4 + 2 + 32 + 1) {
+        return;
+    }
+
+    p = h->ch_raw.data + 4;
+    end = h->ch_raw.data + h->ch_raw.len;
+
+    p += 2 + 32;                                /* version + random */
+    if (p >= end || p + 1 + p[0] > end) { return; }
+    p += 1 + p[0];                              /* session id */
+    if (p + 2 > end) { return; }
+    n = ((size_t) p[0] << 8) | p[1];
+    if (p + 2 + n + 1 > end) { return; }
+    p += 2 + n + 1 + p[2 + n];                  /* ciphers + comp */
+    if (p + 2 > end) { return; }
+    n = ((size_t) p[0] << 8) | p[1];
+    p += 2;
+    if (p + n > end) { return; }
+    e = p + n;                                  /* extensions range */
+
+    while (p + 4 <= e) {
+        uint16_t  et = ((uint16_t) p[0] << 8) | p[1];
+        n = ((size_t) p[2] << 8) | p[3];
+        p += 4;
+        if (p + n > e) { return; }
+        if (et == 0x0039) {
+            goto found;
+        }
+        p += n;
+    }
+    return;
+
+found:
+    h->quic_tp.data = ngx_pnalloc(c->pool, n);
+    if (h->quic_tp.data == NULL) {
+        return;
+    }
+    ngx_memcpy(h->quic_tp.data, p, n);
+    h->quic_tp.len = n;
+
+    /* ordered id list, decimal */
+    cap = n * 6 + 1;
+    h->quic_tps.data = ngx_pnalloc(c->pool, cap);
+    if (h->quic_tps.data == NULL) {
+        return;
+    }
+
+    e = p + n;
+    while (p < e) {
+        uint64_t  id;
+        u_char   *w;
+
+        id = ngx_http_xngin_qvarint(&p, e);
+        if (id == (uint64_t) -1) {
+            break;
+        }
+        v = ngx_http_xngin_qvarint(&p, e);
+        if (v == (uint64_t) -1 || (uint64_t) (e - p) < v) {
+            break;
+        }
+        p += v;
+
+        w = h->quic_tps.data + h->quic_tps.len;
+        if (h->quic_tps.len) {
+            *w++ = ',';
+        }
+        h->quic_tps.len = ngx_snprintf(w, cap - (w - h->quic_tps.data),
+                                       "%uL", id) - h->quic_tps.data;
     }
 }
 
@@ -609,6 +724,17 @@ ngx_http_xngin_ssl_servername(ngx_ssl_conn_t *s, int *ad, void *arg)
         }
 
         ts = ngx_http_xngin_tls_pick(c, targ->servers, sp);
+        if (h != NULL) {
+            h->tlsfp = targ->tls;
+            h->h2fp = targ->h2;
+#if (NGX_QUIC)
+            if (c->listening != NULL && c->listening->quic
+                && h->ch_raw.data)
+            {
+                ngx_http_xngin_quic_tp(c, h);
+            }
+#endif
+        }
         if (ngx_http_xngin_denied(h, ts->deny, ts->groups)) {
             *ad = SSL_AD_ILLEGAL_PARAMETER;
             return SSL_TLSEXT_ERR_ALERT_FATAL;
@@ -649,6 +775,17 @@ ngx_http_xngin_ch_cb(SSL *s, int *al, void *arg)
         }
 
         ts = ngx_http_xngin_tls_pick(c, tctx->servers, sp);
+        if (h != NULL) {
+            h->tlsfp = tctx->tls;
+            h->h2fp = tctx->h2;
+#if (NGX_QUIC)
+            if (c->listening != NULL && c->listening->quic
+                && h->ch_raw.data)
+            {
+                ngx_http_xngin_quic_tp(c, h);
+            }
+#endif
+        }
         if (ngx_http_xngin_denied(h, ts->deny, ts->groups)) {
             *al = SSL_AD_ILLEGAL_PARAMETER;
             return SSL_CLIENT_HELLO_ERROR;
@@ -895,7 +1032,7 @@ ngx_http_xngin_tls_init(ngx_conf_t *cf)
 
     for (s = 0; s < cmcf->servers.nelts; s++) {
         xscf = cscfp[s]->ctx->srv_conf[ngx_http_xngin_module.ctx_index];
-        if (xscf == NULL || !xscf->tls_inspect) {
+        if (xscf == NULL || (!xscf->tls_inspect && !xscf->h2_inspect)) {
             continue;
         }
 
@@ -921,6 +1058,8 @@ ngx_http_xngin_tls_init(ngx_conf_t *cf)
 
         targ->servername = ngx_http_xngin_ssl_servername;
         targ->saved = saved;
+        targ->tls = (xscf->tls_inspect == 1);
+        targ->h2 = (xscf->h2_inspect == 1);
         targ->servers = ngx_http_xngin_tls_server_list(cf, cmcf,
                                                        cscfp[s]);
         if (targ->servers == NULL) {
@@ -945,6 +1084,8 @@ raw_cb:
                 return NGX_ERROR;
             }
 
+            tctx->tls = (xscf->tls_inspect == 1);
+            tctx->h2 = (xscf->h2_inspect == 1);
             tctx->servers = ngx_http_xngin_tls_server_list(cf, cmcf,
                                                            cscfp[s]);
             if (tctx->servers == NULL) {

@@ -284,7 +284,7 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
             ngx_http_xngin_hello_t *hello;
 
             hello = ngx_http_xngin_tls_hello(r->connection);
-            if (hello) {
+            if (hello && hello->tlsfp) {
                 if (hello->ja4.len) {
                     ngx_xnap_wbuf_kv_str(wb, "ja4", hello->ja4.data,
                                          hello->ja4.len);
@@ -296,12 +296,42 @@ ngx_http_xngin_build_notify(ngx_http_request_t *r, ngx_http_xngin_ctx_t *ctx,
                     ngx_xnap_wbuf_bytes(wb, hello->ch_raw.data,
                                         hello->ch_raw.len);
                 }
+                if (hello->quic_tps.len) {
+                    ngx_xnap_wbuf_kv_str(wb, "quic-tps",
+                                         hello->quic_tps.data,
+                                         hello->quic_tps.len);
+                }
+                if (hello->quic_tp.len) {
+                    ngx_xnap_wbuf_kv_name(wb, "quic-tp");
+                    ngx_xnap_wbuf_u8(wb, XNAP_VT_BIN);
+                    ngx_xnap_wbuf_varint(wb, hello->quic_tp.len);
+                    ngx_xnap_wbuf_bytes(wb, hello->quic_tp.data,
+                                        hello->quic_tp.len);
+                }
             }
+
         }
     }
 #else
     ngx_xnap_wbuf_kv_bool(wb, "tls", 0);
 #endif
+
+    /* h2c conns have no ssl — fingerprint emission lives outside.
+       fp presence is itself the scope: the tee only installs when the
+       listen/ctx owner asked for xngin_h2_inspect */
+    {
+        ngx_str_t *fp;
+
+        fp = ngx_http_xngin_h2fp_get(r->connection);
+        if (fp && fp->len) {
+            ngx_xnap_wbuf_kv_str(wb, "h2-fp", fp->data, fp->len);
+        }
+
+        fp = ngx_http_xngin_h3fp_get(r->connection);
+        if (fp && fp->len) {
+            ngx_xnap_wbuf_kv_str(wb, "h3-fp", fp->data, fp->len);
+        }
+    }
 
     /* request-id: nginx>=1.31 generates $request_id lazily, so we
        synthesize our own correlation id: conn number + per-worker seq */
@@ -501,10 +531,13 @@ ngx_http_xngin_notify_bound(ngx_http_request_t *r)
 
         hello = ngx_http_xngin_tls_hello(r->connection);
         if (hello) {
-            bound += hello->ja4.len + hello->ch_raw.len;
+            bound += hello->ja4.len + hello->ch_raw.len
+                     + hello->quic_tp.len + hello->quic_tps.len;
         }
     }
 #endif
+
+    bound += 1024;   /* h2-fp / h3-fp strings */
 
     return bound;
 }

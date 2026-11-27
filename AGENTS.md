@@ -13,7 +13,8 @@
   regenerate with `python3 test/conformance/gen_vectors.py`
 - `test/cases/` — pytest integration suite
 - `test/bench/` — `bench.py` lane harness + `echo_agent.c` (minimal C
-  XNAP agent; bench.py cc-compiles it for the `c-echo` lane)
+  XNAP agent; bench.py cc-compiles it for the `c-echo` lane) +
+  `bench_fp.py` (per-connection h2/h3 fingerprint cost)
 - `test/fuzz/`, `docker-compose.yml`, `test/Dockerfile`
 
 ## Build the module (macOS/Linux)
@@ -127,6 +128,40 @@ python3 -m pytest test/cases -q
 - macOS: overwriting a dlopen'd .so in place invalidates its code
   signature — the process dies with `Killed: 9` ("Code Signature
   Invalid" in the .ips crash report). `rm` the old .so first, then cp.
+- If the .so is built missing a source file (e.g. ./configure ran while
+  sources were stashed), `load_module` fails on the undefined symbol —
+  every stack() test errors "nginx didn't start"; check the error log
+  for `dlopen`.
+- `ngx_http_optimize_servers` runs AFTER http postconfig —
+  `cycle->listening`, `ls->handler`, `ls->servers`, and per-addr
+  `conf.default_server`/`conf.ssl`/`conf.quic` do NOT exist at
+  postconfiguration. Listener swaps (`ls->handler`) belong in the
+  module's `init_module` (ngx_module_t slot), which runs after
+  ngx_open_listening_sockets. When sweeping `cycle->listening`, filter
+  `ls->handler == ngx_http_init_connection` — stream{} listeners share
+  the array with a different `ls->servers` port-struct type.
+- TLS recv tee seam: `c->recv = ngx_ssl_recv` is only assigned inside
+  ngx_ssl_handshake right before `c->ssl->handler(c)` — wrapping at
+  ClientHello time gets overwritten. Swap `c->ssl->handler` at the
+  client-Finished msg_cb instead.
+- QUIC: `ls->handler` (ngx_http_init_connection) dispatches BOTH the
+  session conn (c->quic==NULL) and stream conns (c->quic =
+  ngx_quic_stream_t*, ->parent = session conn). Stream conns inherit
+  `sc->ssl = c->ssl`, so a hello stored via SSL ex_data is reachable
+  from r->connection on h3 requests.
+- Hello field gating scope: capture flags (hello->tlsfp / ->h2fp) must
+  come from the SSL_CTX owner (default server of the listen) — the ctx
+  that installed the callback — NOT the request's routed/sni-picked
+  xscf. Routed-server gating suppressed ja4 on a non-default vhost and
+  broke ban-ja4 pushes (agent substitutes `$hello` from the notify).
+- h2/h3 fingerprinting lives in module/ngx_http_xngin_h2fp.c: pool-
+  cleanup conn ctx, recv tee, h2 frame parser + HPACK-lite (pseudo-
+  header order only, no Huffman), QPACK-lite for h3 control-stream
+  SETTINGS + first field section. `xngin_h2_inspect` srv flag.
+  h2/h3 tests: `test/harness/h2fp.py` oracle + raw-frame client;
+  `Stack(quic=True)` adds `listen <port> quic;` (needs ssl=True);
+  h3 client = `curl --http3-only` (system curl has ngtcp2/nghttp3),
+  aioquic is pip-installed too.
 - The live build tree is `/tmp/nginx-src/nginx-1.31.8` (the
   `/tmp/nginx-1.31.8` dir is a stale partial copy — `make modules`
   fails there on missing src files). Use
@@ -166,3 +201,20 @@ python3 -m pytest test/cases -q
   runtime flavor all measured flat. Diagnose transport-vs-agent gaps
   with `cargo test --test direct_bench -- --ignored` (XNAP_ADDR/CONNS/
   INFLIGHT env) bypassing nginx.
+- QUIC + `worker_processes >1` on loopback is flaky: datagrams landing
+  on the wrong worker are forwarded via socketpairs with ms-level
+  stalls and occasional client-visible timeouts (~40% of aioquic conns
+  timed out at 4 workers; 1 worker is clean). bench_fp.py therefore
+  uses a single worker.
+- aioquic handshakes swing ±0.5ms+ run to run (pure-Python crypto):
+  never run all "off" samples then all "on" — a sequential ordering
+  once produced a phantom "+1ms h3 handshake cost". bench_fp.py
+  interleaves off/on and reports an `h3-aa` (off vs off) noise floor.
+  For sub-µs questions, time inside nginx with temporary
+  `clock_gettime` + `ngx_log_error(WARN)` instead (servername hook
+  measured 4µs TCP / 6µs QUIC).
+- Each h3 request is a fresh QUIC *stream conn* through `ls->handler`;
+  the h3 tee skips streams the session agg can't learn from
+  (uni after `seen_settings`, bidi after `seen_headers`) and every
+  stream restores `c->recv` on `XFPS_DONE`/`XFPS_BAD` — keep both or
+  warm h3 requests regain a per-request buffer + tee.

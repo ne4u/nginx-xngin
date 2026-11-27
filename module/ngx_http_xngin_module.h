@@ -377,6 +377,7 @@ typedef struct {
 
 typedef struct {
     ngx_flag_t                tls_inspect;
+    ngx_flag_t                h2_inspect;
     ngx_array_t              *tls_deny;   /* ngx_str_t, JA4 fingerprints */
 } ngx_http_xngin_srv_conf_t;
 
@@ -384,6 +385,11 @@ typedef struct {
     ngx_str_t                 ch_raw;    /* raw ClientHello handshake msg */
     ngx_str_t                 ja4;       /* 36-char JA4 fingerprint */
     ngx_str_t                 ja4_raw;   /* unhashed JA4_r, debugging */
+    ngx_str_t                 quic_tp;   /* raw QUIC transport params ext */
+    ngx_str_t                 quic_tps;  /* ordered param-id list */
+    unsigned                  tlsfp:1;   /* hello was captured for
+                                            xngin_tls_inspect */
+    unsigned                  h2fp:1;    /* conn wants the h2 recv tee */
 } ngx_http_xngin_hello_t;
 
 /* one leg of a sequential group chain: `xngin_group name [params]` */
@@ -547,6 +553,14 @@ void        ngx_http_xngin_resp_abort(ngx_http_xngin_ctx_t *ctx);
 ngx_int_t   ngx_http_xngin_tls_init(ngx_conf_t *cf);
 ngx_http_xngin_hello_t *ngx_http_xngin_tls_hello(ngx_connection_t *c);
 
+/* ---------- h2/h3 fingerprint ---------- */
+
+ngx_int_t   ngx_http_xngin_h2fp_init(ngx_cycle_t *cycle);
+void        ngx_http_xngin_h2fp_attach(ngx_connection_t *c);
+void        ngx_http_xngin_h2fp_ssl_hook(ngx_connection_t *c);
+ngx_str_t  *ngx_http_xngin_h2fp_get(ngx_connection_t *c);
+ngx_str_t  *ngx_http_xngin_h3fp_get(ngx_connection_t *c);
+
 /* ---------- cache ---------- */
 
 ngx_int_t   ngx_http_xngin_cache_lookup(ngx_http_request_t *r,
@@ -603,6 +617,32 @@ ngx_http_xngin_now_us(void)
     struct timeval tv;
     ngx_gettimeofday(&tv);
     return (int64_t) tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
+/* QUIC varint: 2-bit length prefix; (uint64_t)-1 on truncation */
+static ngx_inline uint64_t
+ngx_http_xngin_qvarint(u_char **pp, u_char *end)
+{
+    uint64_t  v;
+    unsigned  n;
+    u_char   *p = *pp;
+
+    if (p >= end) {
+        return (uint64_t) -1;
+    }
+
+    n = 1 << (*p >> 6);
+    if ((size_t) (end - p) < n) {
+        return (uint64_t) -1;
+    }
+
+    v = *p++ & 0x3f;
+    while (--n) {
+        v = (v << 8) | *p++;
+    }
+
+    *pp = p;
+    return v;
 }
 
 #endif /* _NGX_HTTP_XNGIN_MODULE_H_INCLUDED_ */

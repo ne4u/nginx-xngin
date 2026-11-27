@@ -9,6 +9,7 @@ static void *ngx_http_xngin_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_xngin_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_xngin_init(ngx_conf_t *cf);
+static ngx_int_t ngx_http_xngin_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_xngin_init_process(ngx_cycle_t *cycle);
 static void ngx_http_xngin_exit_process(ngx_cycle_t *cycle);
 
@@ -63,6 +64,10 @@ static ngx_int_t ngx_http_xngin_var_us(ngx_http_request_t *r,
 static ngx_int_t ngx_http_xngin_var_cache(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_xngin_var_ja4(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_xngin_var_h2fp(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_xngin_var_h3fp(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_xngin_var_prefix(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
@@ -191,6 +196,13 @@ static ngx_command_t ngx_http_xngin_commands[] = {
       offsetof(ngx_http_xngin_srv_conf_t, tls_inspect),
       NULL },
 
+    { ngx_string("xngin_h2_inspect"),
+      NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_xngin_srv_conf_t, h2_inspect),
+      NULL },
+
     { ngx_string("xngin_var"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
       ngx_http_xngin_var_add,
@@ -258,7 +270,7 @@ ngx_module_t ngx_http_xngin_module = {
     ngx_http_xngin_commands,               /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    NULL,                                  /* init module */
+    ngx_http_xngin_init_module,            /* init module */
     ngx_http_xngin_init_process,           /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -310,6 +322,14 @@ static ngx_http_variable_t ngx_http_xngin_vars[] = {
       ngx_http_xngin_var_ja4, 0,
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
+    { ngx_string("xngin_h2fp"), NULL,
+      ngx_http_xngin_var_h2fp, 0,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+    { ngx_string("xngin_h3fp"), NULL,
+      ngx_http_xngin_var_h3fp, 0,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
     { ngx_string("xngin_agent"), NULL,
       ngx_http_xngin_var_agent, 0,
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
@@ -350,6 +370,7 @@ ngx_http_xngin_create_srv_conf(ngx_conf_t *cf)
     }
 
     xscf->tls_inspect = NGX_CONF_UNSET;
+    xscf->h2_inspect = NGX_CONF_UNSET;
 
     return xscf;
 }
@@ -362,6 +383,7 @@ ngx_http_xngin_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_xngin_srv_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->tls_inspect, prev->tls_inspect, 0);
+    ngx_conf_merge_value(conf->h2_inspect, prev->h2_inspect, 0);
 
     if (conf->tls_deny == NULL) {
         conf->tls_deny = prev->tls_deny;
@@ -1326,6 +1348,19 @@ ngx_http_xngin_init(ngx_conf_t *cf)
 }
 
 
+/* listeners + ls->handler only exist after ngx_http_optimize_servers,
+   which runs after http postconfig — hook the ls swap at init_module */
+static ngx_int_t
+ngx_http_xngin_init_module(ngx_cycle_t *cycle)
+{
+    if (ngx_http_xngin_h2fp_init(cycle) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_xngin_init_process(ngx_cycle_t *cycle)
 {
@@ -1955,13 +1990,55 @@ ngx_http_xngin_var_ja4(ngx_http_request_t *r,
     ngx_http_xngin_hello_t *hello;
 
     hello = ngx_http_xngin_tls_hello(r->connection);
-    if (hello == NULL || hello->ja4.len == 0) {
+    if (hello == NULL || !hello->tlsfp || hello->ja4.len == 0) {
         v->not_found = 1;
         return NGX_OK;
     }
 
     v->data = hello->ja4.data;
     v->len = hello->ja4.len;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_xngin_var_h2fp(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_str_t *fp;
+
+    fp = ngx_http_xngin_h2fp_get(r->connection);
+    if (fp == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->data = fp->data;
+    v->len = fp->len;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_xngin_var_h3fp(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_str_t *fp;
+
+    fp = ngx_http_xngin_h3fp_get(r->connection);
+    if (fp == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->data = fp->data;
+    v->len = fp->len;
     v->valid = 1;
     v->no_cacheable = 0;
     v->not_found = 0;

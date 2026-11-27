@@ -260,8 +260,10 @@ class Conn:
                 raise
             headers = xnap.headers_dict(kvs)
             kd = dict(kvs)
-            if "ja4" in kd or "ch-raw" in kd:
+            if "ja4" in kd or "ch-raw" in kd or "h2-fp" in kd \
+                    or "h3-fp" in kd or "quic-tp" in kd:
                 ch_raw = kd.get("ch-raw") or b""
+                quic_tp = kd.get("quic-tp") or b""
                 stats.hello = {
                     "ja4": kd.get("ja4"),
                     "sni": kd.get("sni"),
@@ -269,6 +271,10 @@ class Conn:
                     "alpn": kd.get("alpn"),
                     "ch_raw_len": len(ch_raw),
                     "ch_raw_hex": ch_raw.hex(),
+                    "h2-fp": kd.get("h2-fp"),
+                    "h3-fp": kd.get("h3-fp"),
+                    "quic-tps": kd.get("quic-tps"),
+                    "quic-tp": quic_tp.hex(),
                 }
             stats.last_notify = kvs_json(kvs)
             if msg == "http-response":

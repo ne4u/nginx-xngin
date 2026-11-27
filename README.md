@@ -33,8 +33,17 @@ GET / ──► nginx ──NOTIFY──► agent ──VERDICT──► allow �
   with `cache-ttl` — repeat traffic skips the wire entirely
 - **Body inspection**: flag-gated, capped, streamed as BODY frames
 - **TLS fingerprinting**: `xngin_tls_inspect` captures the ClientHello —
-  raw `ch-raw` plus engine JA4 in the NOTIFY; the `ja4-fp` example agent
-  recomputes JA4/JA4_r and returns them as headers and `$xngin_*` vars
+  raw `ch-raw` plus engine JA4 in the NOTIFY (a `q` transport char on
+  QUIC, plus the client's QUIC transport params as `quic-tp`/`quic-tps`);
+  the `ja4-fp` example agent recomputes JA4/JA4_r and returns them as
+  headers and `$xngin_*` vars
+- **HTTP/2 + HTTP/3 fingerprinting**: `xngin_h2_inspect` tees the first
+  bytes off each connection (no nginx patches — installed through
+  `c->ssl->handler` on TLS and `ls->handler` for h2c/QUIC streams) and
+  produces `h2-fp` (Akamai format:
+  `settings|window_update|priorities|pseudo_header_order`) and `h3-fp`
+  (`settings|pseudo_header_order`), in the NOTIFY and as
+  `$xngin_h2fp`/`$xngin_h3fp` vars
 - **Optional mTLS to agents**: `ssl on` in the agent group — engine
   verifies agent certs and can present its own for mutual auth; FIPS-
   capable stacks on every SDK (OpenSSL FIPS / boringcrypto / aws-lc-rs)
@@ -66,7 +75,8 @@ nginx was just missing an open implementation of it:
 nginx. XNAP combines what none of the above do together — streamed
 bodies with early verdicts, full request/response mutation, agent
 output as first-class `$xngin_*` variables for logs and headers, and
-TLS ClientHello/JA4 visibility — on a ~400-line zero-dependency codec.
+TLS ClientHello/JA4 + h2/h3 fingerprint visibility — on a ~400-line
+zero-dependency codec.
 
 ## Repo
 

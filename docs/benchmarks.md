@@ -134,6 +134,64 @@ send→verdict window.
   64KiB (memcpy into 16KiB frames); `sys` stays flat — the extra body
   cost lands in `agent` (transfer + parse).
 
+## Fingerprint cost (`xngin_h2_inspect`) — test/bench/bench_fp.py
+
+The h2/h3 recv tee is a fixed cost per connection, not per request.
+`bench_fp.py` therefore times *connection* setup (TCP+TLS/QUIC
+handshake), first-request, and warm-request medians across separate
+connection samples — one nginx (1 worker), two server blocks on
+separate port pairs, plain vs `xngin_h2_inspect on`, `empty_gif`
+content. Off/on samples are **interleaved** (alternating which side
+goes first) so client drift hits both equally, and an **`h3-aa`**
+lane runs off-vs-off against the same port to measure the noise
+floor. 1 worker is deliberate: on loopback, multi-worker QUIC
+datagrams that land on the wrong worker are forwarded via socketpairs
+with ms-level stalls and occasional client-visible timeouts — noise
+that would swamp a sub-ms measurement (it does not affect TCP lanes,
+which are worker-affine by accept).
+
+Median deltas (inspect on − off), 60 conns × 8 warm requests:
+
+| Lane | conn setup | first req | warm req |
+|---|---|---|---|
+| h1c (cleartext) | −0µs | +2µs | +0µs |
+| h1s (TLS) | +6µs | +2µs | +1µs |
+| h2c | +1µs | +0µs | −0µs |
+| h2s (TLS, ALPN) | +17µs | +2µs | +0µs |
+| **h3-aa (off vs off — noise floor)** | **+467µs** | **+49µs** | **+27µs** |
+| h3 (QUIC, aioquic) | −365µs | +39µs | −6µs |
+
+Baseline medians for scale: TCP conn setup ~50–65µs, TLS ~1.2–1.3ms,
+QUIC handshake ~5–7ms (IQR ~4.5–8ms), warm h1/h2 request ~32–40µs,
+h3 ~310–370µs.
+
+Engine-side cost, timed inside nginx (temporary `clock_gettime`
+instrumentation around the servername hook, 41 handshakes each):
+JA4 + vhost pick + ban check is **4µs median on TCP, 6µs on QUIC**,
+of which `quic-tp` extraction is ~1µs.
+
+Reading the deltas:
+
+- **Everything is inside noise.** The h3 deltas are smaller than the
+  A/A lane's spread — the aioquic client (pure-Python crypto)
+  dominates the handshake and swings ±0.5ms run to run. The real
+  per-handshake engine cost is the ~6µs above.
+- An earlier revision of this section reported "h3 conn setup
+  ≈ +1ms". That was a measurement artifact: all off samples ran
+  before all on samples, and the off-only baseline itself moved
+  7.0 → 9.7ms between runs. Interleaving + the A/A lane removed it
+  (and the similar h1c "−59µs").
+- **h3 per-request is bounded to the first request.** Each h3 request
+  is a fresh QUIC stream conn, so the tee would otherwise re-install
+  per request. `ngx_http_xngin_ls_handler` now skips streams the
+  session can't learn from (control SETTINGS / first HEADERS already
+  seen), uses a 2KB per-stream buffer (an oversized first HEADERS is
+  parsed from its buffered prefix — pseudo-headers lead the block),
+  and every stream drops the tee as soon as its frame is parsed.
+- h1/h2: the tee parses a bounded preamble (preface + SETTINGS +
+  WINDOW_UPDATE + PRIORITY + first HEADERS) then restores `c->recv`;
+  h1 bytes hit the early-BAD path immediately.
+
 ## Caveats
 
 - Loopback only — a remote agent adds real network RTT on top.
@@ -167,6 +225,7 @@ export XNGIN_NGINX_BIN=/path/to/nginx
 export XNGIN_MODULE_SO=/path/to/objs/ngx_http_xngin_module.so
 python3 test/bench/bench.py                 # 300 serial / 5000 ab
 python3 test/bench/bench.py --serial-n 500 --ab-n 10000   # this run
+python3 test/bench/bench_fp.py --conns 60 --reqs 8        # fingerprint cost
 ```
 
 The Go lanes build `agents/go/cmd/edge-guard` on the fly (skipped when

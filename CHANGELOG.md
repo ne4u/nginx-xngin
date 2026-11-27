@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Added
+- `xngin_h2_inspect on` (server context): connection-level HTTP/2 and
+  HTTP/3 fingerprinting without nginx patches. The module tees
+  connection bytes off `c->recv` (installed at client-Finished for TLS,
+  via the `ls->handler` dispatch for cleartext h2c and QUIC streams) and
+  parses the fingerprint itself: `h2-fp` (Akamai format —
+  `settings|window_update|priorities|pseudo_header_order`, HPACK-lite
+  for the pseudo order), `h3-fp` (`settings|pseudo_header_order` via
+  QPACK-lite over the client control stream + first field section), and
+  on QUIC `ja4` gains the `q` transport char plus `quic-tp`/`quic-tps`
+  (raw + ordered ids of TLS ext `0x0039`). New nginx variables
+  `$xngin_h2fp` / `$xngin_h3fp`. Independent of `xngin_tls_inspect` —
+  gated fields carry their capture scope on the hello so they work for
+  non-default SNI vhosts too. The h3 tee only touches the streams that
+  can contribute (control SETTINGS + first request HEADERS, 2KB buffer
+  with prefix parse for oversized blocks) and drops off each stream as
+  soon as it's done, so later requests on a QUIC conn pay nothing
 - Early verdicts before BODY `LAST` in both SDKs (SPEC §4.2): Go
   `EarlyHandler` interface (`EarlyVerdict` may return a verdict at
   NOTIFY time) and Rust `AgentHandler::early_verdict` (default `None`,

@@ -192,6 +192,7 @@ class Stack:
                  loc_extra="", main_extra="", tcp_agents=False,
                  loglevel="warn", ssl=False, srv_extra="",
                  http_ready=True, sub="", go_agent=None, mtls=False,
+                 quic=False,
                  agent_tls=True, client_cert=True, wrong_ca=False,
                  loc_blocks="", server_hosts=None, server_suffix=None,
                  group_extra="", extra_groups=None,
@@ -218,6 +219,10 @@ class Stack:
             srv_extra = (f"ssl_certificate {self.cert};\n        "
                          f"ssl_certificate_key {self.key};\n        "
                          + srv_extra)
+            if quic:
+                # same port, UDP: quic implies TLS1.3 + h3
+                srv_extra = (f"listen {self.listen_port} quic;\n        "
+                             + srv_extra)
 
         certs = gen_mtls_certs(root) if mtls else None
         agent_tls_cfg = ({"cert": certs["agent_cert"],

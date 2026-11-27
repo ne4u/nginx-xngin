@@ -167,8 +167,12 @@ v1 is `http-request`:
 | `tls-version` | STR          | negotiated version, when `tls`            |
 | `sni`         | STR          | client SNI, when `tls` and sent           |
 | `alpn`        | STR          | negotiated ALPN, when `tls` and selected  |
-| `ja4`         | STR          | JA4 fingerprint of the ClientHello; present when `xngin_tls_inspect` captured it. Agents MAY ignore it and fingerprint `ch-raw` with any scheme |
+| `ja4`         | STR          | JA4 fingerprint of the ClientHello (`q` transport char over QUIC); present when `xngin_tls_inspect` captured it. Agents MAY ignore it and fingerprint `ch-raw` with any scheme |
 | `ch-raw`      | BIN          | raw ClientHello handshake message (incl. 4-byte handshake header); present when `xngin_tls_inspect` captured it — canonical material for arbitrary TLS fingerprinting |
+| `quic-tp`     | BIN          | raw QUIC transport-parameters extension body (TLS ext `0x0039`) from the ClientHello; present on QUIC handshakes when `xngin_tls_inspect` captured it |
+| `quic-tps`    | STR          | comma-separated transport-parameter ids in wire order (e.g. `0,1,3,57`); same presence rule as `quic-tp` |
+| `h2-fp`       | STR          | HTTP/2 connection fingerprint in Akamai format `settings|window_update|priorities|pseudo_header_order` (e.g. `1:65536,4:6291456|15663105|0|m,a,s,p`); present on HTTP/2 connections when `xngin_h2_inspect` captured it |
+| `h3-fp`       | STR          | HTTP/3 fingerprint `settings|pseudo_header_order` from the client control stream and first request field section; present on HTTP/3 connections when `xngin_h2_inspect` captured it |
 | `request-id`  | STR          | engine request id, for log correlation    |
 | `vars`        | KVL          | nginx variables captured via `xngin_var` (e.g. `$ssl_client_s_dn`, GeoIP, userid) |
 | `body-len`    | UINT32       | declared Content-Length when known        |

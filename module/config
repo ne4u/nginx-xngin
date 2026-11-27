@@ -13,6 +13,7 @@ if test -n "$ngx_module_link"; then
                     $ngx_addon_dir/ngx_http_xngin_cache.c \
                     $ngx_addon_dir/ngx_http_xngin_ban.c \
                     $ngx_addon_dir/ngx_http_xngin_inflate.c \
+                    $ngx_addon_dir/ngx_http_xngin_h2fp.c \
                     $ngx_addon_dir/ngx_http_xngin_status.c"
     ngx_module_deps="$ngx_addon_dir/ngx_http_xngin_module.h"
     . auto/module
@@ -28,6 +29,7 @@ else
         $ngx_addon_dir/ngx_http_xngin_cache.c \
         $ngx_addon_dir/ngx_http_xngin_ban.c \
         $ngx_addon_dir/ngx_http_xngin_inflate.c \
+        $ngx_addon_dir/ngx_http_xngin_h2fp.c \
         $ngx_addon_dir/ngx_http_xngin_status.c"
     CORE_LIBS="$CORE_LIBS -lz -lbrotlidec"
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS \
